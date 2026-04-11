@@ -107,20 +107,6 @@ When `--path` is also given, a second JSON object follows on the next line ([NDJ
 
 When the object is not found or is unreachable, `found` is `false` and an `error` key describes why.
 
-## How to capture a heap dump
-
-**Running process:**
-```
-jcmd <pid> GC.heap_dump /tmp/heap.hprof
-# or
-jmap -dump:format=b,file=/tmp/heap.hprof <pid>
-```
-
-**On OutOfMemoryError** (add to JVM flags):
-```
--XX:+HeapDumpOnOutOfMemoryError -XX:HeapDumpPath=/tmp/heap.hprof
-```
-
 ## Memory usage
 
 | Pass | Peak RAM |
@@ -136,15 +122,15 @@ I/O buffer defaults to 64 MB (configurable at compile time).
 
 ## Comparison
 
-|                      | minprof       | Eclipse MAT   | VisualVM      |
-|----------------------|---------------|---------------|---------------|
-| Peak RAM             | ~1 GB         | ≈ dump size   | ≈ dump size   |
-| 100 GB dump          | works         | needs 100 GB RAM | needs 100 GB RAM |
-| Retained heap        | ✅            | ✅            | ✅            |
-| Dominator tree       | ✅            | ✅            | ❌            |
-| Path to GC root      | ✅            | ✅            | ❌            |
-| JSON / scriptable    | ✅            | ❌            | ❌            |
-| GUI                  | ❌ (CLI only) | ✅            | ✅            |
+|                      | minprof       | Eclipse MAT       | VisualVM          |
+|----------------------|---------------|-------------------|-------------------|
+| Peak RAM             | ~1 GB         | ≈ dump size       | ≈ dump size       |
+| 100 GB dump          | works         | needs ~100 GB RAM | needs ~100 GB RAM |
+| Retained heap        | ✅            | ✅                 | ✅                 |
+| Dominator tree       | ✅            | ✅                 | ❌                 |
+| Path to GC root      | ✅            | ✅                 | ❌                 |
+| JSON / scriptable    | ✅            | ❌                 | ❌                 |
+| GUI                  | ❌ (CLI only) | ✅                 | ✅                 |
 
 ## Limitations
 
