@@ -1,4 +1,3 @@
-mod anon;
 mod index;
 mod parser;
 mod passes;

@@ -149,9 +149,8 @@ I/O buffer defaults to 64 MB (configurable at compile time).
 ## Limitations
 
 - CLI only — no GUI or interactive query shell
-- Duplicate string detection and PII anonymization are not yet implemented
 - Tested on 64-bit HotSpot HPROF format (id_size = 8); 32-bit dumps (id_size = 4) are parsed correctly, but less tested
-
+- Currently a hobby project, use with caution
 ---
 
 ## References
