@@ -132,7 +132,7 @@ impl ExternalSorter {
         Self {
             output_dir,
             chunk_paths: Vec::new(),
-            current: Vec::with_capacity(entries_per_chunk.min(64 * 1024 * 1024)),
+            current: Vec::with_capacity(entries_per_chunk),
             entries_per_chunk,
         }
     }

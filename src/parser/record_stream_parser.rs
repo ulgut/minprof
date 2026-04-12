@@ -85,6 +85,11 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor, include_data: bool
             file.seek(SeekFrom::Start(header_bytes_consumed as u64))
                 .context("seek past header")?;
 
+            let mut chunk_count = 0u64;
+            let mut total_bytes = 0u64;
+            let mut partial_count = 0u64; // reads that returned < READ_BUFFER_SIZE
+            let t0 = std::time::Instant::now();
+
             loop {
                 // Grab a pooled buffer, fill it.
                 let mut buf = recv_pooled_buf
@@ -96,9 +101,37 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor, include_data: bool
                 if n == 0 {
                     break; // EOF
                 }
+
+                chunk_count += 1;
+                total_bytes += n as u64;
+                if n < READ_BUFFER_SIZE {
+                    partial_count += 1;
+                }
+                if chunk_count % 64 == 0 {
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    eprintln!(
+                        "  reader: {chunk_count} reads, {:.1} GiB, {:.0} partial, \
+                         {:.0} MiB/s, avg read size {:.1} MiB",
+                        total_bytes as f64 / (1 << 30) as f64,
+                        partial_count,
+                        total_bytes as f64 / elapsed / (1 << 20) as f64,
+                        total_bytes as f64 / chunk_count as f64 / (1 << 20) as f64,
+                    );
+                }
+
                 buf.truncate(n);
                 send_chunk.send(buf).expect("parser channel closed");
             }
+
+            let elapsed = t0.elapsed().as_secs_f64();
+            eprintln!(
+                "  reader done: {chunk_count} reads, {:.1} GiB, {partial_count} partial ({:.1}%), \
+                 avg {:.1} MiB/read, {:.0} MiB/s",
+                total_bytes as f64 / (1 << 30) as f64,
+                partial_count as f64 / chunk_count.max(1) as f64 * 100.0,
+                total_bytes as f64 / chunk_count.max(1) as f64 / (1 << 20) as f64,
+                total_bytes as f64 / elapsed / (1 << 20) as f64,
+            );
             // Dropping send_chunk signals EOF to the parser.
             Ok(())
         })?;
