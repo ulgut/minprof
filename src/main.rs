@@ -9,46 +9,59 @@ use clap::Parser;
 
 use query::ReportConfig;
 
-/// Which analyses to emit. Pass multiple times or comma-separate values.
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum Format {
+    /// Human-readable text tables (default)
+    Pretty,
+    /// Newline-delimited JSON — stdout only, progress on stderr
+    Json,
+    /// Self-contained HTML report written to <hprof>.html
+    Html,
+}
+
+/// Which analyses to include. Repeatable or comma-separated.
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum Report {
     /// All analyses (default)
     All,
-    /// Class histogram (object count + shallow bytes per class)
+    /// Class histogram: object count + shallow bytes per class
     Histogram,
-    /// Retained heap grouped by class
+    /// Retained heap grouped by class (dominator tree view)
     Retained,
-    /// Leak suspects (classes dominating ≥1% of heap)
+    /// Leak suspects: classes retaining ≥1% of heap
     Leaks,
     /// Package-level memory rollup
     Packages,
 }
 
 #[derive(Parser)]
-#[command(name = "minprof", about = "Streaming, multi-pass HPROF heap dump analyser")]
+#[command(
+    name = "minprof",
+    about = "Streaming HPROF heap-dump analyser",
+    long_about = "Multi-pass streaming analyser for JVM heap dumps (.hprof).\n\
+                  Processes files larger than available RAM via on-disk index files.\n\
+                  Progress messages go to stderr; results go to stdout."
+)]
 struct Cli {
     /// Path to the .hprof file
     hprof: PathBuf,
 
     /// Directory for intermediate index files (default: <hprof>.minprof/)
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "DIR")]
     output: Option<PathBuf>,
 
+    /// Output format
+    #[arg(long, value_enum, default_value = "pretty")]
+    format: Format,
+
+    /// Which analyses to run (repeatable or comma-separated)
+    #[arg(long, value_enum, value_delimiter = ',', default_values_t = vec![Report::All])]
+    report: Vec<Report>,
+
     /// Print the shortest reference path from a GC root to this object.
-    /// Provide the object ID as a hex address (e.g. 0x7f3a1c or 7f3a1c).
+    /// Use an object ID from the retained-heap table (e.g. 0x7f3a1c80).
     #[arg(long, value_name = "OBJECT_ID")]
     path: Option<String>,
-
-    /// Emit results as JSON instead of formatted text.
-    /// Progress messages still go to stderr; only results go to stdout.
-    /// Each result is a self-contained JSON object (NDJSON when combined with --path).
-    #[arg(long)]
-    json: bool,
-
-    /// Which analyses to run (repeatable or comma-separated).
-    /// Choices: all, histogram, retained, leaks, packages. Default: all.
-    #[arg(long = "report", value_enum, value_delimiter = ',', default_values_t = vec![Report::All])]
-    report: Vec<Report>,
 }
 
 fn build_report_config(reports: &[Report]) -> ReportConfig {
@@ -56,10 +69,10 @@ fn build_report_config(reports: &[Report]) -> ReportConfig {
         return ReportConfig::all();
     }
     ReportConfig {
-        histogram:        reports.contains(&Report::Histogram),
+        histogram:         reports.contains(&Report::Histogram),
         retained_by_class: reports.contains(&Report::Retained),
-        leak_suspects:    reports.contains(&Report::Leaks),
-        package_summary:  reports.contains(&Report::Packages),
+        leak_suspects:     reports.contains(&Report::Leaks),
+        package_summary:   reports.contains(&Report::Packages),
     }
 }
 
@@ -76,12 +89,8 @@ fn main() -> Result<()> {
 
     eprintln!("=== pass 1: build index ===");
     let pass1 = passes::index::run(&cli.hprof, &output_dir)?;
-    eprintln!(
-        "  {} objects, {} classes, {} roots",
-        pass1.object_count,
-        pass1.class_index.len(),
-        pass1.roots.len(),
-    );
+    eprintln!("  {} objects, {} classes, {} roots",
+        pass1.object_count, pass1.class_index.len(), pass1.roots.len());
 
     eprintln!("=== pass 2: extract edges ===");
     let pass2 = passes::edges::run(&cli.hprof, &pass1, &output_dir)?;
@@ -92,20 +101,27 @@ fn main() -> Result<()> {
 
     eprintln!("=== pass 4: retained sizes ===");
     let pass4 = passes::retained::run(&pass1, &pass3, &output_dir)?;
+    eprintln!("done — {:.2} MiB retained heap across {} objects",
+        pass4.total_heap_bytes as f64 / 1_048_576.0, pass4.node_count);
 
-    eprintln!(
-        "done — {:.2} MiB retained heap across {} objects",
-        pass4.total_heap_bytes as f64 / 1_048_576.0,
-        pass4.node_count,
-    );
+    let config = build_report_config(&cli.report);
+    let json   = cli.format == Format::Json;
 
     eprintln!("=== query ===");
-    let config = build_report_config(&cli.report);
-    query::run(&pass1, &pass4, &output_dir, cli.json, &config)?;
+    match cli.format {
+        Format::Html => {
+            let html_path = cli.hprof.with_extension("html");
+            query::run_html(&pass1, &pass4, &html_path)?;
+            eprintln!("wrote {}", html_path.display());
+        }
+        _ => {
+            query::run(&pass1, &pass4, &output_dir, json, &config)?;
+        }
+    }
 
     if let Some(raw_id) = cli.path {
         let target_id = parse_hex_id(&raw_id)?;
-        query::path_to_root(target_id, &pass1, &pass2, cli.json)?;
+        query::path_to_root(target_id, &pass1, &pass2, json)?;
     }
 
     Ok(())

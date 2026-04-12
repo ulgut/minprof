@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>minprof — heap analysis</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f1f5f9;color:#1e293b;font-size:14px}
+header{background:#1e293b;color:#f8fafc;padding:1.25rem 2rem}
+header h1{font-size:1.25rem;font-weight:700}
+header .sub{font-size:.8rem;color:#94a3b8;margin-top:.2rem}
+nav{background:#fff;border-bottom:1px solid #e2e8f0;padding:.5rem 2rem;display:flex;gap:1.5rem;position:sticky;top:0;z-index:20;overflow-x:auto}
+nav a{font-size:.8rem;color:#64748b;padding:.25rem 0;white-space:nowrap;border-bottom:2px solid transparent;transition:color .15s,border-color .15s}
+nav a:hover{color:#6366f1;border-bottom-color:#6366f1}
+main{max-width:1400px;margin:0 auto;padding:2rem;display:flex;flex-direction:column;gap:2rem}
+section h2{font-size:.9rem;font-weight:700;color:#1e293b;margin-bottom:1rem;padding-bottom:.5rem;border-bottom:2px solid #6366f1;text-transform:uppercase;letter-spacing:.05em}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:1rem}
+.card{background:#fff;border-radius:10px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.card-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8}
+.card-value{font-size:1.4rem;font-weight:700;color:#1e293b;margin-top:.25rem;line-height:1.2}
+.card-sub{font-size:.75rem;color:#94a3b8;margin-top:.3rem}
+.card.warn .card-value{color:#d97706}
+.gc-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.gc-box{background:#fff;border-radius:10px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.gc-box h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:.75rem}
+.gc-row{display:flex;justify-content:space-between;align-items:center;padding:.4rem 0;border-bottom:1px solid #f1f5f9;font-size:.85rem}
+.gc-row:last-child{border-bottom:none}
+.gc-key{color:#475569}
+.gc-val{font-weight:600;color:#1e293b}
+.gc-val.warn{color:#d97706}
+.gc-val.danger{color:#dc2626}
+.suspects{display:flex;flex-direction:column;gap:.75rem}
+.suspect{background:#fff;border-left:4px solid #f59e0b;border-radius:0 10px 10px 0;padding:1rem 1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.suspect-n{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:#b45309;margin-bottom:.25rem}
+.suspect-class{font-size:.95rem;font-weight:700;color:#1e293b;font-family:monospace;word-break:break-all}
+.suspect-stats{display:flex;flex-wrap:wrap;gap:.75rem;margin-top:.5rem;font-size:.8rem}
+.suspect-stats span{background:#fef3c7;color:#92400e;padding:.15rem .5rem;border-radius:4px}
+.suspect-pattern{margin-top:.4rem;font-size:.8rem;color:#64748b;font-style:italic}
+.treemap-wrap{background:#fff;border-radius:10px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.treemap-hint{font-size:.75rem;color:#94a3b8;margin-bottom:.75rem}
+#tm-canvas{width:100%;border-radius:6px;cursor:pointer;display:block}
+#tm-tooltip{position:fixed;background:rgba(15,23,42,.92);color:#f8fafc;padding:.5rem .75rem;border-radius:6px;font-size:.75rem;line-height:1.5;pointer-events:none;display:none;z-index:100;max-width:260px}
+.chart-wrap{background:#fff;border-radius:10px;padding:1.25rem;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.chart-title{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;margin-bottom:.75rem}
+.tbl-wrap{background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+table{width:100%;border-collapse:collapse;font-size:.82rem}
+th{background:#f8fafc;text-align:left;padding:.6rem 1rem;font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:#94a3b8;border-bottom:1px solid #e2e8f0}
+th.r{text-align:right}
+td{padding:.55rem 1rem;border-bottom:1px solid #f1f5f9;color:#374151}
+td.r{text-align:right;font-variant-numeric:tabular-nums}
+td.mono{font-family:monospace;font-size:.8rem;word-break:break-all}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#fafafa}
+@media(max-width:700px){.gc-grid{grid-template-columns:1fr}.cards{grid-template-columns:repeat(2,1fr)}}
+</style>
+</head>
+<body>
+<header>
+<h1>minprof — heap analysis</h1>
+<div class="sub">8262 objects &middot; 474 classes &middot; 429 GC roots &middot; 2.45 MiB</div>
+</header>
+<nav>
+<a href="#overview">Overview</a>
+<a href="#gc-pressure">GC Pressure</a>
+<a href="#leak-suspects">Leak Suspects</a>
+<a href="#treemap">Treemap</a>
+<a href="#histogram">Histogram</a>
+<a href="#packages">Packages</a>
+</nav>
+<main>
+<section id="overview">
+<h2>Heap Overview</h2>
+<div class="cards">
+<div class="card"><div class="card-label">Total heap (shallow)</div><div class="card-value">2.45 MiB</div><div class="card-sub">8262 objects</div></div>
+<div class="card"><div class="card-label">Retained (reachable)</div><div class="card-value">237.96 KiB</div><div class="card-sub">429 GC roots</div></div>
+<div class="card"><div class="card-label">Classes</div><div class="card-value">474</div></div>
+<div class="card warn"><div class="card-label">Unreachable (garbage)</div><div class="card-value">2.22 MiB</div><div class="card-sub">3533 objects</div></div>
+<div class="card warn"><div class="card-label">Finalizer queue</div><div class="card-value">40</div><div class="card-sub">pending finalization</div></div>
+<div class="card"><div class="card-label">Soft / Weak / Phantom</div><div class="card-value">98 / 0 / 0</div><div class="card-sub">reference counts</div></div>
+</div>
+</section>
+<section id="gc-pressure">
+<h2>GC Pressure</h2>
+<div class="gc-grid">
+<div class="gc-box"><h3>Reference statistics</h3>
+<div class="gc-row"><span class="gc-key">java.lang.ref.Finalizer</span><span class="gc-val danger">40</span></div>
+<div class="gc-row"><span class="gc-key">java.lang.ref.SoftReference</span><span class="gc-val ">98</span></div>
+<div class="gc-row"><span class="gc-key">java.lang.ref.WeakReference</span><span class="gc-val ">0</span></div>
+<div class="gc-row"><span class="gc-key">java.lang.ref.PhantomReference</span><span class="gc-val ">0</span></div>
+</div>
+<div class="gc-box"><h3>Unreachable objects</h3>
+<div class="gc-row"><span class="gc-key">Object count</span><span class="gc-val warn">3533</span></div>
+<div class="gc-row"><span class="gc-key">Shallow size</span><span class="gc-val">2.22 MiB</span></div>
+<div class="gc-row"><span class="gc-key">% of total heap</span><span class="gc-val">90.5%</span></div>
+</div>
+</div>
+</section>
+<section id="leak-suspects">
+<h2>Leak Suspects</h2>
+<div class="suspects">
+<div class="suspect"><div class="suspect-n">Problem Suspect 1</div><div class="suspect-class">int[]</div><div class="suspect-stats"><span>81.4% of heap</span><span>1.99 MiB retained</span><span>436 instances</span><span>4.68 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 2</div><div class="suspect-class">char[]</div><div class="suspect-stats"><span>7.9% of heap</span><span>197.11 KiB retained</span><span>1991 instances</span><span>101 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 3</div><div class="suspect-class">java.lang.ref.Finalizer</div><div class="suspect-stats"><span>6.3% of heap</span><span>157.22 KiB retained</span><span>40 instances</span><span>3.93 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 4</div><div class="suspect-class">java.lang.Class</div><div class="suspect-stats"><span>5.0% of heap</span><span>126.14 KiB retained</span><span>474 instances</span><span>272 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 5</div><div class="suspect-class">byte[]</div><div class="suspect-stats"><span>3.4% of heap</span><span>85.25 KiB retained</span><span>443 instances</span><span>197 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 6</div><div class="suspect-class">java.lang.Object[]</div><div class="suspect-stats"><span>2.9% of heap</span><span>71.73 KiB retained</span><span>560 instances</span><span>131 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 7</div><div class="suspect-class">java.lang.String</div><div class="suspect-stats"><span>2.8% of heap</span><span>70.70 KiB retained</span><span>1516 instances</span><span>47 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 8</div><div class="suspect-class">java.io.PrintStream</div><div class="suspect-stats"><span>2.0% of heap</span><span>48.98 KiB retained</span><span>2 instances</span><span>24.49 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 9</div><div class="suspect-class">sun.misc.Launcher$AppClassLoader</div><div class="suspect-stats"><span>1.9% of heap</span><span>48.69 KiB retained</span><span>1 instances</span><span>48.69 KiB avg/inst</span></div><div class="suspect-pattern">singleton retaining a large subgraph</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 10</div><div class="suspect-class">sun.misc.Launcher$ExtClassLoader</div><div class="suspect-stats"><span>1.8% of heap</span><span>44.39 KiB retained</span><span>1 instances</span><span>44.39 KiB avg/inst</span></div><div class="suspect-pattern">singleton retaining a large subgraph</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 11</div><div class="suspect-class">sun.misc.URLClassPath</div><div class="suspect-stats"><span>1.7% of heap</span><span>43.71 KiB retained</span><span>2 instances</span><span>21.85 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 12</div><div class="suspect-class">sun.misc.URLClassPath$JarLoader</div><div class="suspect-stats"><span>1.6% of heap</span><span>38.87 KiB retained</span><span>11 instances</span><span>3.53 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 13</div><div class="suspect-class">sun.misc.JarIndex</div><div class="suspect-stats"><span>1.4% of heap</span><span>35.32 KiB retained</span><span>1 instances</span><span>35.32 KiB avg/inst</span></div><div class="suspect-pattern">singleton retaining a large subgraph</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 14</div><div class="suspect-class">java.io.BufferedWriter</div><div class="suspect-stats"><span>1.3% of heap</span><span>32.13 KiB retained</span><span>2 instances</span><span>16.07 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 15</div><div class="suspect-class">java.util.HashMap$Node</div><div class="suspect-stats"><span>1.1% of heap</span><span>28.73 KiB retained</span><span>212 instances</span><span>138 B avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 16</div><div class="suspect-class">java.util.HashMap$Node[]</div><div class="suspect-stats"><span>1.1% of heap</span><span>28.59 KiB retained</span><span>18 instances</span><span>1.59 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 17</div><div class="suspect-class">java.util.HashMap</div><div class="suspect-stats"><span>1.1% of heap</span><span>27.21 KiB retained</span><span>24 instances</span><span>1.13 KiB avg/inst</span></div><div class="suspect-pattern">elevated retention</div></div>
+<div class="suspect"><div class="suspect-n">Problem Suspect 18</div><div class="suspect-class">sun.nio.cs.StandardCharsets</div><div class="suspect-stats"><span>1.0% of heap</span><span>26.05 KiB retained</span><span>1 instances</span><span>26.05 KiB avg/inst</span></div><div class="suspect-pattern">singleton retaining a large subgraph</div></div>
+</div>
+</section>
+<section id="treemap">
+<h2>Retained Heap Treemap</h2>
+<div class="treemap-wrap">
+<div class="treemap-hint">Click a package to drill into its classes. Click the header bar to go back.</div>
+<canvas id="tm-canvas"></canvas>
+</div>
+<div id="tm-tooltip"></div>
+</section>
+<section id="histogram">
+<h2>Class Histogram</h2>
+<div class="chart-wrap">
+<div class="chart-title">Top classes by total allocation (shallow bytes)</div>
+<svg width="746" height="564" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:746px;display:block"><text x="280" y="15" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">int[]</text><rect x="288" y="1" width="320" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="614" y="15" font-size="11" fill="#6b7280" font-family="sans-serif">1.99 MiB (81.4%)</text><text x="280" y="43" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">char[]</text><rect x="288" y="29" width="30" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="324" y="43" font-size="11" fill="#6b7280" font-family="sans-serif">197.11 KiB (7.9%)</text><text x="280" y="71" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">byte[]</text><rect x="288" y="57" width="13" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="307" y="71" font-size="11" fill="#6b7280" font-family="sans-serif">85.25 KiB (3.4%)</text><text x="280" y="99" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.Object[]</text><rect x="288" y="85" width="7" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="301" y="99" font-size="11" fill="#6b7280" font-family="sans-serif">47.61 KiB (1.9%)</text><text x="280" y="127" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.String</text><rect x="288" y="113" width="2" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="296" y="127" font-size="11" fill="#6b7280" font-family="sans-serif">17.77 KiB (0.7%)</text><text x="280" y="155" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.Class</text><rect x="288" y="141" width="2" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="296" y="155" font-size="11" fill="#6b7280" font-family="sans-serif">12.96 KiB (0.5%)</text><text x="280" y="183" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.reflect.Field</text><rect x="288" y="169" width="1" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="295" y="183" font-size="11" fill="#6b7280" font-family="sans-serif">11.94 KiB (0.5%)</text><text x="280" y="211" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.LinkedList$Node</text><rect x="288" y="197" width="1" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="295" y="211" font-size="11" fill="#6b7280" font-family="sans-serif">8.86 KiB (0.4%)</text><text x="280" y="239" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.HashMap$Node[]</text><rect x="288" y="225" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="239" font-size="11" fill="#6b7280" font-family="sans-serif">5.98 KiB (0.2%)</text><text x="280" y="267" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.HashMap$Node</text><rect x="288" y="253" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="267" font-size="11" fill="#6b7280" font-family="sans-serif">5.80 KiB (0.2%)</text><text x="280" y="295" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.LinkedList</text><rect x="288" y="281" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="295" font-size="11" fill="#6b7280" font-family="sans-serif">4.45 KiB (0.2%)</text><text x="280" y="323" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.ref.SoftReference</text><rect x="288" y="309" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="323" font-size="11" fill="#6b7280" font-family="sans-serif">3.83 KiB (0.2%)</text><text x="280" y="351" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.String[]</text><rect x="288" y="337" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="351" font-size="11" fill="#6b7280" font-family="sans-serif">3.35 KiB (0.1%)</text><text x="280" y="379" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.Hashtable$Entry[]</text><rect x="288" y="365" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="379" font-size="11" fill="#6b7280" font-family="sans-serif">3.22 KiB (0.1%)</text><text x="280" y="407" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.Hashtable$Entry</text><rect x="288" y="393" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="407" font-size="11" fill="#6b7280" font-family="sans-serif">3.17 KiB (0.1%)</text><text x="280" y="435" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.net.URL</text><rect x="288" y="421" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="435" font-size="11" fill="#6b7280" font-family="sans-serif">3.00 KiB (0.1%)</text><text x="280" y="463" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.invoke.MethodHandle[]</text><rect x="288" y="449" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="463" font-size="11" fill="#6b7280" font-family="sans-serif">2.05 KiB (0.1%)</text><text x="280" y="491" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.WeakHashMap$Entry[]</text><rect x="288" y="477" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="491" font-size="11" fill="#6b7280" font-family="sans-serif">2.02 KiB (0.1%)</text><text x="280" y="519" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.Integer[]</text><rect x="288" y="505" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="519" font-size="11" fill="#6b7280" font-family="sans-serif">2.02 KiB (0.1%)</text><text x="280" y="547" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.io.File</text><rect x="288" y="533" width="0" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="294" y="547" font-size="11" fill="#6b7280" font-family="sans-serif">2.00 KiB (0.1%)</text></svg>
+</div>
+<div class="chart-wrap" style="margin-top:1rem">
+<div class="chart-title">Top classes by retained heap</div>
+<svg width="746" height="564" xmlns="http://www.w3.org/2000/svg" style="width:100%;max-width:746px;display:block"><text x="280" y="15" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">int[]</text><rect x="288" y="1" width="320" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="614" y="15" font-size="11" fill="#6b7280" font-family="sans-serif">1.99 MiB (81.4%)</text><text x="280" y="43" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">char[]</text><rect x="288" y="29" width="30" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="324" y="43" font-size="11" fill="#6b7280" font-family="sans-serif">197.11 KiB (7.9%)</text><text x="280" y="71" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.ref.Finalizer</text><rect x="288" y="57" width="24" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="318" y="71" font-size="11" fill="#6b7280" font-family="sans-serif">157.22 KiB (6.3%)</text><text x="280" y="99" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.Class</text><rect x="288" y="85" width="19" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="313" y="99" font-size="11" fill="#6b7280" font-family="sans-serif">126.14 KiB (5.0%)</text><text x="280" y="127" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">byte[]</text><rect x="288" y="113" width="13" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="307" y="127" font-size="11" fill="#6b7280" font-family="sans-serif">85.25 KiB (3.4%)</text><text x="280" y="155" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.Object[]</text><rect x="288" y="141" width="11" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="305" y="155" font-size="11" fill="#6b7280" font-family="sans-serif">71.73 KiB (2.9%)</text><text x="280" y="183" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.lang.String</text><rect x="288" y="169" width="11" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="305" y="183" font-size="11" fill="#6b7280" font-family="sans-serif">70.70 KiB (2.8%)</text><text x="280" y="211" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.io.PrintStream</text><rect x="288" y="197" width="7" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="301" y="211" font-size="11" fill="#6b7280" font-family="sans-serif">48.98 KiB (2.0%)</text><text x="280" y="239" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.misc.Launcher$AppClassLoader</text><rect x="288" y="225" width="7" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="301" y="239" font-size="11" fill="#6b7280" font-family="sans-serif">48.69 KiB (1.9%)</text><text x="280" y="267" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.misc.Launcher$ExtClassLoader</text><rect x="288" y="253" width="6" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="300" y="267" font-size="11" fill="#6b7280" font-family="sans-serif">44.39 KiB (1.8%)</text><text x="280" y="295" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.misc.URLClassPath</text><rect x="288" y="281" width="6" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="300" y="295" font-size="11" fill="#6b7280" font-family="sans-serif">43.71 KiB (1.7%)</text><text x="280" y="323" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.misc.URLClassPath$JarLoader</text><rect x="288" y="309" width="6" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="300" y="323" font-size="11" fill="#6b7280" font-family="sans-serif">38.87 KiB (1.6%)</text><text x="280" y="351" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.misc.JarIndex</text><rect x="288" y="337" width="5" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="299" y="351" font-size="11" fill="#6b7280" font-family="sans-serif">35.32 KiB (1.4%)</text><text x="280" y="379" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.io.BufferedWriter</text><rect x="288" y="365" width="5" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="299" y="379" font-size="11" fill="#6b7280" font-family="sans-serif">32.13 KiB (1.3%)</text><text x="280" y="407" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.HashMap$Node</text><rect x="288" y="393" width="4" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="298" y="407" font-size="11" fill="#6b7280" font-family="sans-serif">28.73 KiB (1.1%)</text><text x="280" y="435" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.HashMap$Node[]</text><rect x="288" y="421" width="4" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="298" y="435" font-size="11" fill="#6b7280" font-family="sans-serif">28.59 KiB (1.1%)</text><text x="280" y="463" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.util.HashMap</text><rect x="288" y="449" width="4" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="298" y="463" font-size="11" fill="#6b7280" font-family="sans-serif">27.21 KiB (1.1%)</text><text x="280" y="491" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.nio.cs.StandardCharsets</text><rect x="288" y="477" width="4" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="298" y="491" font-size="11" fill="#6b7280" font-family="sans-serif">26.05 KiB (1.0%)</text><text x="280" y="519" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">sun.nio.cs.StandardCharsets$Aliases</text><rect x="288" y="505" width="3" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="297" y="519" font-size="11" fill="#6b7280" font-family="sans-serif">19.47 KiB (0.8%)</text><text x="280" y="547" text-anchor="end" font-size="11" fill="#374151" font-family="sans-serif">java.io.OutputStreamWriter</text><rect x="288" y="533" width="2" height="18" rx="2" fill="#6366f1" opacity="0.8"/><text x="296" y="547" font-size="11" fill="#6b7280" font-family="sans-serif">16.46 KiB (0.7%)</text></svg>
+</div>
+</section>
+<section id="packages">
+<h2>Package Summary</h2>
+<div class="tbl-wrap">
+<table>
+<thead><tr><th>Package</th><th class="r">Retained</th><th class="r">% heap</th><th class="r">Shallow</th><th class="r">Classes</th><th class="r">Instances</th></tr></thead>
+<tbody>
+<tr><td class="mono">&lt;primitive arrays&gt;</td><td class="r">2.27 MiB</td><td class="r">92.8%</td><td class="r">2.27 MiB</td><td class="r">5</td><td class="r">2891</td></tr>
+<tr><td class="mono">java.lang</td><td class="r">291.66 KiB</td><td class="r">11.6%</td><td class="r">92.52 KiB</td><td class="r">50</td><td class="r">3216</td></tr>
+<tr><td class="mono">sun.misc</td><td class="r">213.08 KiB</td><td class="r">8.5%</td><td class="r">1.99 KiB</td><td class="r">20</td><td class="r">73</td></tr>
+<tr><td class="mono">java.lang.ref</td><td class="r">162.20 KiB</td><td class="r">6.5%</td><td class="r">6.48 KiB</td><td class="r">9</td><td class="r">182</td></tr>
+<tr><td class="mono">java.util</td><td class="r">144.01 KiB</td><td class="r">5.7%</td><td class="r">38.71 KiB</td><td class="r">33</td><td class="r">1101</td></tr>
+<tr><td class="mono">java.io</td><td class="r">136.08 KiB</td><td class="r">5.4%</td><td class="r">4.92 KiB</td><td class="r">25</td><td class="r">174</td></tr>
+<tr><td class="mono">sun.nio.cs</td><td class="r">68.83 KiB</td><td class="r">2.7%</td><td class="r">1.70 KiB</td><td class="r">14</td><td class="r">36</td></tr>
+<tr><td class="mono">java.util.concurrent</td><td class="r">29.34 KiB</td><td class="r">1.2%</td><td class="r">3.80 KiB</td><td class="r">4</td><td class="r">78</td></tr>
+<tr><td class="mono">java.nio</td><td class="r">17.35 KiB</td><td class="r">0.7%</td><td class="r">855 B</td><td class="r">6</td><td class="r">20</td></tr>
+<tr><td class="mono">java.lang.reflect</td><td class="r">15.02 KiB</td><td class="r">0.6%</td><td class="r">14.95 KiB</td><td class="r">8</td><td class="r">162</td></tr>
+<tr><td class="mono">sun.util.locale</td><td class="r">11.60 KiB</td><td class="r">0.5%</td><td class="r">3.19 KiB</td><td class="r">4</td><td class="r">78</td></tr>
+<tr><td class="mono">java.util.jar</td><td class="r">8.96 KiB</td><td class="r">0.4%</td><td class="r">1.62 KiB</td><td class="r">3</td><td class="r">19</td></tr>
+<tr><td class="mono">java.util.zip</td><td class="r">8.67 KiB</td><td class="r">0.3%</td><td class="r">2.02 KiB</td><td class="r">7</td><td class="r">47</td></tr>
+<tr><td class="mono">java.net</td><td class="r">5.82 KiB</td><td class="r">0.2%</td><td class="r">3.80 KiB</td><td class="r">5</td><td class="r">66</td></tr>
+<tr><td class="mono">java.security</td><td class="r">4.13 KiB</td><td class="r">0.2%</td><td class="r">1.37 KiB</td><td class="r">10</td><td class="r">39</td></tr>
+<tr><td class="mono">java.lang.invoke</td><td class="r">2.14 KiB</td><td class="r">0.1%</td><td class="r">2.09 KiB</td><td class="r">7</td><td class="r">8</td></tr>
+<tr><td class="mono">simple</td><td class="r">1.17 KiB</td><td class="r">0.0%</td><td class="r">673 B</td><td class="r">3</td><td class="r">5</td></tr>
+<tr><td class="mono">sun.security.action</td><td class="r">368 B</td><td class="r">0.0%</td><td class="r">368 B</td><td class="r">1</td><td class="r">23</td></tr>
+<tr><td class="mono">sun.reflect</td><td class="r">196 B</td><td class="r">0.0%</td><td class="r">196 B</td><td class="r">5</td><td class="r">20</td></tr>
+<tr><td class="mono">java.nio.charset</td><td class="r">190 B</td><td class="r">0.0%</td><td class="r">56 B</td><td class="r">4</td><td class="r">7</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+</main>
+<script>
+const TREEMAP=[{name:"<primitive arrays>",value:2381980,classes:[{name:"int[]",value:2091112,instances:436},{name:"char[]",value:201842,instances:1991},{name:"byte[]",value:87294,instances:443},{name:"short[]",value:1680,instances:20},{name:"long[]",value:52,instances:1}]},{name:"java.lang",value:298658,classes:[{name:"java.lang.Class",value:129168,instances:474},{name:"java.lang.Object[]",value:73454,instances:560},{name:"java.lang.String",value:72400,instances:1516},{name:"java.lang.String[]",value:8876,instances:56},{name:"java.lang.Integer[]",value:3080,instances:1},{name:"java.lang.Thread",value:2064,instances:8},{name:"java.lang.StringBuilder",value:1852,instances:150},{name:"java.lang.Class$ReflectionData",value:1216,instances:16},{name:"java.lang.Integer",value:1032,instances:258},{name:"java.lang.Class",value:828,instances:9},{name:"java.lang.Class[]",value:524,instances:25},{name:"java.lang.ThreadLocal$ThreadLocalMap",value:500,instances:1},{name:"java.lang.ThreadLocal$ThreadLocalMap$Entry[]",value:484,instances:1},{name:"java.lang.OutOfMemoryError",value:400,instances:10},{name:"java.lang.ThreadGroup",value:374,instances:2},{name:"java.lang.StringBuffer",value:360,instances:18},{name:"java.lang.ThreadLocal$ThreadLocalMap$Entry",value:336,instances:2},{name:"java.lang.RuntimePermission",value:318,instances:3},{name:"java.lang.ClassNotFoundException",value:192,instances:4},{name:"java.lang.Thread[]",value:188,instances:3},{name:"java.lang.Class$1",value:112,instances:7},{name:"java.lang.StringCoding$StringEncoder",value:107,instances:1},{name:"java.lang.ClassValue$Entry",value:80,instances:2},{name:"java.lang.VirtualMachineError",value:80,instances:2},{name:"java.lang.Package",value:80,instances:1},{name:"java.lang.NoSuchMethodError",value:80,instances:2},{name:"java.lang.StringCoding$StringDecoder",value:69,instances:1},{name:"java.lang.ClassValue$Version",value:56,instances:1},{name:"java.lang.OutOfMemoryError[]",value:52,instances:1},{name:"java.lang.ThreadGroup[]",value:52,instances:1},{name:"java.lang.StackTraceElement[]",value:40,instances:2},{name:"java.lang.NullPointerException",value:40,instances:1},{name:"java.lang.ArithmeticException",value:40,instances:1},{name:"java.lang.ClassLoader$NativeLibrary",value:30,instances:1},{name:"java.lang.ClassValue$Entry[]",value:28,instances:1},{name:"java.lang.Throwable[]",value:20,instances:1},{name:"java.lang.Class$MethodArray",value:16,instances:1},{name:"java.lang.ThreadLocal",value:12,instances:3},{name:"java.lang.ClassLoader$3",value:8,instances:1},{name:"java.lang.SystemClassLoaderAction",value:8,instances:1},{name:"java.lang.Boolean",value:2,instances:2},{name:"java.lang.CharacterDataLatin1",value:0,instances:1},{name:"java.lang.Compiler$1",value:0,instances:1},{name:"java.lang.Runtime",value:0,instances:1},{name:"java.lang.Terminator$1",value:0,instances:1},{name:"java.lang.System$2",value:0,instances:1},{name:"java.lang.String$CaseInsensitiveComparator",value:0,instances:1},{name:"java.lang.ClassValue$Identity",value:0,instances:1},{name:"java.lang.Object",value:0,instances:53},{name:"java.lang.Class$3",value:0,instances:5}]},{name:"sun.misc",value:218199,classes:[{name:"sun.misc.Launcher$AppClassLoader",value:49863,instances:1},{name:"sun.misc.Launcher$ExtClassLoader",value:45458,instances:1},{name:"sun.misc.URLClassPath",value:44757,instances:2},{name:"sun.misc.URLClassPath$JarLoader",value:39807,instances:11},{name:"sun.misc.JarIndex",value:36164,instances:1},{name:"sun.misc.PerfCounter",value:1274,instances:6},{name:"sun.misc.URLClassPath$3",value:192,instances:12},{name:"sun.misc.FileURLMapper",value:176,instances:11},{name:"sun.misc.URLClassPath$FileLoader$1",value:160,instances:4},{name:"sun.misc.Signal",value:152,instances:3},{name:"sun.misc.URLClassPath$JarLoader$1",value:88,instances:11},{name:"sun.misc.URLClassPath$FileLoader",value:52,instances:1},{name:"sun.misc.Launcher$AppClassLoader$1",value:24,instances:1},{name:"sun.misc.NativeSignalHandler",value:16,instances:2},{name:"sun.misc.Launcher$ExtClassLoader$1",value:8,instances:1},{name:"sun.misc.Launcher",value:8,instances:1},{name:"sun.misc.Unsafe",value:0,instances:1},{name:"sun.misc.Launcher$Factory",value:0,instances:1},{name:"sun.misc.Perf",value:0,instances:1},{name:"sun.misc.Perf$GetPerfAction",value:0,instances:1}]},{name:"java.lang.ref",value:166097,classes:[{name:"java.lang.ref.Finalizer",value:160990,instances:40},{name:"java.lang.ref.SoftReference",value:4096,instances:98},{name:"java.lang.ref.ReferenceQueue",value:432,instances:18},{name:"java.lang.ref.Reference$ReferenceHandler",value:273,instances:1},{name:"java.lang.ref.Finalizer$FinalizerThread",value:258,instances:1},{name:"java.lang.ref.ReferenceQueue$Null",value:48,instances:2},{name:"java.lang.ref.ReferenceQueue$Lock",value:0,instances:20},{name:"java.lang.ref.Reference$Lock",value:0,instances:1},{name:"java.lang.ref.Reference$1",value:0,instances:1}]},{name:"java.util",value:147466,classes:[{name:"java.util.HashMap$Node",value:29419,instances:212},{name:"java.util.HashMap$Node[]",value:29281,instances:18},{name:"java.util.HashMap",value:27861,instances:24},{name:"java.util.LinkedList",value:13632,instances:190},{name:"java.util.LinkedList$Node",value:9072,instances:378},{name:"java.util.Hashtable$Entry[]",value:6972,instances:12},{name:"java.util.Properties",value:5176,instances:2},{name:"java.util.LinkedHashMap$Entry",value:5148,instances:16},{name:"java.util.Hashtable$Entry",value:4918,instances:116},{name:"java.util.WeakHashMap",value:3504,instances:14},{name:"java.util.WeakHashMap$Entry[]",value:2384,instances:14},{name:"java.util.Locale$Cache",value:2224,instances:1},{name:"java.util.ArrayDeque",value:1804,instances:11},{name:"java.util.ArrayList",value:990,instances:6},{name:"java.util.Vector",value:808,instances:8},{name:"java.util.WeakHashMap$Entry",value:728,instances:12},{name:"java.util.Hashtable",value:708,instances:4},{name:"java.util.Locale",value:532,instances:19},{name:"java.util.Collections$SetFromMap",value:512,instances:1},{name:"java.util.Stack",value:440,instances:3},{name:"java.util.Locale$LocaleKey",value:400,instances:20},{name:"java.util.Collections$SynchronizedSet",value:344,instances:3},{name:"java.util.HashSet",value:320,instances:6},{name:"java.util.StringTokenizer",value:86,instances:2},{name:"java.util.BitSet",value:65,instances:1},{name:"java.util.Hashtable$Enumerator",value:45,instances:1},{name:"java.util.Collections$UnmodifiableRandomAccessList",value:32,instances:1},{name:"java.util.Random",value:25,instances:1},{name:"java.util.Collections$EmptyMap",value:16,instances:1},{name:"java.util.Hashtable$EntrySet",value:8,instances:1},{name:"java.util.WeakHashMap$KeySet",value:8,instances:1},{name:"java.util.Collections$EmptyList",value:4,instances:1},{name:"java.util.Collections$EmptySet",value:0,instances:1}]},{name:"java.io",value:139349,classes:[{name:"java.io.PrintStream",value:50160,instances:2},{name:"java.io.BufferedWriter",value:32904,instances:2},{name:"java.io.OutputStreamWriter",value:16850,instances:2},{name:"java.io.BufferedInputStream",value:8244,instances:1},{name:"java.io.UnixFileSystem",value:5802,instances:1},{name:"java.io.ExpiringCache",value:5774,instances:2},{name:"java.io.ExpiringCache$1",value:5718,instances:2},{name:"java.io.ObjectStreamField[]",value:3335,instances:11},{name:"java.io.ObjectStreamField",value:2883,instances:29},{name:"java.io.ExpiringCache$Entry",value:2420,instances:16},{name:"java.io.File",value:2044,instances:73},{name:"java.io.FileInputStream",value:1543,instances:5},{name:"java.io.FilePermissionCollection",value:439,instances:1},{name:"java.io.FilePermission",value:344,instances:2},{name:"java.io.BufferedOutputStream",value:336,instances:2},{name:"java.io.FileDescriptor",value:147,instances:7},{name:"java.io.File$PathStatus",value:116,instances:2},{name:"java.io.FileOutputStream",value:68,instances:2},{name:"java.io.File[]",value:64,instances:2},{name:"java.io.BufferedReader",value:50,instances:1},{name:"java.io.File$PathStatus[]",value:36,instances:1},{name:"java.io.FileInputStream$1",value:32,instances:4},{name:"java.io.InputStreamReader",value:24,instances:1},{name:"java.io.FilePermission$1",value:16,instances:2},{name:"java.io.FileDescriptor$1",value:0,instances:1}]},{name:"sun.nio.cs",value:70482,classes:[{name:"sun.nio.cs.StandardCharsets",value:26680,instances:1},{name:"sun.nio.cs.StandardCharsets$Aliases",value:19940,instances:1},{name:"sun.nio.cs.StreamEncoder",value:16802,instances:2},{name:"sun.nio.cs.StandardCharsets$Classes",value:3234,instances:1},{name:"sun.nio.cs.StandardCharsets$Cache",value:1840,instances:1},{name:"sun.nio.cs.UTF_8$Encoder",value:1148,instances:14},{name:"sun.nio.cs.UTF_8$Decoder",value:396,instances:9},{name:"sun.nio.cs.ISO_8859_1",value:76,instances:1},{name:"sun.nio.cs.US_ASCII",value:72,instances:1},{name:"sun.nio.cs.UTF_16LE",value:72,instances:1},{name:"sun.nio.cs.UTF_16BE",value:72,instances:1},{name:"sun.nio.cs.UTF_8",value:66,instances:1},{name:"sun.nio.cs.StreamDecoder",value:60,instances:1},{name:"sun.nio.cs.UTF_16",value:24,instances:1}]},{name:"java.util.concurrent",value:30044,classes:[{name:"java.util.concurrent.ConcurrentHashMap$Node",value:11158,instances:63},{name:"java.util.concurrent.ConcurrentHashMap",value:9511,instances:6},{name:"java.util.concurrent.ConcurrentHashMap$Node[]",value:9303,instances:7},{name:"java.util.concurrent.ConcurrentHashMap$ForwardingNode",value:72,instances:2}]},{name:"java.nio",value:17767,classes:[{name:"java.nio.HeapByteBuffer",value:16541,instances:3},{name:"java.nio.DirectLongBufferU",value:648,instances:6},{name:"java.nio.DirectByteBuffer",value:378,instances:6},{name:"java.nio.ByteOrder",value:126,instances:2},{name:"java.nio.HeapCharBuffer",value:74,instances:2},{name:"java.nio.Bits$1",value:0,instances:1}]},{name:"java.lang.reflect",value:15384,classes:[{name:"java.lang.reflect.Field",value:12222,instances:126},{name:"java.lang.reflect.Constructor",value:1484,instances:14},{name:"java.lang.reflect.Field[]",value:1068,instances:9},{name:"java.lang.reflect.Method",value:260,instances:2},{name:"java.lang.reflect.Constructor[]",value:196,instances:7},{name:"java.lang.reflect.ReflectPermission",value:90,instances:1},{name:"java.lang.reflect.Method[]",value:64,instances:2},{name:"java.lang.reflect.ReflectAccess",value:0,instances:1}]},{name:"sun.util.locale",value:11875,classes:[{name:"sun.util.locale.BaseLocale$Cache",value:5587,instances:1},{name:"sun.util.locale.BaseLocale$Key",value:3780,instances:20},{name:"sun.util.locale.LocaleObjectCache$CacheEntry",value:1824,instances:38},{name:"sun.util.locale.BaseLocale",value:684,instances:19}]},{name:"java.util.jar",value:9175,classes:[{name:"java.util.jar.JarFile",value:7903,instances:11},{name:"java.util.jar.JarFile$JarFileEntry",value:1272,instances:7},{name:"java.util.jar.JavaUtilJarAccessImpl",value:0,instances:1}]},{name:"java.util.zip",value:8880,classes:[{name:"java.util.zip.ZipFile$ZipFileInflaterInputStream",value:5998,instances:7},{name:"java.util.zip.ZipCoder",value:1573,instances:11},{name:"java.util.zip.ZipEntry",value:616,instances:7},{name:"java.util.zip.Inflater",value:350,instances:7},{name:"java.util.zip.ZipFile$ZipFileInputStream",value:287,instances:7},{name:"java.util.zip.ZStreamRef",value:56,instances:7},{name:"java.util.zip.ZipFile$1",value:0,instances:1}]},{name:"java.net",value:5956,classes:[{name:"java.net.URL",value:5140,instances:32},{name:"java.net.Parts",value:552,instances:23},{name:"java.net.URL[]",value:136,instances:2},{name:"java.net.URLClassLoader$1",value:128,instances:8},{name:"java.net.URLClassLoader$7",value:0,instances:1}]},{name:"java.security",value:4234,classes:[{name:"java.security.ProtectionDomain",value:1373,instances:3},{name:"java.security.Permissions",value:1107,instances:1},{name:"java.security.AccessControlContext",value:944,instances:16},{name:"java.security.BasicPermissionCollection",value:398,instances:1},{name:"java.security.CodeSource",value:240,instances:6},{name:"java.security.ProtectionDomain[]",value:112,instances:4},{name:"java.security.Principal[]",value:60,instances:3},{name:"java.security.ProtectionDomain$JavaSecurityAccessImpl",value:0,instances:1},{name:"java.security.ProtectionDomain$Key",value:0,instances:3},{name:"java.security.ProtectionDomain$2",value:0,instances:1}]},{name:"java.lang.invoke",value:2196,classes:[{name:"java.lang.invoke.MethodHandle[]",value:2104,instances:2},{name:"java.lang.invoke.MethodHandleImpl$4",value:76,instances:1},{name:"java.lang.invoke.MethodHandleStatics$1",value:8,instances:1},{name:"java.lang.invoke.MethodHandleImpl$1",value:8,instances:1},{name:"java.lang.invoke.MethodHandleImpl$2",value:0,instances:1},{name:"java.lang.invoke.MethodHandleImpl$3",value:0,instances:1},{name:"java.lang.invoke.MemberName$Factory",value:0,instances:1}]},{name:"simple",value:1201,classes:[{name:"simple.Consumer",value:598,instances:2},{name:"simple.Producer",value:598,instances:2},{name:"simple.Data",value:5,instances:1}]},{name:"sun.security.action",value:368,classes:[{name:"sun.security.action.GetPropertyAction",value:368,instances:23}]},{name:"sun.reflect",value:196,classes:[{name:"sun.reflect.NativeConstructorAccessorImpl",value:140,instances:7},{name:"sun.reflect.DelegatingConstructorAccessorImpl",value:56,instances:7},{name:"sun.reflect.ReflectionFactory$GetReflectionFactoryAction",value:0,instances:3},{name:"sun.reflect.ReflectionFactory",value:0,instances:1},{name:"sun.reflect.ReflectionFactory$1",value:0,instances:2}]},{name:"java.nio.charset",value:190,classes:[{name:"java.nio.charset.CodingErrorAction",value:158,instances:3},{name:"java.nio.charset.CoderResult",value:16,instances:2},{name:"java.nio.charset.CoderResult$1",value:8,instances:1},{name:"java.nio.charset.CoderResult$2",value:8,instances:1}]},{name:"sun.net.www.protocol.file",value:124,classes:[{name:"sun.net.www.protocol.file.FileURLConnection",value:124,instances:1},{name:"sun.net.www.protocol.file.Handler",value:0,instances:1}]},{name:"java.util.concurrent.atomic",value:120,classes:[{name:"java.util.concurrent.atomic.AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl",value:48,instances:1},{name:"java.util.concurrent.atomic.AtomicLong",value:40,instances:5},{name:"java.util.concurrent.atomic.AtomicReferenceFieldUpdater$AtomicReferenceFieldUpdaterImpl$1",value:24,instances:1},{name:"java.util.concurrent.atomic.AtomicInteger",value:8,instances:2}]},{name:"sun.launcher",value:88,classes:[{name:"sun.launcher.LauncherHelper",value:60,instances:1},{name:"sun.launcher.LauncherHelper[]",value:28,instances:1}]},{name:"sun.net.www",value:20,classes:[{name:"sun.net.www.MessageHeader",value:20,instances:1}]},{name:"java.security.cert",value:20,classes:[{name:"java.security.cert.Certificate[]",value:20,instances:1}]},{name:"sun.net.www.protocol.jar",value:0,classes:[{name:"sun.net.www.protocol.jar.Handler",value:0,instances:2}]}];
+const TOTAL_BYTES=2567885;
+
+function fmtB(b){
+  if(b>=1048576)return(b/1048576).toFixed(2)+' MiB';
+  if(b>=1024)return(b/1024).toFixed(2)+' KiB';
+  return b+' B';
+}
+function fmtPct(v,t){return t?((v/t)*100).toFixed(1)+'%':'0%';}
+function he(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// Squarified treemap (Bruls et al.)
+function worstRatio(row,rowArea,sideLen){
+  const max=Math.max(...row.map(n=>n.sv));
+  const min=Math.min(...row.map(n=>n.sv));
+  if(!rowArea||!sideLen)return Infinity;
+  const s2=sideLen*sideLen;
+  return Math.max(s2*max/(rowArea*rowArea),rowArea*rowArea/(s2*min));
+}
+function squarify(nodes,x,y,w,h){
+  if(!nodes.length)return[];
+  const total=nodes.reduce((s,n)=>s+n.value,0);
+  if(!total)return[];
+  const areaScale=(w*h)/total;
+  const scaled=nodes.map(n=>Object.assign({},n,{sv:n.value*areaScale}));
+  const out=[];
+  let rem=[...scaled],cx=x,cy=y,cw=w,ch=h;
+  while(rem.length){
+    const horiz=cw>=ch;
+    const len=horiz?ch:cw;
+    let row=[],rowA=0,worst=Infinity;
+    for(const item of rem){
+      const nr=[...row,item],na=rowA+item.sv;
+      const w2=worstRatio(nr,na,len);
+      if(row.length&&w2>worst)break;
+      row=nr;rowA=na;worst=w2;
+    }
+    const dim=rowA/len;
+    let off=0;
+    for(const item of row){
+      const frac=item.sv/rowA;
+      if(horiz){out.push(Object.assign({},item,{x:cx,y:cy+off,w:dim,h:frac*len}));off+=frac*len;}
+      else{out.push(Object.assign({},item,{x:cx+off,y:cy,w:frac*len,h:dim}));off+=frac*len;}
+    }
+    rem=rem.slice(row.length);
+    if(horiz){cx+=dim;cw-=dim;}else{cy+=dim;ch-=dim;}
+  }
+  return out;
+}
+
+const PAL=['#6366f1','#0891b2','#059669','#d97706','#dc2626','#7c3aed','#0284c7','#16a34a','#ca8a04','#b91c1c','#0e7490','#4338ca','#047857','#b45309','#9333ea'];
+function lighten(hex,amt){
+  const n=parseInt(hex.slice(1),16);
+  const r=Math.min(255,(n>>16)+amt);
+  const g=Math.min(255,((n>>8)&0xff)+amt);
+  const b=Math.min(255,(n&0xff)+amt);
+  return'#'+[r,g,b].map(x=>x.toString(16).padStart(2,'0')).join('');
+}
+
+const canvas=document.getElementById('tm-canvas');
+const tip=document.getElementById('tm-tooltip');
+let DPR=window.devicePixelRatio||1;
+let nodes=[];
+let zoomPkg=null;
+
+function resize(){
+  const W=canvas.parentElement.clientWidth-40;
+  const H=Math.max(300,Math.min(580,W*0.55));
+  canvas.width=W*DPR;canvas.height=H*DPR;
+  canvas.style.width=W+'px';canvas.style.height=H+'px';
+  draw();
+}
+
+function draw(){
+  const ctx=canvas.getContext('2d');
+  const W=canvas.clientWidth,H=canvas.clientHeight;
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+  ctx.clearRect(0,0,W,H);
+  let items;
+  if(zoomPkg===null){
+    items=TREEMAP.map((p,i)=>Object.assign({},p,{color:PAL[i%PAL.length]}));
+  }else{
+    const pkg=TREEMAP[zoomPkg];
+    const base=PAL[zoomPkg%PAL.length];
+    items=(pkg.classes||[]).map((c,i)=>Object.assign({},c,{color:lighten(base,i*18)}));
+  }
+  nodes=squarify(items,0,0,W,H);
+  for(const n of nodes){
+    ctx.fillStyle=n.color;
+    ctx.fillRect(n.x+1,n.y+1,n.w-2,n.h-2);
+    if(n.w>50&&n.h>22){
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(n.x+2,n.y+2,n.w-4,n.h-4);
+      ctx.clip();
+      const label=n.name.includes('.')?n.name.split('.').pop():n.name;
+      const fs=Math.min(12,Math.max(9,n.w/12));
+      ctx.fillStyle='rgba(255,255,255,0.95)';
+      ctx.font='bold '+fs+'px system-ui';
+      ctx.fillText(label,n.x+5,n.y+fs+3,n.w-10);
+      if(n.h>38){
+        ctx.fillStyle='rgba(255,255,255,0.7)';
+        ctx.font=(fs-1)+'px system-ui';
+        ctx.fillText(fmtB(n.value),n.x+5,n.y+fs*2+5,n.w-10);
+      }
+      ctx.restore();
+    }
+  }
+  if(zoomPkg!==null){
+    ctx.fillStyle='rgba(0,0,0,0.4)';
+    ctx.fillRect(0,0,W,20);
+    ctx.fillStyle='#fff';
+    ctx.font='11px system-ui';
+    ctx.fillText('< back  |  '+TREEMAP[zoomPkg].name,6,14);
+  }
+}
+
+function hitNode(mx,my){
+  return nodes.find(n=>mx>=n.x&&mx<n.x+n.w&&my>=n.y&&my<n.y+n.h)||null;
+}
+
+canvas.addEventListener('mousemove',function(e){
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  const n=hitNode(mx,my);
+  if(n){
+    tip.style.display='block';
+    tip.style.left=(e.clientX+12)+'px';
+    tip.style.top=(e.clientY+12)+'px';
+    const inst=zoomPkg!==null?('<br>Instances: '+(n.instances||0).toLocaleString()):'';
+    tip.innerHTML='<strong>'+he(n.name)+'</strong><br>Retained: '+fmtB(n.value)+' ('+fmtPct(n.value,TOTAL_BYTES)+' of heap)'+inst;
+  }else{tip.style.display='none';}
+});
+canvas.addEventListener('mouseleave',function(){tip.style.display='none';});
+canvas.addEventListener('click',function(e){
+  const r=canvas.getBoundingClientRect();
+  const mx=e.clientX-r.left,my=e.clientY-r.top;
+  if(zoomPkg!==null){zoomPkg=null;draw();return;}
+  const n=hitNode(mx,my);
+  if(n){
+    const idx=TREEMAP.findIndex(function(p){return p.name===n.name;});
+    if(idx>=0&&TREEMAP[idx].classes&&TREEMAP[idx].classes.length>1){zoomPkg=idx;draw();}
+  }
+});
+window.addEventListener('resize',resize);
+resize();
+</script>
+</body>
+</html>

@@ -1,5 +1,5 @@
 //! Query layer — class histogram, retained heap by class, leak suspects,
-//! package summary, and path to GC root.
+//! package summary, path to GC root, and HTML report.
 //!
 //! All queries read from the on-disk index files produced by the four passes;
 //! no HPROF re-parsing is required at query time.
@@ -9,6 +9,8 @@
 //! - JSON (`--json`): newline-delimited JSON objects on stdout.
 //!   Progress/diagnostic messages always go to stderr regardless of mode,
 //!   making stdout safe to pipe or redirect without filtering.
+
+mod html;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -64,6 +66,15 @@ pub struct AnalysisOutput {
     pub retained_by_class:      Vec<RetainedByClassEntry>,
     /// Top 20 Java packages by total retained heap.
     pub package_summary:        Vec<PackageSummaryEntry>,
+    /// Classes retaining ≥ 1% of heap (Eclipse MAT "Leak Suspects").
+    pub leak_suspects:          Vec<LeakSuspectEntry>,
+    /// Full package hierarchy for the HTML treemap (all packages, not truncated).
+    pub treemap_data:           Vec<TreemapPackage>,
+    // ── GC pressure metrics (Eclipse MAT "System Overview") ──────────────────
+    pub finalizer_queue_depth:  u64,
+    pub soft_ref_count:         u64,
+    pub weak_ref_count:         u64,
+    pub phantom_ref_count:      u64,
 }
 
 pub struct ClassHistEntry {
@@ -93,6 +104,31 @@ pub struct PackageSummaryEntry {
     pub instance_count:       u64,
     pub total_shallow_bytes:  u64,
     pub total_retained_bytes: u64,
+}
+
+/// A classified leak suspect — class retaining ≥ 1% of heap.
+#[allow(dead_code)]
+pub struct LeakSuspectEntry {
+    pub class_name:           String,
+    pub instance_count:       u64,
+    pub total_retained_bytes: u64,
+    pub total_shallow_bytes:  u64,
+    pub avg_retained_bytes:   u64,
+    pub pct_of_heap:          f64,
+    pub pattern:              &'static str,
+}
+
+/// Package node in the treemap hierarchy.
+pub struct TreemapPackage {
+    pub name:          String,
+    pub retained_bytes: u64,
+    pub classes:       Vec<TreemapClass>,
+}
+
+pub struct TreemapClass {
+    pub name:           String,
+    pub retained_bytes: u64,
+    pub instance_count: u64,
 }
 
 pub struct PathStep {
@@ -266,10 +302,45 @@ fn collect_output(
         .collect();
     retained_by_class_full.sort_by(|a, b| b.total_retained_bytes.cmp(&a.total_retained_bytes));
 
-    // ── Package summary (computed from full retained-by-class data) ───────────
+    // ── Package summary + treemap data (computed from full retained-by-class) ──
     let package_summary = compute_package_summary(&retained_by_class_full);
+    let treemap_data    = compute_treemap_data(&retained_by_class_full);
 
-    // Truncate retained_by_class to TOP_N for output.
+    // ── Leak suspects ─────────────────────────────────────────────────────────
+    let threshold = (total_shallow_bytes / 100).max(1);
+    let leak_suspects: Vec<LeakSuspectEntry> = retained_by_class_full.iter()
+        .filter(|e| e.total_retained_bytes >= threshold)
+        .map(|e| {
+            let avg = if e.instance_count > 0 { e.total_retained_bytes / e.instance_count } else { 0 };
+            let pct = e.total_retained_bytes as f64 / total_shallow_bytes as f64 * 100.0;
+            LeakSuspectEntry {
+                class_name:           e.class_name.clone(),
+                instance_count:       e.instance_count,
+                total_retained_bytes: e.total_retained_bytes,
+                total_shallow_bytes:  e.total_shallow_bytes,
+                avg_retained_bytes:   avg,
+                pct_of_heap:          pct,
+                pattern:              classify_suspect(e.instance_count, avg, e.total_retained_bytes),
+            }
+        })
+        .collect();
+
+    // ── GC pressure metrics ───────────────────────────────────────────────────
+    let mut finalizer_queue_depth = 0u64;
+    let mut soft_ref_count        = 0u64;
+    let mut weak_ref_count        = 0u64;
+    let mut phantom_ref_count     = 0u64;
+    for e in &retained_by_class_full {
+        match e.class_name.as_str() {
+            "java.lang.ref.Finalizer"       => finalizer_queue_depth = e.instance_count,
+            "java.lang.ref.SoftReference"   => soft_ref_count        = e.instance_count,
+            "java.lang.ref.WeakReference"   => weak_ref_count        = e.instance_count,
+            "java.lang.ref.PhantomReference" => phantom_ref_count    = e.instance_count,
+            _ => {}
+        }
+    }
+
+    // Truncate retained_by_class to TOP_N for text/JSON output.
     retained_by_class_full.truncate(TOP_N);
 
     Ok(AnalysisOutput {
@@ -285,7 +356,33 @@ fn collect_output(
         top_retained_objects,
         retained_by_class:    retained_by_class_full,
         package_summary,
+        leak_suspects,
+        treemap_data,
+        finalizer_queue_depth,
+        soft_ref_count,
+        weak_ref_count,
+        phantom_ref_count,
     })
+}
+
+fn compute_treemap_data(retained_by_class: &[RetainedByClassEntry]) -> Vec<TreemapPackage> {
+    let mut by_pkg: HashMap<String, (u64, Vec<TreemapClass>)> = HashMap::new();
+    for e in retained_by_class {
+        let pkg = package_of(&e.class_name);
+        let entry = by_pkg.entry(pkg).or_insert_with(|| (0, Vec::new()));
+        entry.0 += e.total_retained_bytes;
+        entry.1.push(TreemapClass {
+            name:           e.class_name.clone(),
+            retained_bytes: e.total_retained_bytes,
+            instance_count: e.instance_count,
+        });
+    }
+    let mut pkgs: Vec<TreemapPackage> = by_pkg.into_iter().map(|(name, (retained_bytes, mut classes))| {
+        classes.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes));
+        TreemapPackage { name, retained_bytes, classes }
+    }).collect();
+    pkgs.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes));
+    pkgs
 }
 
 fn compute_package_summary(retained_by_class: &[RetainedByClassEntry]) -> Vec<PackageSummaryEntry> {
@@ -762,7 +859,7 @@ pub fn path_to_root(
     Ok(())
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
+// ── Public entry points ───────────────────────────────────────────────────────
 
 /// Run the selected analyses and emit results to stdout.
 /// Progress messages go to stderr regardless of mode.
@@ -777,5 +874,20 @@ pub fn run(
     let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
     let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;
     if json { emit_json(&out, config); } else { emit_text(&out, config); }
+    Ok(())
+}
+
+/// Generate a self-contained HTML report and write it to `html_path`.
+pub fn run_html(
+    pass1: &Pass1Output,
+    pass4: &Pass4Output,
+    html_path: &Path,
+) -> Result<()> {
+    let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
+    let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
+    let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;
+    let html_str = html::render(&out);
+    std::fs::write(html_path, html_str.as_bytes())
+        .with_context(|| format!("write HTML report to {}", html_path.display()))?;
     Ok(())
 }
