@@ -1,158 +1,184 @@
 # minprof
 
-A streaming, multi-pass JVM heap dump analyzer. For huge (XX-XXXGB) heaps, Eclipse MAT and VisualVM need to load the entire heap into RAM and are a pain to work with.
-`minprof` allows the processing of `.hprof` files many times larger than available physical RAM on resource-constrained devices (e.g. 16GB laptops), without sacrificing any insight that tools 
-like Eclipse MAT and VisualVM provide. `minprof` achieves this by trading loading time for memory by streaming the file in multiple passes and keeping intermediate data on disk.
+A streaming, multi-pass JVM heap dump analyser. Eclipse MAT and VisualVM load the entire heap into RAM — impractical for dumps larger than your available memory. `minprof` streams `.hprof` files in multiple passes, keeping intermediate data on disk, so it can handle files many times larger than available RAM without sacrificing insight.
 
 ## Installation
 
-```
+```sh
 cargo install --path .
 ```
 
 ## Usage
 
 ```
-minprof <HPROF> [--output <DIR>] [--path <OBJECT_ID>] [--json] [--report <TYPE>]
+minprof [OPTIONS] <HPROF>
+
+Arguments:
+  <HPROF>  Path to the .hprof file
+
+Options:
+  -o, --output <DIR>       Directory for intermediate index files [default: <hprof>.minprof/]
+      --format <FORMAT>    Output format [default: pretty]
+      --report <REPORT>    Which analyses to run [default: all]
+      --path <OBJECT_ID>   Print shortest reference path from a GC root to this object
+  -h, --help               Print help
 ```
 
-`<HPROF>` — path to the `.hprof` file.
+### `--format`
 
-`--output` — directory for intermediate index files. Defaults to
-`<hprof>.minprof/` next to the dump. The directory is reusable: if you re-run
-minprof on the same dump, it overwrites previous results.
+| Value    | Description |
+|----------|-------------|
+| `pretty` | Human-readable text tables (default) |
+| `json`   | Newline-delimited JSON on stdout; progress on stderr |
+| `html`   | Self-contained HTML report written to `<hprof>.html` |
 
-`--path <OBJECT_ID>` — print the shortest reference chain from a GC root to
-the given object. The ID is the hex address shown in the output tables
-(e.g. `--path 0x7f3a1c80` or `--path 7f3a1c80`).
+### `--report`
 
-`--json` — emit results as JSON instead of formatted text (see [JSON output](#json-output)).
+Selects which analyses to emit. Repeatable or comma-separated. Default: `all`.
 
-`--report <TYPE>` — which analyses to run (repeatable or comma-separated, default: `all`).
-
-| Report type | Equivalent Eclipse MAT analysis | Description |
+| Value       | Eclipse MAT equivalent          | Description |
 |-------------|--------------------------------|-------------|
 | `all`       | All reports                    | Run every analysis (default) |
 | `histogram` | Class Histogram                | Object count + shallow bytes per class |
-| `retained`  | Dominator Tree (by class)      | Total retained heap grouped by class |
-| `leaks`     | Leak Suspects                  | Classes dominating ≥1% of heap |
+| `retained`  | Dominator Tree (by class)      | Retained heap grouped by class, top individual objects by retained size |
+| `leaks`     | Leak Suspects                  | Classes retaining ≥ 1% of heap, with pattern classification |
 | `packages`  | System Overview → Package view | Memory rollup by Java package |
 
-**Examples:**
+### Examples
 
 ```sh
-# Only leak suspects + package summary
+# Default: pretty text, all analyses
+minprof heap.hprof
+
+# HTML report (treemap + charts + leak suspects)
+minprof heap.hprof --format html
+
+# JSON, retained analysis only
+minprof heap.hprof --format json --report retained
+
+# Leak suspects + package summary, text output
 minprof heap.hprof --report leaks,packages
 
-# JSON output, retained analysis only
-minprof heap.hprof --json --report retained
-
-# Equivalent: repeat the flag
-minprof heap.hprof --report leaks --report packages
+# Path to GC root for an object ID from the retained table
+minprof heap.hprof --path 0x00000000d6fc57f0
 ```
 
-### Example
+## Output
+
+### Text (`--format pretty`)
+
+Four sections, each gated by `--report`:
 
 ```
-$ minprof heap.hprof
-output dir: heap.minprof
-=== pass 1: build index ===
-  482301 objects, 3847 classes, 413 roots
-=== pass 2: extract edges ===
-  1923847 references
-=== pass 3: dominator tree ===
-=== pass 4: retained sizes ===
-pass 4: done — 48.3 MB retained heap across 482301 objects (12847 unreachable, 1.9 MB garbage)
+Total heap: 2.45MiB shallow across 8262 objects (474 classes, 429 GC roots).
+Retained heap (reachable): 237.96KiB.
+Unreachable (garbage): 3533 objects, 2.22MiB — not held by any GC root.
 
-Found a total of 50.20MiB of instances allocated on the heap (482301 objects, 3847 classes).
-Retained heap of reachable objects: 48.30MiB (413 GC roots).
-Unreachable (garbage) objects: 12847 objects, 1.99MiB shallow — not reachable from any GC root.
-
-Top 20 allocated classes:
-+----------------+-----------+---------------+------------------------------------------------+
-| Total size     | Instances |       Largest | Class name                                     |
-+----------------+-----------+---------------+------------------------------------------------+
-| 12.34MiB       |    204819 |    192.00bytes | byte[]                                         |
-...
+── Top 20 classes by total allocation ──
+── Top 20 classes by largest single instance ──
+── Top 20 classes by retained heap ──
+── Top 20 individual objects by retained heap ──  ← object IDs for --path
+── Leak suspects (classes retaining ≥ 1% of heap) ──
+── Top 20 packages by retained heap ──
 ```
 
-### Path to GC root
-
-Copy an object ID from the retained table, then:
+The "Top 20 individual objects by retained heap" table shows object IDs you can pass directly to `--path`:
 
 ```
-$ minprof heap.hprof --path 0x7f3a1c80
-
-Path from GC root to 0x00000007f3a1c80:
-
-  0x00000001234ab000  java.lang.Thread                                  (shallow: 96.00bytes) ← GC root
-  → 0x00000003fab12400  java.util.concurrent.ThreadPoolExecutor         (shallow: 64.00bytes)
-  → 0x00000005c8891200  java.util.concurrent.LinkedBlockingQueue        (shallow: 48.00bytes)
-  → 0x00000007f3a1c80   com.example.RequestContext                      (shallow: 128.00bytes) ← target
+  0x00000000d6fc57f0  sun.misc.Launcher$AppClassLoader  retained: 48.69KiB
 ```
 
-## JSON output
+### HTML (`--format html`)
 
-Progress messages always go to **stderr**; only result data goes to **stdout**.
-This makes stdout safe to redirect or pipe without filtering in any mode.
+Writes a single self-contained `.html` file with no external dependencies:
 
-`--json` switches stdout to JSON. The analysis result is one JSON object:
+- **Heap Overview** — summary cards: total shallow, retained, classes, unreachable, finalizer queue depth, soft/weak/phantom reference counts
+- **GC Pressure** — reference statistics and unreachable object breakdown (Eclipse MAT "System Overview" style)
+- **Leak Suspects** — numbered "Problem Suspect" cards with pattern classification
+- **Retained Heap Treemap** — interactive canvas treemap; click a package to drill into its classes
+- **Class Histogram** — bar charts for top classes by allocation and retained heap
+- **Package Summary** — table of all packages by retained heap
+
+### JSON (`--format json`)
+
+Progress goes to **stderr**; only results go to **stdout** — safe to pipe or redirect.
+
+The analysis result is a single JSON object:
 
 ```json
 {
-  "summary": {
-    "total_objects": 482301,
-    "total_classes": 3847,
-    "gc_roots": 413,
-    "total_shallow_bytes": 52674560,
-    "retained_heap_bytes": 50661376,
-    "unreachable_count": 12847,
-    "unreachable_shallow_bytes": 2086912
-  },
+  "summary": { "total_objects": 8262, "total_classes": 474, "gc_roots": 429,
+               "total_shallow_bytes": 2568192, "retained_heap_bytes": 243670,
+               "unreachable_count": 3533, "unreachable_shallow_bytes": 2324480 },
   "top_allocated_classes": [
-    {"class_name": "byte[]", "instances": 204819, "total_shallow_bytes": 12939264, "max_shallow_bytes": 192}
+    { "class_name": "int[]", "instances": 436, "total_shallow_bytes": 2088960, "max_shallow_bytes": 649998 }
   ],
   "top_largest_instances": [ ... ],
-  "top_retained": [
-    {"class_name": "com.example.Foo", "shallow_bytes": 128, "retained_bytes": 8388608}
+  "retained_by_class": [
+    { "class_name": "int[]", "instance_count": 436, "total_retained_bytes": 2088960,
+      "total_shallow_bytes": 2088960, "avg_retained_bytes": 4793 }
+  ],
+  "top_retained_objects": [
+    { "object_id": "0x00000000d701ec08", "class_name": "int[]",
+      "shallow_bytes": 649998, "retained_bytes": 649998 }
+  ],
+  "leak_suspects": [
+    { "class_name": "int[]", "instance_count": 436, "total_retained_bytes": 2088960,
+      "avg_retained_bytes": 4793, "pct_of_heap": 81.4, "pattern": "elevated retention" }
+  ],
+  "package_summary": [
+    { "package": "<primitive arrays>", "class_count": 5, "instance_count": 2891,
+      "total_shallow_bytes": 2380800, "total_retained_bytes": 2380800 }
   ]
 }
 ```
 
-When `--path` is also given, a second JSON object follows on the next line:
+When `--path` is also given, a second JSON object follows on the next line ([NDJSON](https://ndjson.org/)):
 
 ```json
-{"type":"path_to_root","target_id":"0x00000007f3a1c80","found":true,"path":[
+{"type":"path_to_root","target_id":"0x00000000d6fc57f0","found":true,"path":[
   {"object_id":"0x00000001234ab000","class_name":"java.lang.Thread","shallow_bytes":96,"is_gc_root":true,"is_target":false},
-  {"object_id":"0x00000007f3a1c80","class_name":"com.example.RequestContext","shallow_bytes":128,"is_gc_root":false,"is_target":true}
+  {"object_id":"0x00000000d6fc57f0","class_name":"sun.misc.Launcher$AppClassLoader","shallow_bytes":130,"is_gc_root":false,"is_target":true}
 ]}
 ```
 
-When the object is not found or is unreachable, `found` is `false` and an `error` key describes why.
+When the object is not found or is unreachable, `found` is `false` and an `error` key explains why.
+
+## Memory usage
+
+| Pass | What it does | Peak extra RAM |
+|------|-------------|----------------|
+| Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | ~100 MB (class index) |
+| Pass 2 — edges | Extract object references, sort into `edges.bin` + `reverse_edges.bin` | 256 MB sort buffer |
+| Pass 3 — dominator tree | CHK iterative algorithm on in-memory CSR graph | proportional to edge count |
+| Pass 4 — retained sizes | Bottom-up dominator tree walk | O(N) |
+
+The class index (kept in RAM across all passes) is typically under 100 MB for real-world JVM applications regardless of heap size.
 
 ## Comparison
 
-|                      | minprof       | Eclipse MAT       | VisualVM          |
-|----------------------|---------------|-------------------|-------------------|
-| Peak RAM             | ~1 GB         | ≈ dump size       | ≈ dump size       |
-| 100 GB dump          | works         | needs ~100 GB RAM | needs ~100 GB RAM |
-| Retained heap        | ✅            | ✅                 | ✅                 |
-| Dominator tree       | ✅            | ✅                 | ❌                 |
-| Path to GC root      | ✅            | ✅                 | ❌                 |
-| JSON / scriptable    | ✅            | ❌                 | ❌                 |
+|                         | minprof       | Eclipse MAT       | VisualVM          |
+|-------------------------|---------------|-------------------|-------------------|
+| Peak RAM                | ~1 GB         | ≈ dump size       | ≈ dump size       |
+| 100 GB dump             | works         | needs ~100 GB RAM | needs ~100 GB RAM |
+| Retained heap           | ✅            | ✅                 | ✅                 |
+| Dominator tree          | ✅            | ✅                 | ❌                 |
+| Path to GC root         | ✅            | ✅                 | ❌                 |
+| Leak suspects           | ✅            | ✅                 | ❌                 |
+| GC pressure metrics     | ✅            | ✅                 | partial           |
+| Interactive treemap     | ✅ (HTML)     | ✅                 | ❌                 |
+| JSON / scriptable       | ✅            | ❌                 | ❌                 |
 
 ## Limitations
 
-- CLI only — no GUI or interactive query shell
-- Tested on 64-bit HotSpot HPROF format (id_size = 8); 32-bit dumps (id_size = 4) are parsed correctly, but less tested
-- Currently, a hobby project – use with caution
+- CLI only — no interactive query shell
+- Tested on 64-bit HotSpot HPROF format (`id_size = 8`); 32-bit dumps (`id_size = 4`) parse correctly but are less tested
+- Hobby project — use with caution
+
 ---
 
 ## References
 
-- [hprof-slurp](https://github.com/agourlay/hprof-slurp) — single-pass streaming
-  HPROF parser in Rust by Arnaud Gourlay. minprof's parser layer is adapted from
-  this project (Apache 2.0). hprof-slurp benchmarks at ~1–2 GB/s parse throughput
-  and is the basis for our streaming architecture.
+- [hprof-slurp](https://github.com/agourlay/hprof-slurp) — single-pass streaming HPROF parser in Rust by Arnaud Gourlay. minprof's parser layer is adapted from this project (Apache 2.0).
 - [HPROF format specification](https://docs.oracle.com/javase/8/docs/technotes/samples/hprof.html)
-- [Cooper, Harvey, Kennedy — "A Simple, Fast Dominance Algorithm"](https://www.cs.tufts.edu/~nr/cs257/archive/keith-cooper/dom14.pdf) — the iterative dominator algorithm used in pass 3
+- [Cooper, Harvey, Kennedy — "A Simple, Fast Dominance Algorithm"](https://www.cs.tufts.edu/~nr/cs257/archive/keith-cooper/dom14.pdf) — the CHK iterative dominator algorithm used in pass 3
