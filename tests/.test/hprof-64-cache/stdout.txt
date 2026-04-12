@@ -1,0 +1,197 @@
+
+Total heap: 2.45MiB shallow across 8262 objects (474 classes, 429 GC roots).
+Retained heap (reachable): 237.96KiB.
+Unreachable (garbage): 3533 objects, 2.22MiB — not held by any GC root.
+
+── Top 20 classes by total allocation ──
+
++--------------+-----------+--------------+--------------------------------------------------+
+|        Total | Instances |      Largest | Class                                            |
++--------------+-----------+--------------+--------------------------------------------------+
+|      1.99MiB |       436 |    634.79KiB | int[]                                            |
+|    197.11KiB |      1991 |     16.02KiB | char[]                                           |
+|     85.25KiB |       443 |      8.02KiB | byte[]                                           |
+|     47.61KiB |       560 |      8.02KiB | java.lang.Object[]                               |
+|     17.77KiB |      1516 |   12.00bytes | java.lang.String                                 |
+|     12.96KiB |       474 |  328.00bytes | java.lang.Class                                  |
+|     11.94KiB |       126 |   97.00bytes | java.lang.reflect.Field                          |
+|      8.86KiB |       378 |   24.00bytes | java.util.LinkedList$Node                        |
+|      5.98KiB |        18 |      2.02KiB | java.util.HashMap$Node[]                         |
+|      5.80KiB |       212 |   28.00bytes | java.util.HashMap$Node                           |
+|      4.45KiB |       190 |   24.00bytes | java.util.LinkedList                             |
+|      3.83KiB |        98 |   40.00bytes | java.lang.ref.SoftReference                      |
+|      3.35KiB |        56 |  148.00bytes | java.lang.String[]                               |
+|      3.22KiB |        12 |  780.00bytes | java.util.Hashtable$Entry[]                      |
+|      3.17KiB |       116 |   28.00bytes | java.util.Hashtable$Entry                        |
+|      3.00KiB |        32 |   96.00bytes | java.net.URL                                     |
+|      2.05KiB |         2 |      2.02KiB | java.lang.invoke.MethodHandle[]                  |
+|      2.02KiB |        14 |  148.00bytes | java.util.WeakHashMap$Entry[]                    |
+|      2.02KiB |         1 |      2.02KiB | java.lang.Integer[]                              |
+|      2.00KiB |        73 |   28.00bytes | java.io.File                                     |
++--------------+-----------+--------------+--------------------------------------------------+
+
+── Top 20 classes by largest single instance ──
+
++--------------+-----------+--------------+--------------------------------------------------+
+|        Total | Instances |      Largest | Class                                            |
++--------------+-----------+--------------+--------------------------------------------------+
+|      1.99MiB |       436 |    634.79KiB | int[]                                            |
+|    197.11KiB |      1991 |     16.02KiB | char[]                                           |
+|     85.25KiB |       443 |      8.02KiB | byte[]                                           |
+|     47.61KiB |       560 |      8.02KiB | java.lang.Object[]                               |
+|      2.02KiB |         1 |      2.02KiB | java.lang.Integer[]                              |
+|      2.05KiB |         2 |      2.02KiB | java.lang.invoke.MethodHandle[]                  |
+|      5.98KiB |        18 |      2.02KiB | java.util.HashMap$Node[]                         |
+|      3.22KiB |        12 |  780.00bytes | java.util.Hashtable$Entry[]                      |
+|     12.96KiB |       474 |  328.00bytes | java.lang.Class                                  |
+|      1.04KiB |         9 |  316.00bytes | java.lang.reflect.Field[]                        |
+|      1.51KiB |         7 |  276.00bytes | java.util.concurrent.ConcurrentHashMap$Node[]    |
+|  334.00bytes |         2 |  167.00bytes | simple.Consumer                                  |
+|  334.00bytes |         2 |  167.00bytes | simple.Producer                                  |
+|  156.00bytes |         1 |  156.00bytes | java.lang.ref.Finalizer$FinalizerThread          |
+|      1.21KiB |         8 |  155.00bytes | java.lang.Thread                                 |
+|  155.00bytes |         1 |  155.00bytes | java.lang.ref.Reference$ReferenceHandler         |
+|      3.35KiB |        56 |  148.00bytes | java.lang.String[]                               |
+|  148.00bytes |         1 |  148.00bytes | java.lang.ThreadLocal$ThreadLocalMap$Entry[]     |
+|      2.02KiB |        14 |  148.00bytes | java.util.WeakHashMap$Entry[]                    |
+|  260.00bytes |         2 |  130.00bytes | java.lang.reflect.Method                         |
++--------------+-----------+--------------+--------------------------------------------------+
+
+── Top 20 classes by retained heap ──
+
++--------------+---------+--------------+-----------+--------------+------------------------------------------+
+|     Retained |  % heap |      Shallow | Instances |     Avg/inst | Class                                    |
++--------------+---------+--------------+-----------+--------------+------------------------------------------+
+|      1.99MiB |   81.4% |      1.99MiB |       436 |      4.68KiB | int[]                                    |
+|    197.11KiB |    7.9% |    197.11KiB |      1991 |  101.00bytes | char[]                                   |
+|    157.22KiB |    6.3% |      1.88KiB |        40 |      3.93KiB | java.lang.ref.Finalizer                  |
+|    126.14KiB |    5.0% |     12.96KiB |       474 |  272.00bytes | java.lang.Class                          |
+|     85.25KiB |    3.4% |     85.25KiB |       443 |  197.00bytes | byte[]                                   |
+|     71.73KiB |    2.9% |     47.61KiB |       560 |  131.00bytes | java.lang.Object[]                       |
+|     70.70KiB |    2.8% |     17.77KiB |      1516 |   47.00bytes | java.lang.String                         |
+|     48.98KiB |    2.0% |   70.00bytes |         2 |     24.49KiB | java.io.PrintStream                      |
+|     48.69KiB |    1.9% |  130.00bytes |         1 |     48.69KiB | sun.misc.Launcher$AppClassLoader         |
+|     44.39KiB |    1.8% |  122.00bytes |         1 |     44.39KiB | sun.misc.Launcher$ExtClassLoader         |
+|     43.71KiB |    1.7% |  130.00bytes |         2 |     21.85KiB | sun.misc.URLClassPath                    |
+|     38.87KiB |    1.6% |  803.00bytes |        11 |      3.53KiB | sun.misc.URLClassPath$JarLoader          |
+|     35.32KiB |    1.4% |   24.00bytes |         1 |     35.32KiB | sun.misc.JarIndex                        |
+|     32.13KiB |    1.3% |   96.00bytes |         2 |     16.07KiB | java.io.BufferedWriter                   |
+|     28.73KiB |    1.1% |      5.80KiB |       212 |  138.00bytes | java.util.HashMap$Node                   |
+|     28.59KiB |    1.1% |      5.98KiB |        18 |      1.59KiB | java.util.HashMap$Node[]                 |
+|     27.21KiB |    1.1% |      1.12KiB |        24 |      1.13KiB | java.util.HashMap                        |
+|     26.05KiB |    1.0% |   32.00bytes |         1 |     26.05KiB | sun.nio.cs.StandardCharsets              |
+|     19.47KiB |    0.8% |   40.00bytes |         1 |     19.47KiB | sun.nio.cs.StandardCharsets$Aliases      |
+|     16.46KiB |    0.7% |   48.00bytes |         2 |      8.23KiB | java.io.OutputStreamWriter               |
++--------------+---------+--------------+-----------+--------------+------------------------------------------+
+
+── Top 20 individual objects by retained heap ──
+   (copy an object ID and run: minprof <heap> --path <ID>)
+
++--------------+---------+--------------+--------------------+------------------------------------------+
+|     Retained |  % heap |      Shallow | Object ID          | Class                                    |
++--------------+---------+--------------+--------------------+------------------------------------------+
+|    634.79KiB |   25.3% |    634.79KiB | 0x00000000d701ec08 | int[]                                    |
+|    634.75KiB |   25.3% |    634.75KiB | 0x00000000d715c4b8 | int[]                                    |
+|    630.45KiB |   25.1% |    630.45KiB | 0x00000000d70be8f8 | int[]                                    |
+|    130.85KiB |    5.2% |    130.85KiB | 0x00000000d6ffe030 | int[]                                    |
+|     48.69KiB |    1.9% |  130.00bytes | 0x00000000d6fc57f0 | sun.misc.Launcher$AppClassLoader         |
+|     44.39KiB |    1.8% |  122.00bytes | 0x00000000d6fb13b8 | sun.misc.Launcher$ExtClassLoader         |
+|     42.74KiB |    1.7% |   65.00bytes | 0x00000000d6fc3f90 | sun.misc.URLClassPath                    |
+|     35.63KiB |    1.4% |   73.00bytes | 0x00000000d6fd6ae0 | sun.misc.URLClassPath$JarLoader          |
+|     35.32KiB |    1.4% |   24.00bytes | 0x00000000d6fd7738 | sun.misc.JarIndex                        |
+|     35.06KiB |    1.4% |   72.00bytes | 0x00000000d6f80c78 | java.lang.Class                          |
+|     26.19KiB |    1.0% |   64.00bytes | 0x00000000d6f8a628 | java.lang.Class                          |
+|     26.05KiB |    1.0% |   32.00bytes | 0x00000000d6f8e310 | sun.nio.cs.StandardCharsets              |
+|     24.49KiB |    1.0% |   35.00bytes | 0x00000000d6f9e0b0 | java.io.PrintStream                      |
+|     24.49KiB |    1.0% |   35.00bytes | 0x00000000d6fa5108 | java.io.PrintStream                      |
+|     19.47KiB |    0.8% |   40.00bytes | 0x00000000d6f8e848 | sun.nio.cs.StandardCharsets$Aliases      |
+|     19.43KiB |    0.8% |      8.02KiB | 0x00000000d6f8e870 | java.lang.Object[]                       |
+|     16.09KiB |    0.6% |   48.00bytes | 0x00000000d6fd8fd0 | java.util.HashMap                        |
+|     16.07KiB |    0.6% |   48.00bytes | 0x00000000d6fa1068 | java.io.BufferedWriter                   |
+|     16.07KiB |    0.6% |   48.00bytes | 0x00000000d6fa72c0 | java.io.BufferedWriter                   |
+|     16.05KiB |    0.6% |      2.02KiB | 0x00000000d6fe4e28 | java.util.HashMap$Node[]                 |
++--------------+---------+--------------+--------------------+------------------------------------------+
+
+── Leak suspects (classes retaining ≥ 1% of heap) ──
+
+  int[]                                               1.99MiB  (81.4% of heap)
+    436 instances · 4.68KiB avg retained · elevated retention
+
+  char[]                                              197.11KiB  (7.9% of heap)
+    1991 instances · 101.00bytes avg retained · elevated retention
+
+  java.lang.ref.Finalizer                             157.22KiB  (6.3% of heap)
+    40 instances · 3.93KiB avg retained · elevated retention
+
+  java.lang.Class                                     126.14KiB  (5.0% of heap)
+    474 instances · 272.00bytes avg retained · elevated retention
+
+  byte[]                                              85.25KiB  (3.4% of heap)
+    443 instances · 197.00bytes avg retained · elevated retention
+
+  java.lang.Object[]                                  71.73KiB  (2.9% of heap)
+    560 instances · 131.00bytes avg retained · elevated retention
+
+  java.lang.String                                    70.70KiB  (2.8% of heap)
+    1516 instances · 47.00bytes avg retained · elevated retention
+
+  java.io.PrintStream                                 48.98KiB  (2.0% of heap)
+    2 instances · 24.49KiB avg retained · elevated retention
+
+  sun.misc.Launcher$AppClassLoader                    48.69KiB  (1.9% of heap)
+    1 instances · 48.69KiB avg retained · singleton retaining a large subgraph
+
+  sun.misc.Launcher$ExtClassLoader                    44.39KiB  (1.8% of heap)
+    1 instances · 44.39KiB avg retained · singleton retaining a large subgraph
+
+  sun.misc.URLClassPath                               43.71KiB  (1.7% of heap)
+    2 instances · 21.85KiB avg retained · elevated retention
+
+  sun.misc.URLClassPath$JarLoader                     38.87KiB  (1.6% of heap)
+    11 instances · 3.53KiB avg retained · elevated retention
+
+  sun.misc.JarIndex                                   35.32KiB  (1.4% of heap)
+    1 instances · 35.32KiB avg retained · singleton retaining a large subgraph
+
+  java.io.BufferedWriter                              32.13KiB  (1.3% of heap)
+    2 instances · 16.07KiB avg retained · elevated retention
+
+  java.util.HashMap$Node                              28.73KiB  (1.1% of heap)
+    212 instances · 138.00bytes avg retained · elevated retention
+
+  java.util.HashMap$Node[]                            28.59KiB  (1.1% of heap)
+    18 instances · 1.59KiB avg retained · elevated retention
+
+  java.util.HashMap                                   27.21KiB  (1.1% of heap)
+    24 instances · 1.13KiB avg retained · elevated retention
+
+  sun.nio.cs.StandardCharsets                         26.05KiB  (1.0% of heap)
+    1 instances · 26.05KiB avg retained · singleton retaining a large subgraph
+
+
+── Top 20 packages by retained heap ──
+
++--------------+---------+--------------+---------+-----------+------------------------------------------+
+|     Retained |  % heap |      Shallow | Classes | Instances | Package                                  |
++--------------+---------+--------------+---------+-----------+------------------------------------------+
+|      2.27MiB |   92.8% |      2.27MiB |       5 |      2891 | <primitive arrays>                       |
+|    291.66KiB |   11.6% |     92.52KiB |      50 |      3216 | java.lang                                |
+|    213.08KiB |    8.5% |      1.99KiB |      20 |        73 | sun.misc                                 |
+|    162.20KiB |    6.5% |      6.48KiB |       9 |       182 | java.lang.ref                            |
+|    144.01KiB |    5.7% |     38.71KiB |      33 |      1101 | java.util                                |
+|    136.08KiB |    5.4% |      4.92KiB |      25 |       174 | java.io                                  |
+|     68.83KiB |    2.7% |      1.70KiB |      14 |        36 | sun.nio.cs                               |
+|     29.34KiB |    1.2% |      3.80KiB |       4 |        78 | java.util.concurrent                     |
+|     17.35KiB |    0.7% |  855.00bytes |       6 |        20 | java.nio                                 |
+|     15.02KiB |    0.6% |     14.95KiB |       8 |       162 | java.lang.reflect                        |
+|     11.60KiB |    0.5% |      3.19KiB |       4 |        78 | sun.util.locale                          |
+|      8.96KiB |    0.4% |      1.62KiB |       3 |        19 | java.util.jar                            |
+|      8.67KiB |    0.3% |      2.02KiB |       7 |        47 | java.util.zip                            |
+|      5.82KiB |    0.2% |      3.80KiB |       5 |        66 | java.net                                 |
+|      4.13KiB |    0.2% |      1.37KiB |      10 |        39 | java.security                            |
+|      2.14KiB |    0.1% |      2.09KiB |       7 |         8 | java.lang.invoke                         |
+|      1.17KiB |    0.0% |  673.00bytes |       3 |         5 | simple                                   |
+|  368.00bytes |    0.0% |  368.00bytes |       1 |        23 | sun.security.action                      |
+|  196.00bytes |    0.0% |  196.00bytes |       5 |        20 | sun.reflect                              |
+|  190.00bytes |    0.0% |   56.00bytes |       4 |         7 | java.nio.charset                         |
++--------------+---------+--------------+---------+-----------+------------------------------------------+

@@ -1,14 +1,14 @@
 //! Integration tests: run the minprof binary against the small test fixtures and
-//! compare every output file against the golden snapshots in `test/.expected/`.
+//! compare every output file against the golden snapshots in `tests/.expected/`.
 //!
 //! To regenerate the golden snapshots:
 //!
-//!   cargo build --release
-//!   mkdir -p test/.expected/hprof-32 test/.expected/hprof-64
-//!   target/release/minprof -p test/hprof-32.bin -o test/.expected/hprof-32 \
-//!       > test/.expected/hprof-32/stdout.txt
-//!   target/release/minprof -p test/hprof-64.bin -o test/.expected/hprof-64 \
-//!       > test/.expected/hprof-64/stdout.txt
+//!   cargo build
+//!   mkdir -p tests/.expected/hprof-32 tests/.expected/hprof-64
+//!   target/debug/minprof -p tests/hprof-32.bin -o tests/.expected/hprof-32 \
+//!       > tests/.expected/hprof-32/stdout.txt
+//!   target/debug/minprof -p tests/hprof-64.bin -o tests/.expected/hprof-64 \
+//!       > tests/.expected/hprof-64/stdout.txt
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -117,9 +117,9 @@ fn compare_dirs(label: &str, test_dir: &Path, expected_dir: &Path) {
 #[test]
 fn hprof_32_full_run() {
     let root      = workspace_root();
-    let hprof     = root.join("test/hprof-32.bin");
-    let test_dir  = root.join("test/.test/hprof-32");
-    let expected  = root.join("test/.expected/hprof-32");
+    let hprof     = root.join("tests/hprof-32.bin");
+    let test_dir  = root.join("tests/.test/hprof-32");
+    let expected  = root.join("tests/.expected/hprof-32");
 
     // Clean previous test output so stale files don't mask regressions.
     if test_dir.exists() {
@@ -133,9 +133,9 @@ fn hprof_32_full_run() {
 #[test]
 fn hprof_64_full_run() {
     let root      = workspace_root();
-    let hprof     = root.join("test/hprof-64.bin");
-    let test_dir  = root.join("test/.test/hprof-64");
-    let expected  = root.join("test/.expected/hprof-64");
+    let hprof     = root.join("tests/hprof-64.bin");
+    let test_dir  = root.join("tests/.test/hprof-64");
+    let expected  = root.join("tests/.expected/hprof-64");
 
     if test_dir.exists() {
         std::fs::remove_dir_all(&test_dir).expect("clean test dir");
@@ -150,9 +150,9 @@ fn hprof_64_full_run() {
 #[test]
 fn hprof_64_index_cache_matches() {
     let root     = workspace_root();
-    let hprof    = root.join("test/hprof-64.bin");
-    let test_dir = root.join("test/.test/hprof-64-cache");
-    let expected = root.join("test/.expected/hprof-64");
+    let hprof    = root.join("tests/hprof-64.bin");
+    let test_dir = root.join("tests/.test/hprof-64-cache");
+    let expected = root.join("tests/.expected/hprof-64");
 
     if test_dir.exists() {
         std::fs::remove_dir_all(&test_dir).expect("clean test dir");
@@ -182,9 +182,9 @@ fn hprof_64_index_cache_matches() {
 #[test]
 fn hprof_32_index_cache_matches() {
     let root     = workspace_root();
-    let hprof    = root.join("test/hprof-32.bin");
-    let test_dir = root.join("test/.test/hprof-32-cache");
-    let expected = root.join("test/.expected/hprof-32");
+    let hprof    = root.join("tests/hprof-32.bin");
+    let test_dir = root.join("tests/.test/hprof-32-cache");
+    let expected = root.join("tests/.expected/hprof-32");
 
     if test_dir.exists() {
         std::fs::remove_dir_all(&test_dir).expect("clean test dir");
