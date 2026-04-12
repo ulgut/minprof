@@ -547,13 +547,10 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
 
     // ── Leak suspects ─────────────────────────────────────────────────────────
     if config.leak_suspects {
-        // Suspects: classes holding ≥ 1% of retained heap.
-        let threshold = (out.total_shallow_bytes / 100).max(1);
-        let suspects: Vec<&RetainedByClassEntry> = out.retained_by_class.iter()
-            .filter(|e| e.total_retained_bytes >= threshold)
-            .collect();
-
-        if suspects.is_empty() {
+        // Use the pre-computed list from collect_output, which was built from the
+        // full retained-by-class data before it was truncated to TOP_N. Re-filtering
+        // the truncated `retained_by_class` here would miss suspects outside the top 20.
+        if out.leak_suspects.is_empty() {
             println!();
             println!("── Leak suspects ──");
             println!();
@@ -562,9 +559,7 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
             println!();
             println!("── Leak suspects (classes retaining ≥ 1% of heap) ──");
             println!();
-            for e in &suspects {
-                let avg = if e.instance_count > 0 { e.total_retained_bytes / e.instance_count } else { 0 };
-                let pattern = classify_suspect(e.instance_count, avg, e.total_retained_bytes);
+            for e in &out.leak_suspects {
                 println!(
                     "  {:<50}  {}  ({} of heap)",
                     e.class_name,
@@ -574,8 +569,8 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
                 println!(
                     "    {} instances · {} avg retained · {}",
                     e.instance_count,
-                    fmt_size(avg),
-                    pattern,
+                    fmt_size(e.avg_retained_bytes),
+                    e.pattern,
                 );
                 println!();
             }
@@ -669,20 +664,16 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
     }
 
     if config.leak_suspects {
-        let threshold = (out.total_shallow_bytes / 100).max(1);
-        let suspect_rows: Vec<String> = out.retained_by_class.iter()
-            .filter(|e| e.total_retained_bytes >= threshold)
-            .map(|e| {
-                let avg = if e.instance_count > 0 { e.total_retained_bytes / e.instance_count } else { 0 };
-                let pct = if out.total_shallow_bytes > 0 {
-                    e.total_retained_bytes as f64 / out.total_shallow_bytes as f64 * 100.0
-                } else { 0.0 };
-                format!(
-                    "    {{\"class_name\":{},\"instance_count\":{},\"total_retained_bytes\":{},\"avg_retained_bytes\":{},\"pct_of_heap\":{:.2},\"pattern\":{}}}",
-                    json_str(&e.class_name), e.instance_count, e.total_retained_bytes, avg, pct,
-                    json_str(classify_suspect(e.instance_count, avg, e.total_retained_bytes)),
-                )
-            }).collect();
+        // Use the pre-computed list (built from the full class data, not the
+        // truncated top-20 retained_by_class slice).
+        let suspect_rows: Vec<String> = out.leak_suspects.iter().map(|e| {
+            format!(
+                "    {{\"class_name\":{},\"instance_count\":{},\"total_retained_bytes\":{},\"avg_retained_bytes\":{},\"pct_of_heap\":{:.2},\"pattern\":{}}}",
+                json_str(&e.class_name), e.instance_count, e.total_retained_bytes,
+                e.avg_retained_bytes, e.pct_of_heap,
+                json_str(e.pattern),
+            )
+        }).collect();
         sections.push(format!("  \"leak_suspects\": [\n{}\n  ]", suspect_rows.join(",\n")));
     }
 

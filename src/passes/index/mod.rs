@@ -179,6 +179,31 @@ impl ExternalSorter {
     where
         F: Fn(&mut RawEntry),
     {
+        // Fast path: no chunks have been flushed to disk yet — all data lives in
+        // `current`. Sort and write directly to the output file without ever
+        // touching a temporary chunk file. This saves one full write + one full
+        // read cycle (≈ 2× the object index size in disk I/O) compared with
+        // flushing to a chunk and then merging it.
+        if self.chunk_paths.is_empty() {
+            if self.current.is_empty() {
+                File::create(output_path).context("create empty object index")?;
+                return Ok(0);
+            }
+            use rayon::slice::ParallelSliceMut;
+            let count = self.current.len() as u64;
+            eprintln!("  sorting {count} entries in-memory (no chunk files needed)…");
+            self.current.par_sort_unstable_by_key(entry_id);
+            let mut w = BufWriter::new(
+                File::create(output_path).context("create object index")?,
+            );
+            for mut entry in self.current.drain(..) {
+                fixup(&mut entry);
+                w.write_all(&entry)?;
+            }
+            w.flush()?;
+            return Ok(count);
+        }
+
         self.flush_chunk()?;
 
         // Take ownership so Drop sees an empty list and won't double-delete.
@@ -369,7 +394,7 @@ impl IndexVisitor {
 
         // Write class names so later runs can skip re-parsing the HPROF.
         let class_names_path = self.output_dir.join("class_names.bin");
-        write_class_names(&self.class_index, &class_names_path)
+        write_class_names(&class_index, &class_names_path)
             .context("write class_names.bin")?;
 
         Ok(Pass1Output {

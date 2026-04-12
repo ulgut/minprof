@@ -108,6 +108,28 @@ impl EdgeSorter {
     }
 
     fn finish(mut self, output_path: &Path) -> Result<u64> {
+        // Fast path: no chunks have been flushed to disk — sort in-memory and
+        // write directly. Avoids one temporary file write + read cycle.
+        if self.chunk_paths.is_empty() {
+            if self.current.is_empty() {
+                File::create(output_path).context("create empty edge file")?;
+                return Ok(0);
+            }
+            use rayon::slice::ParallelSliceMut;
+            eprintln!("  sorting {} edges in-memory (no chunk files needed)…", self.current.len());
+            self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
+            self.current.dedup();
+            let count = self.current.len() as u64;
+            let mut w = BufWriter::new(
+                File::create(output_path).context("create edge file")?,
+            );
+            for edge in self.current.drain(..) {
+                w.write_all(&edge)?;
+            }
+            w.flush()?;
+            return Ok(count);
+        }
+
         self.flush_chunk()?;
 
         let chunks = std::mem::take(&mut self.chunk_paths);
