@@ -307,7 +307,7 @@ fn compute_dominators(
         }
     }
 
-    eprintln!("dominator tree converged in {iterations} iterations");
+    eprintln!("    converged in {iterations} iterations");
     idom
 }
 
@@ -329,22 +329,34 @@ pub fn run(
     pass2: &Pass2Output,
     output_dir: &Path,
 ) -> Result<Pass3Output> {
-    eprintln!("pass 3: loading object index…");
+    let t = std::time::Instant::now();
+    eprintln!("  loading object index…");
     let ids = load_object_ids(&pass1.object_index_path)?;
     let n = ids.len() as u32;
     let vroot = n;
+    eprintln!("    {} nodes  [{:.1}s]", n, t.elapsed().as_secs_f64());
 
-    eprintln!("pass 3: resolving GC root node indices…");
+    let t = std::time::Instant::now();
+    eprintln!("  resolving GC root node indices…");
     let root_nodes = load_root_nodes(&pass1.roots, &ids);
+    eprintln!("    {} roots  [{:.1}s]", root_nodes.len(), t.elapsed().as_secs_f64());
 
-    eprintln!("pass 3: building adjacency lists…");
+    let t = std::time::Instant::now();
+    eprintln!("  building adjacency lists…");
     let (forward, reverse) = build_csrs(&pass2.edges_path, &ids, &root_nodes)?;
+    eprintln!("    {} forward edges, {} reverse edges  [{:.1}s]",
+        forward.neighbors.len(), reverse.neighbors.len(), t.elapsed().as_secs_f64());
 
-    eprintln!("pass 3: computing RPO via DFS…");
+    let t = std::time::Instant::now();
+    eprintln!("  computing RPO via DFS…");
     let (node_to_rpo, rpo_to_node) = compute_rpo(n, vroot, &root_nodes, &forward);
+    eprintln!("    {} reachable nodes  [{:.1}s]",
+        rpo_to_node.len().saturating_sub(1), t.elapsed().as_secs_f64());
 
-    eprintln!("pass 3: running CHK dominator algorithm…");
+    let t = std::time::Instant::now();
+    eprintln!("  running CHK dominator algorithm…");
     let idom = compute_dominators(&rpo_to_node, &node_to_rpo, &reverse);
+    eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
 
     let idom_path = output_dir.join("idom.bin");
     write_idom(&idom, &idom_path)?;

@@ -114,32 +114,47 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor, include_data: bool
             };
             // Working buffer: accumulates data across chunk boundaries so that
             // records that span two chunks are handled correctly.
+            //
+            // `work_pos` is a cursor into `work_buf`; unconsumed bytes start at
+            // work_buf[work_pos..]. We compact (copy tail to front) only when at
+            // least half the buffer has been consumed, bounding work_buf to ~2 ×
+            // READ_BUFFER_SIZE and avoiding the O(remaining) drain on every chunk.
             let mut work_buf: Vec<u8> = Vec::new();
+            let mut work_pos: usize = 0;
 
             while let Ok(mut chunk) = recv_chunk.recv() {
-                // Move chunk data into the working buffer, then return the
-                // now-empty chunk allocation to the reader pool.
-                work_buf.append(&mut chunk);
-                send_pooled_buf
-                    .send(chunk)
-                    .expect("reader pool channel closed");
+                // Append new chunk data; clear chunk so it can be recycled.
+                work_buf.extend_from_slice(&chunk);
+                chunk.clear();
+                // Return the now-empty chunk allocation to the reader pool.
+                // If the reader has already exited (EOF), the send will fail —
+                // that's fine; we just let the buffer drop.
+                let _ = send_pooled_buf.send(chunk);
 
                 // Get a record vec to fill for this iteration.
                 let mut records = recv_pooled_vec
                     .recv()
                     .expect("consumer pool channel closed");
 
-                match parser.parse_streaming(&work_buf, &mut records) {
+                match parser.parse_streaming(&work_buf[work_pos..], &mut records) {
                     Ok((rest, ())) => {
-                        // Drain consumed bytes from the front of the working buffer.
-                        let consumed = work_buf.len() - rest.len();
-                        work_buf.drain(0..consumed);
+                        // Advance the cursor past consumed bytes.
+                        work_pos = work_buf.len() - rest.len();
                     }
                     Err(nom::Err::Incomplete(_)) => {
                         // The buffer didn't contain even a single complete record.
-                        // More data is needed — leave work_buf untouched.
+                        // More data is needed — leave cursor untouched.
                     }
                     Err(e) => panic!("HPROF parse error: {e:?}"),
+                }
+
+                // Compact: once ≥ half the buffer is consumed, shift the tail to
+                // the front. This keeps work_buf bounded to ≤ 2 × READ_BUFFER_SIZE.
+                if work_pos > 0 && work_pos >= work_buf.len() / 2 {
+                    let tail = work_buf.len() - work_pos;
+                    work_buf.copy_within(work_pos.., 0);
+                    work_buf.truncate(tail);
+                    work_pos = 0;
                 }
 
                 // Send the batch (may be empty if we got Incomplete).
@@ -156,9 +171,9 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor, include_data: bool
             visitor.on_record(record);
         }
         // Return the now-empty vec to the parser pool.
-        send_pooled_vec
-            .send(records)
-            .expect("parser pool channel closed");
+        // If the parser has already exited, the send will fail — that's fine;
+        // we just let the vec drop.
+        let _ = send_pooled_vec.send(records);
     }
 
     visitor.finish();

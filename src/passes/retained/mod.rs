@@ -165,14 +165,11 @@ pub fn run(
 ) -> Result<Pass4Output> {
     let n = pass3.node_count as usize;
 
-    eprintln!("pass 4: loading shallow sizes…");
     let shallow = load_shallow_sizes(&pass1.object_index_path)?;
     assert_eq!(shallow.len(), n, "shallow size count mismatch");
 
-    eprintln!("pass 4: loading idom array…");
     let idom = load_idom(&pass3.idom_path)?;
 
-    eprintln!("pass 4: computing retained sizes…");
     let (retained, unreachable_count, unreachable_shallow) =
         compute_retained(&shallow, &idom, &pass3.rpo_to_node, pass3.node_count);
 
@@ -183,7 +180,7 @@ pub fn run(
     write_retained(&retained, n, &retained_path)?;
 
     eprintln!(
-        "pass 4: done — total heap {:.1} MB across {} objects ({} unreachable, {:.1} MB garbage)",
+        "  total heap {:.1} MiB across {} objects ({} unreachable, {:.1} MiB garbage)",
         total_heap_bytes as f64 / 1_048_576.0,
         n,
         unreachable_count,

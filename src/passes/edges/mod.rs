@@ -50,27 +50,36 @@ fn edge_to(e: &RawEdge) -> u64 {
 
 // ── External sorter ──────────────────────────────────────────────────────────
 
-const SORT_CHUNK_BYTES: usize = 256 * 1024 * 1024; // 256 MB
-const EDGES_PER_CHUNK: usize = SORT_CHUNK_BYTES / EDGE_SIZE;
+/// Above this many chunks, perform a two-level merge to cap the final fan-in.
+const MAX_MERGE_FAN_IN: usize = 64;
 
 struct EdgeSorter {
     output_dir: PathBuf,
     chunk_paths: Vec<PathBuf>,
     current: Vec<RawEdge>,
+    edges_per_chunk: usize,
 }
 
 impl EdgeSorter {
     fn new(output_dir: PathBuf) -> Self {
+        let chunk_bytes = crate::passes::sort_chunk_bytes();
+        let edges_per_chunk = chunk_bytes / EDGE_SIZE;
+        eprintln!(
+            "  sort buffer: {:.1} GiB ({} edges/chunk)",
+            chunk_bytes as f64 / (1 << 30) as f64,
+            edges_per_chunk
+        );
         Self {
             output_dir,
             chunk_paths: Vec::new(),
-            current: Vec::with_capacity(EDGES_PER_CHUNK),
+            current: Vec::with_capacity(edges_per_chunk.min(64 * 1024 * 1024)),
+            edges_per_chunk,
         }
     }
 
     fn push(&mut self, edge: RawEdge) -> Result<()> {
         self.current.push(edge);
-        if self.current.len() >= EDGES_PER_CHUNK {
+        if self.current.len() >= self.edges_per_chunk {
             self.flush_chunk()?;
         }
         Ok(())
@@ -80,8 +89,9 @@ impl EdgeSorter {
         if self.current.is_empty() {
             return Ok(());
         }
-        // Sort by (from, to) so consecutive duplicates can be removed in one pass.
-        self.current.sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
+        // Parallel sort + dedup within chunk.
+        use rayon::slice::ParallelSliceMut;
+        self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
         self.current.dedup();
 
         let path = self
@@ -93,31 +103,60 @@ impl EdgeSorter {
         }
         w.flush()?;
         self.chunk_paths.push(path);
+        eprintln!("  flushed edge chunk {} ({} total)", self.chunk_paths.len(), self.chunk_paths.len());
         Ok(())
     }
 
     fn finish(mut self, output_path: &Path) -> Result<u64> {
         self.flush_chunk()?;
 
-        match self.chunk_paths.len() {
+        let chunks = std::mem::take(&mut self.chunk_paths);
+
+        match chunks.len() {
             0 => {
                 File::create(output_path).context("create empty edge file")?;
                 return Ok(0);
             }
             1 => {
-                std::fs::rename(&self.chunk_paths[0], output_path)
+                std::fs::rename(&chunks[0], output_path)
                     .context("rename single edge chunk")?;
             }
-            _ => {
-                merge_chunks(&self.chunk_paths, output_path)?;
-                for p in &self.chunk_paths {
-                    let _ = std::fs::remove_file(p);
+            n if n <= MAX_MERGE_FAN_IN => {
+                eprintln!("  merging {} edge chunks…", n);
+                merge_chunks(&chunks, output_path)?;
+                for p in &chunks { let _ = std::fs::remove_file(p); }
+            }
+            n => {
+                let group_size = MAX_MERGE_FAN_IN;
+                let num_groups = (n + group_size - 1) / group_size;
+                eprintln!("  two-level edge merge: {} chunks → {} groups…", n, num_groups);
+
+                let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
+                for (g, group) in chunks.chunks(group_size).enumerate() {
+                    let inter = self.output_dir.join(format!("edge_inter_{g}.bin"));
+                    eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
+                    merge_chunks(group, &inter)?;
+                    for p in group { let _ = std::fs::remove_file(p); }
+                    intermediates.push(inter);
                 }
+
+                eprintln!("  final edge merge of {} intermediate files…", intermediates.len());
+                merge_chunks(&intermediates, output_path)?;
+                for p in &intermediates { let _ = std::fs::remove_file(p); }
             }
         }
 
         let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
         Ok(count)
+    }
+}
+
+/// Clean up chunk files if the sorter is dropped before `finish()` (e.g. on panic).
+impl Drop for EdgeSorter {
+    fn drop(&mut self) {
+        for p in &self.chunk_paths {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 

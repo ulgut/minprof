@@ -87,35 +87,46 @@ fn main() -> Result<()> {
 
     eprintln!("output dir: {}", output_dir.display());
 
+    let total_start = std::time::Instant::now();
+
     eprintln!("=== pass 1: build index ===");
+    let t = std::time::Instant::now();
     let pass1 = passes::index::run(&cli.hprof, &output_dir)?;
-    eprintln!("  {} objects, {} classes, {} roots",
-        pass1.object_count, pass1.class_index.len(), pass1.roots.len());
+    eprintln!("  {} objects, {} classes, {} roots  [{:.1}s]",
+        pass1.object_count, pass1.class_index.len(), pass1.roots.len(),
+        t.elapsed().as_secs_f64());
 
     eprintln!("=== pass 2: extract edges ===");
+    let t = std::time::Instant::now();
     let pass2 = passes::edges::run(&cli.hprof, &pass1, &output_dir)?;
-    eprintln!("  {} references", pass2.edge_count);
+    eprintln!("  {} references  [{:.1}s]", pass2.edge_count, t.elapsed().as_secs_f64());
 
     eprintln!("=== pass 3: dominator tree ===");
+    let t = std::time::Instant::now();
     let pass3 = passes::dominators::run(&pass1, &pass2, &output_dir)?;
+    eprintln!("  [{:.1}s]", t.elapsed().as_secs_f64());
 
     eprintln!("=== pass 4: retained sizes ===");
+    let t = std::time::Instant::now();
     let pass4 = passes::retained::run(&pass1, &pass3, &output_dir)?;
-    eprintln!("done — {:.2} MiB retained heap across {} objects",
-        pass4.total_heap_bytes as f64 / 1_048_576.0, pass4.node_count);
+    eprintln!("  {:.2} MiB retained across {} objects  [{:.1}s]",
+        pass4.total_heap_bytes as f64 / 1_048_576.0, pass4.node_count,
+        t.elapsed().as_secs_f64());
 
     let config = build_report_config(&cli.report);
     let json   = cli.format == Format::Json;
 
     eprintln!("=== query ===");
+    let t = std::time::Instant::now();
     match cli.format {
         Format::Html => {
             let html_path = cli.hprof.with_extension("html");
             query::run_html(&pass1, &pass4, &html_path)?;
-            eprintln!("wrote {}", html_path.display());
+            eprintln!("  wrote {}  [{:.1}s]", html_path.display(), t.elapsed().as_secs_f64());
         }
         _ => {
             query::run(&pass1, &pass4, &output_dir, json, &config)?;
+            eprintln!("  [{:.1}s]", t.elapsed().as_secs_f64());
         }
     }
 
@@ -123,6 +134,8 @@ fn main() -> Result<()> {
         let target_id = parse_hex_id(&raw_id)?;
         query::path_to_root(target_id, &pass1, &pass2, json)?;
     }
+
+    eprintln!("=== done in {:.1}s total ===", total_start.elapsed().as_secs_f64());
 
     Ok(())
 }

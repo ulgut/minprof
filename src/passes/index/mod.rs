@@ -108,29 +108,38 @@ pub struct Pass1Output {
 
 // ── External sorter ──────────────────────────────────────────────────────────
 
-/// Target memory per sort chunk. Entries are buffered until this limit is
-/// reached, then sorted and flushed to a temporary chunk file.
-const SORT_CHUNK_BYTES: usize = 256 * 1024 * 1024; // 256 MB
-const ENTRIES_PER_CHUNK: usize = SORT_CHUNK_BYTES / ENTRY_SIZE;
+/// Above this many chunks, do a two-level merge (merge groups → then merge groups).
+/// Keeps the final merge fan-in small regardless of dump size.
+const MAX_MERGE_FAN_IN: usize = 64;
 
 struct ExternalSorter {
     output_dir: PathBuf,
     chunk_paths: Vec<PathBuf>,
     current: Vec<RawEntry>,
+    entries_per_chunk: usize,
 }
 
 impl ExternalSorter {
     fn new(output_dir: PathBuf) -> Self {
+        // Compute chunk capacity once from physical-RAM detection.
+        let chunk_bytes = crate::passes::sort_chunk_bytes();
+        let entries_per_chunk = chunk_bytes / ENTRY_SIZE;
+        eprintln!(
+            "  sort buffer: {:.1} GiB ({} entries/chunk)",
+            chunk_bytes as f64 / (1 << 30) as f64,
+            entries_per_chunk
+        );
         Self {
             output_dir,
             chunk_paths: Vec::new(),
-            current: Vec::with_capacity(ENTRIES_PER_CHUNK),
+            current: Vec::with_capacity(entries_per_chunk.min(64 * 1024 * 1024)),
+            entries_per_chunk,
         }
     }
 
     fn push(&mut self, entry: RawEntry) -> Result<()> {
         self.current.push(entry);
-        if self.current.len() >= ENTRIES_PER_CHUNK {
+        if self.current.len() >= self.entries_per_chunk {
             self.flush_chunk()?;
         }
         Ok(())
@@ -140,8 +149,10 @@ impl ExternalSorter {
         if self.current.is_empty() {
             return Ok(());
         }
-        self.current
-            .sort_unstable_by_key(entry_id);
+        // Parallel sort via rayon — cuts sort time proportionally to core count.
+        use rayon::slice::ParallelSliceMut;
+        self.current.par_sort_unstable_by_key(entry_id);
+
         let path = self
             .output_dir
             .join(format!("object_index_chunk_{}.bin", self.chunk_paths.len()));
@@ -151,35 +162,68 @@ impl ExternalSorter {
         }
         w.flush()?;
         self.chunk_paths.push(path);
+        eprintln!("  flushed chunk {} ({} total)", self.chunk_paths.len(), self.chunk_paths.len());
         Ok(())
     }
 
     /// Merge all chunks into a single sorted file at `output_path`.
+    /// Uses a two-level merge when the chunk count exceeds MAX_MERGE_FAN_IN,
+    /// keeping the final fan-in small regardless of dump size.
     /// Returns the total number of entries written.
     fn finish(mut self, output_path: &Path) -> Result<u64> {
         self.flush_chunk()?;
 
-        match self.chunk_paths.len() {
+        // Take ownership of chunk_paths so Drop sees an empty list and doesn't
+        // double-remove files we're about to handle here.
+        let chunks = std::mem::take(&mut self.chunk_paths);
+
+        match chunks.len() {
             0 => {
-                // No objects at all — create an empty file.
                 File::create(output_path).context("create empty object index")?;
                 return Ok(0);
             }
             1 => {
-                // Already sorted — just move the single chunk into place.
-                std::fs::rename(&self.chunk_paths[0], output_path)
+                std::fs::rename(&chunks[0], output_path)
                     .context("rename single sort chunk")?;
             }
-            _ => {
-                merge_chunks(&self.chunk_paths, output_path)?;
-                for p in &self.chunk_paths {
-                    let _ = std::fs::remove_file(p);
+            n if n <= MAX_MERGE_FAN_IN => {
+                eprintln!("  merging {} chunks…", n);
+                merge_chunks(&chunks, output_path)?;
+                for p in &chunks { let _ = std::fs::remove_file(p); }
+            }
+            n => {
+                // Two-level merge: group into batches of MAX_MERGE_FAN_IN,
+                // merge each batch into an intermediate file, then final merge.
+                let group_size = MAX_MERGE_FAN_IN;
+                let num_groups = (n + group_size - 1) / group_size;
+                eprintln!("  two-level merge: {} chunks → {} groups…", n, num_groups);
+
+                let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
+                for (g, group) in chunks.chunks(group_size).enumerate() {
+                    let inter = self.output_dir.join(format!("object_index_inter_{g}.bin"));
+                    eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
+                    merge_chunks(group, &inter)?;
+                    for p in group { let _ = std::fs::remove_file(p); }
+                    intermediates.push(inter);
                 }
+
+                eprintln!("  final merge of {} intermediate files…", intermediates.len());
+                merge_chunks(&intermediates, output_path)?;
+                for p in &intermediates { let _ = std::fs::remove_file(p); }
             }
         }
 
         let count = std::fs::metadata(output_path)?.len() / ENTRY_SIZE as u64;
         Ok(count)
+    }
+}
+
+/// Clean up any chunk files if the sorter is dropped before `finish()` (e.g. on panic).
+impl Drop for ExternalSorter {
+    fn drop(&mut self) {
+        for p in &self.chunk_paths {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 

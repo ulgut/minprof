@@ -9,3 +9,4 @@ nom = "8"
 crossbeam-channel = "0.5"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+rayon = "1"
