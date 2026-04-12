@@ -255,7 +255,10 @@ fn collect_output(
 
     // ── Top by total allocation ───────────────────────────────────────────────
     let mut by_total: Vec<(&u64, &ClassStats)> = histogram.iter().collect();
-    by_total.sort_by(|a, b| b.1.total_shallow.cmp(&a.1.total_shallow));
+    by_total.sort_by(|a, b| {
+        b.1.total_shallow.cmp(&a.1.total_shallow)
+            .then_with(|| class_name(*a.0, class_index).cmp(&class_name(*b.0, class_index)))
+    });
     let top_allocated = by_total.iter().take(TOP_N).map(|(cid, s)| ClassHistEntry {
         class_name:          class_name(**cid, class_index),
         instances:           s.count,
@@ -265,7 +268,10 @@ fn collect_output(
 
     // ── Top by largest single instance ────────────────────────────────────────
     let mut by_largest: Vec<(&u64, &ClassStats)> = histogram.iter().collect();
-    by_largest.sort_by(|a, b| b.1.max_shallow.cmp(&a.1.max_shallow));
+    by_largest.sort_by(|a, b| {
+        b.1.max_shallow.cmp(&a.1.max_shallow)
+            .then_with(|| class_name(*a.0, class_index).cmp(&class_name(*b.0, class_index)))
+    });
     let top_largest = by_largest.iter().take(TOP_N).map(|(cid, s)| ClassHistEntry {
         class_name:          class_name(**cid, class_index),
         instances:           s.count,
@@ -274,7 +280,9 @@ fn collect_output(
     }).collect();
 
     // ── Top individual objects by retained heap ───────────────────────────────
-    raw_retained.sort_unstable_by(|a, b| b.retained.cmp(&a.retained));
+    raw_retained.sort_unstable_by(|a, b| {
+        b.retained.cmp(&a.retained).then_with(|| a.object_id.cmp(&b.object_id))
+    });
     let top_retained_objects: Vec<RetainedObjectEntry> = raw_retained.iter().take(TOP_N).map(|r| RetainedObjectEntry {
         object_id:      r.object_id,
         class_name:     class_name(r.class_id, class_index),
@@ -300,7 +308,10 @@ fn collect_output(
             total_shallow_bytes:  *total_sh,
         })
         .collect();
-    retained_by_class_full.sort_by(|a, b| b.total_retained_bytes.cmp(&a.total_retained_bytes));
+    retained_by_class_full.sort_by(|a, b| {
+        b.total_retained_bytes.cmp(&a.total_retained_bytes)
+            .then_with(|| a.class_name.cmp(&b.class_name))
+    });
 
     // ── Package summary + treemap data (computed from full retained-by-class) ──
     let package_summary = compute_package_summary(&retained_by_class_full);
@@ -378,10 +389,14 @@ fn compute_treemap_data(retained_by_class: &[RetainedByClassEntry]) -> Vec<Treem
         });
     }
     let mut pkgs: Vec<TreemapPackage> = by_pkg.into_iter().map(|(name, (retained_bytes, mut classes))| {
-        classes.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes));
+        classes.sort_by(|a, b| {
+            b.retained_bytes.cmp(&a.retained_bytes).then_with(|| a.name.cmp(&b.name))
+        });
         TreemapPackage { name, retained_bytes, classes }
     }).collect();
-    pkgs.sort_by(|a, b| b.retained_bytes.cmp(&a.retained_bytes));
+    pkgs.sort_by(|a, b| {
+        b.retained_bytes.cmp(&a.retained_bytes).then_with(|| a.name.cmp(&b.name))
+    });
     pkgs
 }
 
@@ -402,7 +417,10 @@ fn compute_package_summary(retained_by_class: &[RetainedByClassEntry]) -> Vec<Pa
         e.total_retained_bytes += entry.total_retained_bytes;
     }
     let mut result: Vec<PackageSummaryEntry> = by_pkg.into_values().collect();
-    result.sort_by(|a, b| b.total_retained_bytes.cmp(&a.total_retained_bytes));
+    result.sort_by(|a, b| {
+        b.total_retained_bytes.cmp(&a.total_retained_bytes)
+            .then_with(|| a.package.cmp(&b.package))
+    });
     result.truncate(TOP_N);
     result
 }

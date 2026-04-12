@@ -511,7 +511,9 @@ impl RecordVisitor for IndexVisitor {
 fn write_class_names(class_index: &ClassDescriptorMap, path: &Path) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).context("create class_names.bin")?);
     w.write_all(&(class_index.len() as u64).to_le_bytes())?;
-    for (&class_id, desc) in class_index {
+    let mut entries: Vec<(&u64, &ClassDescriptor)> = class_index.iter().collect();
+    entries.sort_unstable_by_key(|(id, _)| **id);
+    for (&class_id, desc) in entries {
         w.write_all(&class_id.to_le_bytes())?;
         w.write_all(&desc.super_id.to_le_bytes())?;
         let name = desc.name.as_bytes();

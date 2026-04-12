@@ -16,6 +16,26 @@ use nom::error::{ErrorKind, ParseError};
 use nom::{IResult, Parser, bytes};
 use nom::combinator::map;
 
+// ---------------------------------------------------------------------------
+// Fast direct-read helpers (hot path — no nom overhead)
+// ---------------------------------------------------------------------------
+
+/// Read a big-endian object ID from the start of `buf`.
+/// `is` must be 4 or 8 (the HPROF id_size).
+#[inline(always)]
+fn read_id(is: usize, buf: &[u8]) -> u64 {
+    if is == 8 {
+        u64::from_be_bytes(buf[..8].try_into().unwrap())
+    } else {
+        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
+    }
+}
+
+#[inline(always)]
+fn read_u32_be(buf: &[u8]) -> u32 {
+    u32::from_be_bytes(buf[..4].try_into().unwrap())
+}
+
 // Top-level record tags
 const TAG_STRING: u8 = 0x01;
 const TAG_LOAD_CLASS: u8 = 0x02;
@@ -144,75 +164,133 @@ fn parse_field_value(id_size: u32, ty: FieldType, i: &[u8]) -> IResult<&[u8], Fi
     }
 }
 
-/// Skip the raw bytes of a primitive array without parsing element values.
-fn skip_primitive_array(element_type: FieldType, num_elements: u32, i: &[u8]) -> IResult<&[u8], ()> {
-    let n = num_elements as u64;
-    let byte_count = match element_type {
-        FieldType::Object                               => panic!("Object type in primitive array"),
-        FieldType::Bool | FieldType::Byte               => n,
-        FieldType::Char | FieldType::Short              => n * 2,
-        FieldType::Float | FieldType::Int               => n * 4,
-        FieldType::Double | FieldType::Long             => n * 8,
-    };
-    map(bytes::streaming::take(byte_count), |_| ()).parse(i)
-}
-
 // ---------------------------------------------------------------------------
 // GC sub-record parsers
 // ---------------------------------------------------------------------------
 
-fn parse_gc_record(id_size: u32, include_data: bool, i: &[u8]) -> IResult<&[u8], GcRecord> {
-    let (r, tag) = parse_u8(i)?;
+fn parse_gc_record(id_size: u32, include_data: bool, buf: &[u8]) -> IResult<&[u8], GcRecord> {
+    if buf.is_empty() {
+        return Err(nom::Err::Incomplete(nom::Needed::new(1)));
+    }
+    let is   = id_size as usize;
+    let tag  = buf[0];
+    let data = &buf[1..];
+
     match tag {
+        // ── Hot path: three record types account for ~100% of heap dump bytes ──
+
+        TAG_GC_INSTANCE_DUMP => {
+            // object_id(is) | stack_serial(4) | class_id(is) | data_size(4) | raw[data_size]
+            let hdr = 2 * is + 8;
+            if data.len() < hdr {
+                return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
+            }
+            let object_id = read_id(is, data);
+            let class_id  = read_id(is, &data[is + 4..]);
+            let data_size = read_u32_be(&data[2 * is + 4..]) as usize;
+            let total     = hdr + data_size;
+            if data.len() < total {
+                return Err(nom::Err::Incomplete(nom::Needed::new(total - data.len())));
+            }
+            let raw_data = if include_data { data[hdr..total].to_vec() } else { Vec::new() };
+            Ok((&data[total..], GcRecord::InstanceDump {
+                object_id, class_id, data_size: data_size as u32, raw_data,
+            }))
+        }
+
+        TAG_GC_OBJ_ARRAY_DUMP => {
+            // object_id(is) | stack_serial(4) | num_elements(4) | element_class_id(is) | ids[num*is]
+            let hdr = 2 * is + 8;
+            if data.len() < hdr {
+                return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
+            }
+            let object_id        = read_id(is, data);
+            let num_elements     = read_u32_be(&data[is + 4..]);
+            let element_class_id = read_id(is, &data[is + 8..]);
+            let payload          = num_elements as usize * is;
+            let total            = hdr + payload;
+            if data.len() < total {
+                return Err(nom::Err::Incomplete(nom::Needed::new(total - data.len())));
+            }
+            let elements = if include_data {
+                data[hdr..total].chunks_exact(is).map(|b| {
+                    if is == 8 { u64::from_be_bytes(b.try_into().unwrap()) }
+                    else       { u32::from_be_bytes(b.try_into().unwrap()) as u64 }
+                }).collect()
+            } else {
+                Vec::new()
+            };
+            Ok((&data[total..], GcRecord::ObjectArrayDump {
+                object_id, num_elements, element_class_id, elements,
+            }))
+        }
+
+        TAG_GC_PRIM_ARRAY_DUMP => {
+            // object_id(is) | stack_serial(4) | num_elements(4) | element_type(1) | data[...]
+            let hdr = is + 9;
+            if data.len() < hdr {
+                return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
+            }
+            let object_id    = read_id(is, data);
+            let num_elements = read_u32_be(&data[is + 4..]);
+            let element_type = FieldType::from_value(data[is + 8]);
+            let total        = hdr + num_elements as usize * element_type.byte_size(id_size) as usize;
+            if data.len() < total {
+                return Err(nom::Err::Incomplete(nom::Needed::new(total - data.len())));
+            }
+            Ok((&data[total..], GcRecord::PrimitiveArrayDump { object_id, num_elements, element_type }))
+        }
+
+        // ── Rare records: keep nom (ClassDump, roots) ─────────────────────────
+
+        TAG_GC_CLASS_DUMP => parse_class_dump(id_size, data),
+
         TAG_GC_ROOT_UNKNOWN => {
-            let (r, object_id) = parse_id(id_size, r)?;
+            let (r, object_id) = parse_id(id_size, data)?;
             Ok((r, GcRecord::RootUnknown { object_id }))
         }
         TAG_GC_ROOT_JNI_GLOBAL => {
-            let (r, object_id)        = parse_id(id_size, r)?;
+            let (r, object_id)         = parse_id(id_size, data)?;
             let (r, jni_global_ref_id) = parse_id(id_size, r)?;
             Ok((r, GcRecord::RootJniGlobal { object_id, jni_global_ref_id }))
         }
         TAG_GC_ROOT_JNI_LOCAL => {
-            let (r, object_id)    = parse_id(id_size, r)?;
+            let (r, object_id)    = parse_id(id_size, data)?;
             let (r, thread_serial) = parse_u32(r)?;
             let (r, frame_num)    = parse_u32(r)?;
             Ok((r, GcRecord::RootJniLocal { object_id, thread_serial, frame_num }))
         }
         TAG_GC_ROOT_JAVA_FRAME => {
-            let (r, object_id)    = parse_id(id_size, r)?;
+            let (r, object_id)    = parse_id(id_size, data)?;
             let (r, thread_serial) = parse_u32(r)?;
             let (r, frame_num)    = parse_u32(r)?;
             Ok((r, GcRecord::RootJavaFrame { object_id, thread_serial, frame_num }))
         }
         TAG_GC_ROOT_NATIVE_STACK => {
-            let (r, object_id)    = parse_id(id_size, r)?;
+            let (r, object_id)    = parse_id(id_size, data)?;
             let (r, thread_serial) = parse_u32(r)?;
             Ok((r, GcRecord::RootNativeStack { object_id, thread_serial }))
         }
         TAG_GC_ROOT_STICKY_CLASS => {
-            let (r, object_id) = parse_id(id_size, r)?;
+            let (r, object_id) = parse_id(id_size, data)?;
             Ok((r, GcRecord::RootStickyClass { object_id }))
         }
         TAG_GC_ROOT_THREAD_BLOCK => {
-            let (r, object_id)    = parse_id(id_size, r)?;
+            let (r, object_id)    = parse_id(id_size, data)?;
             let (r, thread_serial) = parse_u32(r)?;
             Ok((r, GcRecord::RootThreadBlock { object_id, thread_serial }))
         }
         TAG_GC_ROOT_MONITOR_USED => {
-            let (r, object_id) = parse_id(id_size, r)?;
+            let (r, object_id) = parse_id(id_size, data)?;
             Ok((r, GcRecord::RootMonitorUsed { object_id }))
         }
         TAG_GC_ROOT_THREAD_OBJ => {
-            let (r, object_id)    = parse_id(id_size, r)?;
+            let (r, object_id)    = parse_id(id_size, data)?;
             let (r, thread_serial) = parse_u32(r)?;
             let (r, stack_serial)  = parse_u32(r)?;
             Ok((r, GcRecord::RootThreadObject { object_id, thread_serial, stack_serial }))
         }
-        TAG_GC_CLASS_DUMP      => parse_class_dump(id_size, r),
-        TAG_GC_INSTANCE_DUMP   => parse_instance_dump(id_size, include_data, r),
-        TAG_GC_OBJ_ARRAY_DUMP  => parse_object_array_dump(id_size, include_data, r),
-        TAG_GC_PRIM_ARRAY_DUMP => parse_primitive_array_dump(id_size, r),
+
         x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
     }
 }
@@ -265,54 +343,6 @@ fn parse_class_dump(id_size: u32, i: &[u8]) -> IResult<&[u8], GcRecord> {
         instance_fields,
         static_fields,
     }))))
-}
-
-fn parse_instance_dump(id_size: u32, include_data: bool, i: &[u8]) -> IResult<&[u8], GcRecord> {
-    let (r, object_id)     = parse_id(id_size, i)?;
-    let (r, _stack_serial) = parse_u32(r)?;
-    let (r, class_id)      = parse_id(id_size, r)?;
-    let (r, data_size)     = parse_u32(r)?;
-    let (r, raw_data) = if include_data {
-        let (r, slice) = bytes::streaming::take(data_size as u64)(r)?;
-        (r, slice.to_vec())
-    } else {
-        let (r, _) = bytes::streaming::take(data_size as u64)(r)?;
-        (r, Vec::new())
-    };
-    Ok((r, GcRecord::InstanceDump { object_id, class_id, data_size, raw_data }))
-}
-
-fn parse_object_array_dump(id_size: u32, include_data: bool, i: &[u8]) -> IResult<&[u8], GcRecord> {
-    let (r, object_id)        = parse_id(id_size, i)?;
-    let (r, _stack_serial)    = parse_u32(r)?;
-    let (r, num_elements)     = parse_u32(r)?;
-    let (r, element_class_id) = parse_id(id_size, r)?;
-    let total_bytes           = num_elements as u64 * id_size as u64;
-    let (r, elements) = if include_data {
-        let (r, slice) = bytes::streaming::take(total_bytes)(r)?;
-        let ids = slice
-            .chunks_exact(id_size as usize)
-            .map(|b| if id_size == 4 {
-                u32::from_be_bytes(b.try_into().unwrap()) as u64
-            } else {
-                u64::from_be_bytes(b.try_into().unwrap())
-            })
-            .collect();
-        (r, ids)
-    } else {
-        let (r, _) = bytes::streaming::take(total_bytes)(r)?;
-        (r, Vec::new())
-    };
-    Ok((r, GcRecord::ObjectArrayDump { object_id, num_elements, element_class_id, elements }))
-}
-
-fn parse_primitive_array_dump(id_size: u32, i: &[u8]) -> IResult<&[u8], GcRecord> {
-    let (r, object_id)    = parse_id(id_size, i)?;
-    let (r, _stack_serial) = parse_u32(r)?;
-    let (r, num_elements) = parse_u32(r)?;
-    let (r, element_type) = parse_field_type(r)?;
-    let (r, _)            = skip_primitive_array(element_type, num_elements, r)?;
-    Ok((r, GcRecord::PrimitiveArrayDump { object_id, num_elements, element_type }))
 }
 
 // ---------------------------------------------------------------------------
