@@ -392,6 +392,11 @@ impl IndexVisitor {
         }
         rw.flush()?;
 
+        // Write class names so later runs can skip re-parsing the HPROF.
+        let class_names_path = self.output_dir.join("class_names.bin");
+        write_class_names(&self.class_index, &class_names_path)
+            .context("write class_names.bin")?;
+
         Ok(Pass1Output {
             class_index: self.class_index,
             roots: self.roots,
@@ -491,6 +496,80 @@ impl RecordVisitor for IndexVisitor {
             _ => {}
         }
     }
+}
+
+// ── class_names.bin serialisation ────────────────────────────────────────────
+//
+// Format (little-endian throughout):
+//   u64: class_count
+//   for each class (any order):
+//     u64: class_id
+//     u64: super_id
+//     u32: name_len
+//     u8[name_len]: class name (UTF-8, dot-separated)
+
+fn write_class_names(class_index: &ClassDescriptorMap, path: &Path) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).context("create class_names.bin")?);
+    w.write_all(&(class_index.len() as u64).to_le_bytes())?;
+    for (&class_id, desc) in class_index {
+        w.write_all(&class_id.to_le_bytes())?;
+        w.write_all(&desc.super_id.to_le_bytes())?;
+        let name = desc.name.as_bytes();
+        w.write_all(&(name.len() as u32).to_le_bytes())?;
+        w.write_all(name)?;
+    }
+    w.flush()?;
+    Ok(())
+}
+
+/// Deserialise `class_names.bin` into a `ClassDescriptorMap`.
+///
+/// `instance_fields` and `instance_size` are left empty/zero — sufficient for
+/// the query phase (which only needs class names and super-class chains).
+pub fn load_class_index(path: &Path) -> Result<ClassDescriptorMap> {
+    let mut r = BufReader::new(File::open(path).context("open class_names.bin")?);
+
+    let mut buf8 = [0u8; 8];
+    let mut buf4 = [0u8; 4];
+
+    r.read_exact(&mut buf8)?;
+    let count = u64::from_le_bytes(buf8) as usize;
+
+    let mut map = ClassDescriptorMap::with_capacity(count);
+    for _ in 0..count {
+        r.read_exact(&mut buf8)?;
+        let class_id = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf8)?;
+        let super_id = u64::from_le_bytes(buf8);
+        r.read_exact(&mut buf4)?;
+        let name_len = u32::from_le_bytes(buf4) as usize;
+        let mut name_bytes = vec![0u8; name_len];
+        r.read_exact(&mut name_bytes)?;
+        let name = String::from_utf8(name_bytes).context("class name UTF-8")?;
+        map.insert(class_id, ClassDescriptor {
+            name,
+            super_id,
+            instance_size: 0,
+            instance_fields: Vec::new(),
+        });
+    }
+    Ok(map)
+}
+
+/// Load GC root IDs from `roots.bin`.
+pub fn load_roots(path: &Path) -> Result<Vec<u64>> {
+    let len = std::fs::metadata(path)?.len() as usize;
+    let mut r = BufReader::new(File::open(path).context("open roots.bin")?);
+    let mut roots = Vec::with_capacity(len / 8);
+    let mut buf = [0u8; 8];
+    loop {
+        match r.read_exact(&mut buf) {
+            Ok(()) => roots.push(u64::from_le_bytes(buf)),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e).context("read roots.bin"),
+        }
+    }
+    Ok(roots)
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────

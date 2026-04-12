@@ -11,17 +11,39 @@ cargo install --path .
 ## Usage
 
 ```
-minprof [OPTIONS] <HPROF>
+minprof <--profile <FILE> | --index-cache <DIR>> [OPTIONS]
 
-Arguments:
-  <HPROF>  Path to the .hprof file
+Source (one required):
+  -p, --profile <FILE>       Path to the .hprof file to parse and index
+  -i, --index-cache <DIR>    Existing index directory from a previous run
 
 Options:
-  -o, --output <DIR>       Directory for intermediate index files [default: <hprof>.minprof/]
-      --format <FORMAT>    Output format [default: pretty]
-      --report <REPORT>    Which analyses to run [default: all]
-      --path <OBJECT_ID>   Print shortest reference path from a GC root to this object
-  -h, --help               Print help
+  -o, --output <DIR>         Directory for index files and reports
+                             [default with -p: <hprof>.minprof/]
+      --format <FORMAT>      Output format [default: pretty]
+      --report <REPORT>      Which analyses to run [default: all]
+      --path <OBJECT_ID>     Print shortest reference path to this object
+  -h, --help                 Print help
+```
+
+### First run
+
+Parse and index a heap dump. Index files are written to `heap.hprof.minprof/` by default.
+
+```sh
+minprof -p heap.hprof
+minprof -p heap.hprof -o /fast-disk/heap-index/
+```
+
+### Subsequent runs
+
+Skip all parse passes and generate reports from the existing index instantly.
+
+```sh
+minprof -i heap.hprof.minprof/
+minprof -i heap.hprof.minprof/ --format html
+minprof -i heap.hprof.minprof/ --report leaks,packages
+minprof -i /fast-disk/heap-index/ --format json
 ```
 
 ### `--format`
@@ -30,7 +52,7 @@ Options:
 |----------|-------------|
 | `pretty` | Human-readable text tables (default) |
 | `json`   | Newline-delimited JSON on stdout; progress on stderr |
-| `html`   | Self-contained HTML report written to `<hprof>.html` |
+| `html`   | Self-contained HTML report written to `<hprof>.html` (or `report.html` inside the index dir when using `-i`) |
 
 ### `--report`
 
@@ -47,20 +69,23 @@ Selects which analyses to emit. Repeatable or comma-separated. Default: `all`.
 ### Examples
 
 ```sh
-# Default: pretty text, all analyses
-minprof heap.hprof
+# First run — parse the dump, write index to heap.hprof.minprof/
+minprof -p heap.hprof
 
-# HTML report (treemap + charts + leak suspects)
-minprof heap.hprof --format html
+# First run with custom index location
+minprof -p heap.hprof -o /mnt/heap-index/
 
-# JSON, retained analysis only
-minprof heap.hprof --format json --report retained
+# Re-run with HTML report (no re-parsing)
+minprof -i heap.hprof.minprof/ --format html
 
-# Leak suspects + package summary, text output
-minprof heap.hprof --report leaks,packages
+# Re-run — JSON output, retained analysis only (no re-parsing)
+minprof -i heap.hprof.minprof/ --format json --report retained
+
+# Re-run — leak suspects + packages (no re-parsing)
+minprof -i heap.hprof.minprof/ --report leaks,packages
 
 # Path to GC root for an object ID from the retained table
-minprof heap.hprof --path 0x00000000d6fc57f0
+minprof -i heap.hprof.minprof/ --path 0x00000000d6fc57f0
 ```
 
 ## Output
@@ -144,12 +169,29 @@ When `--path` is also given, a second JSON object follows on the next line ([NDJ
 
 When the object is not found or is unreachable, `found` is `false` and an `error` key explains why.
 
+## Index files
+
+The first run writes the following files to the index directory (`<hprof>.minprof/` by default):
+
+| File | Description |
+|------|-------------|
+| `object_index.bin` | Sorted `(object_id, class_id, shallow_size)` for every object |
+| `class_names.bin` | Class name and super-class chain for every loaded class |
+| `edges.bin` | Sorted `(from_id, to_id)` reference pairs |
+| `reverse_edges.bin` | Sorted `(to_id, from_id)` pairs for path-to-root queries |
+| `idom.bin` | Immediate dominator array (RPO-indexed) |
+| `retained.bin` | Retained size per object |
+| `meta.bin` | Scalar summary (object count, heap size, unreachable stats) |
+| `roots.bin` | GC root object IDs |
+
+Once these files exist, `-i <dir>` can generate any report without touching the original `.hprof`.
+
 ## Memory usage
 
 | Pass | What it does | Peak extra RAM |
 |------|-------------|----------------|
-| Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | ~100 MB (class index) |
-| Pass 2 — edges | Extract object references, sort into `edges.bin` + `reverse_edges.bin` | 256 MB sort buffer |
+| Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | ~100 MB (class index) + sort buffer |
+| Pass 2 — edges | Extract object references, sort into `edges.bin` + `reverse_edges.bin` | sort buffer |
 | Pass 3 — dominator tree | CHK iterative algorithm on in-memory CSR graph | proportional to edge count |
 | Pass 4 — retained sizes | Bottom-up dominator tree walk | O(N) |
 
@@ -173,6 +215,7 @@ The class index (kept in RAM across all passes) is typically under 100 MB for re
 
 - CLI only — no interactive query shell
 - Tested on 64-bit HotSpot HPROF format (`id_size = 8`); 32-bit dumps (`id_size = 4`) parse correctly but are less tested
+- Pass 3 (dominator tree) loads the full edge graph into RAM — on very large dumps (> a few hundred GB) this may require significant memory. See `PERFORMANCE_NOTES.md` for planned improvements.
 - Hobby project — use with caution
 
 ---
