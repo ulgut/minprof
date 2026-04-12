@@ -8,6 +8,8 @@ use crate::parser::gc_record::GcRecord;
 
 #[derive(Debug)]
 pub struct LoadClassData {
+    /// Parsed from the binary format; not used by any analysis pass.
+    #[allow(dead_code)]
     pub serial_number: u32,
     pub class_object_id: u64,
     pub class_name_id: u64,

@@ -7,6 +7,23 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::Parser;
 
+use query::ReportConfig;
+
+/// Which analyses to emit. Pass multiple times or comma-separate values.
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum Report {
+    /// All analyses (default)
+    All,
+    /// Class histogram (object count + shallow bytes per class)
+    Histogram,
+    /// Retained heap grouped by class
+    Retained,
+    /// Leak suspects (classes dominating ≥1% of heap)
+    Leaks,
+    /// Package-level memory rollup
+    Packages,
+}
+
 #[derive(Parser)]
 #[command(name = "minprof", about = "Streaming, multi-pass HPROF heap dump analyser")]
 struct Cli {
@@ -27,6 +44,23 @@ struct Cli {
     /// Each result is a self-contained JSON object (NDJSON when combined with --path).
     #[arg(long)]
     json: bool,
+
+    /// Which analyses to run (repeatable or comma-separated).
+    /// Choices: all, histogram, retained, leaks, packages. Default: all.
+    #[arg(long = "report", value_enum, value_delimiter = ',', default_values_t = vec![Report::All])]
+    report: Vec<Report>,
+}
+
+fn build_report_config(reports: &[Report]) -> ReportConfig {
+    if reports.contains(&Report::All) {
+        return ReportConfig::all();
+    }
+    ReportConfig {
+        histogram:        reports.contains(&Report::Histogram),
+        retained_by_class: reports.contains(&Report::Retained),
+        leak_suspects:    reports.contains(&Report::Leaks),
+        package_summary:  reports.contains(&Report::Packages),
+    }
 }
 
 fn main() -> Result<()> {
@@ -66,7 +100,8 @@ fn main() -> Result<()> {
     );
 
     eprintln!("=== query ===");
-    query::run(&pass1, &pass4, &output_dir, cli.json)?;
+    let config = build_report_config(&cli.report);
+    query::run(&pass1, &pass4, &output_dir, cli.json, &config)?;
 
     if let Some(raw_id) = cli.path {
         let target_id = parse_hex_id(&raw_id)?;

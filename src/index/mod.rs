@@ -195,6 +195,7 @@ impl RetainedIndex {
         self.data[node_idx]
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.data.len()
     }

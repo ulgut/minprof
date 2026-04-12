@@ -263,7 +263,7 @@ impl<'a> EdgeVisitor<'a> {
         Ok(())
     }
 
-    pub fn into_output(mut self, output_dir: &Path) -> Result<Pass2Output> {
+    pub fn into_output(self, output_dir: &Path) -> Result<Pass2Output> {
         let edges_path = output_dir.join("edges.bin");
         let edge_count = self.sorter.finish(&edges_path)?;
         let reverse_edges_path = build_reverse_edges(&edges_path, output_dir)?;

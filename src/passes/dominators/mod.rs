@@ -39,8 +39,6 @@ pub struct Pass3Output {
     pub idom_path: PathBuf,
     /// RPO number → node index (position in object_index.bin).
     pub rpo_to_node: Vec<u32>,
-    /// Node index → RPO number. `UNDEFINED` for nodes not reached by DFS.
-    pub node_to_rpo: Vec<u32>,
     /// N: number of actual object nodes.
     pub node_count: u32,
 }
@@ -58,10 +56,6 @@ impl Csr {
         let start = self.offsets[node as usize] as usize;
         let end   = self.offsets[node as usize + 1] as usize;
         &self.neighbors[start..end]
-    }
-
-    fn node_count(&self) -> u32 {
-        (self.offsets.len() - 1) as u32
     }
 }
 
@@ -358,7 +352,6 @@ pub fn run(
     Ok(Pass3Output {
         idom_path,
         rpo_to_node,
-        node_to_rpo,
         node_count: n,
     })
 }

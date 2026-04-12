@@ -5,7 +5,7 @@
 // Licensed under the Apache License, Version 2.0.
 
 use crate::parser::gc_record::{
-    ClassDumpFields, ConstFieldInfo, FieldInfo, FieldType, FieldValue, GcRecord,
+    ClassDumpFields, FieldInfo, FieldType, FieldValue, GcRecord,
 };
 use crate::parser::primitive_parsers::{
     parse_f32, parse_f64, parse_i8, parse_i16, parse_i32, parse_i64, parse_u8, parse_u16,

@@ -13,7 +13,7 @@ cargo install --path .
 ## Usage
 
 ```
-minprof <HPROF> [--output <DIR>] [--path <OBJECT_ID>] [--json]
+minprof <HPROF> [--output <DIR>] [--path <OBJECT_ID>] [--json] [--report <TYPE>]
 ```
 
 `<HPROF>` — path to the `.hprof` file.
@@ -27,6 +27,29 @@ the given object. The ID is the hex address shown in the output tables
 (e.g. `--path 0x7f3a1c80` or `--path 7f3a1c80`).
 
 `--json` — emit results as JSON instead of formatted text (see [JSON output](#json-output)).
+
+`--report <TYPE>` — which analyses to run (repeatable or comma-separated, default: `all`).
+
+| Report type | Equivalent Eclipse MAT analysis | Description |
+|-------------|--------------------------------|-------------|
+| `all`       | All reports                    | Run every analysis (default) |
+| `histogram` | Class Histogram                | Object count + shallow bytes per class |
+| `retained`  | Dominator Tree (by class)      | Total retained heap grouped by class |
+| `leaks`     | Leak Suspects                  | Classes dominating ≥1% of heap |
+| `packages`  | System Overview → Package view | Memory rollup by Java package |
+
+**Examples:**
+
+```sh
+# Only leak suspects + package summary
+minprof heap.hprof --report leaks,packages
+
+# JSON output, retained analysis only
+minprof heap.hprof --json --report retained
+
+# Equivalent: repeat the flag
+minprof heap.hprof --report leaks --report packages
+```
 
 ### Example
 
@@ -96,7 +119,7 @@ This makes stdout safe to redirect or pipe without filtering in any mode.
 }
 ```
 
-When `--path` is also given, a second JSON object follows on the next line ([NDJSON](https://ndjson.org/)):
+When `--path` is also given, a second JSON object follows on the next line:
 
 ```json
 {"type":"path_to_root","target_id":"0x00000007f3a1c80","found":true,"path":[
@@ -106,19 +129,6 @@ When `--path` is also given, a second JSON object follows on the next line ([NDJ
 ```
 
 When the object is not found or is unreachable, `found` is `false` and an `error` key describes why.
-
-## Memory usage
-
-| Pass | Peak RAM |
-|------|----------|
-| Pass 1 — parse & index | ~100 MB (class index) + I/O buffer |
-| Pass 2 — edges | same |
-| Pass 3 — dominator tree | I/O buffer + OS page cache |
-| Pass 4 — retained sizes | I/O buffer |
-
-The class index is the only structure kept in RAM across passes. For real-world
-JVM applications this is typically under 100 MB regardless of heap size.
-I/O buffer defaults to 64 MB (configurable at compile time).
 
 ## Comparison
 
@@ -130,13 +140,12 @@ I/O buffer defaults to 64 MB (configurable at compile time).
 | Dominator tree       | ✅            | ✅                 | ❌                 |
 | Path to GC root      | ✅            | ✅                 | ❌                 |
 | JSON / scriptable    | ✅            | ❌                 | ❌                 |
-| GUI                  | ❌ (CLI only) | ✅                 | ✅                 |
 
 ## Limitations
 
 - CLI only — no GUI or interactive query shell
 - Tested on 64-bit HotSpot HPROF format (id_size = 8); 32-bit dumps (id_size = 4) are parsed correctly, but less tested
-- Currently a hobby project, use with caution
+- Currently, a hobby project – use with caution
 ---
 
 ## References

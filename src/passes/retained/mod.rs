@@ -93,10 +93,9 @@ fn compute_retained(
     node_count: u32,         // N: number of actual objects
 ) -> (Vec<u64>, u64, u64) {
     let n = node_count as usize;
-    let vroot = n; // virtual root node index
 
     // Initialise retained[i] = shallow_size[i] for actual objects.
-    // retained[vroot] starts at 0 (virtual root has no shallow size).
+    // retained[n] (index past the last real object) is the virtual root slot.
     let mut retained: Vec<u64> = shallow.iter().map(|&s| s as u64).collect();
     retained.push(0u64); // slot for the virtual root
 

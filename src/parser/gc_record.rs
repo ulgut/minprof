@@ -47,26 +47,27 @@ impl FieldType {
 
 #[derive(Debug)]
 pub struct FieldInfo {
+    /// String ID of the field name (resolvable from the string table).
+    /// Parsed from the binary format; not yet used but retained for future
+    /// field-name display in path-to-GC-root output.
+    #[allow(dead_code)]
     pub name_id: u64,
     pub field_type: FieldType,
 }
 
 #[derive(Debug)]
-pub struct ConstFieldInfo {
-    pub const_pool_idx: u16,
-    pub const_type: FieldType,
-}
-
-#[derive(Debug)]
 pub enum FieldValue {
-    Bool(bool),
-    Byte(i8),
-    Char(u16),
-    Short(i16),
-    Int(i32),
-    Long(i64),
-    Float(f32),
-    Double(f64),
+    // Primitive variants are parsed to correctly advance the byte cursor.
+    // Only Object references are used in analysis; the others are kept for
+    // completeness and potential future use (e.g. string content extraction).
+    #[allow(dead_code)] Bool(bool),
+    #[allow(dead_code)] Byte(i8),
+    #[allow(dead_code)] Char(u16),
+    #[allow(dead_code)] Short(i16),
+    #[allow(dead_code)] Int(i32),
+    #[allow(dead_code)] Long(i64),
+    #[allow(dead_code)] Float(f32),
+    #[allow(dead_code)] Double(f64),
     Object(u64),
 }
 
@@ -81,6 +82,12 @@ pub struct ClassDumpFields {
 }
 
 /// A sub-record within a HEAP_DUMP or HEAP_DUMP_SEGMENT block.
+///
+/// Auxiliary root fields (thread_serial, frame_num, etc.) are parsed from the
+/// HPROF binary format and retained for potential future use (e.g. attributing
+/// retained memory to specific threads). They are not currently read by the
+/// analysis passes.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum GcRecord {
     RootUnknown       { object_id: u64 },
@@ -120,20 +127,3 @@ pub enum GcRecord {
     },
 }
 
-impl GcRecord {
-    /// The GC root object ID, if this record is any root variant.
-    pub fn root_object_id(&self) -> Option<u64> {
-        match self {
-            Self::RootUnknown     { object_id }
-            | Self::RootJniGlobal  { object_id, .. }
-            | Self::RootJniLocal   { object_id, .. }
-            | Self::RootJavaFrame  { object_id, .. }
-            | Self::RootNativeStack{ object_id, .. }
-            | Self::RootStickyClass{ object_id }
-            | Self::RootThreadBlock{ object_id, .. }
-            | Self::RootMonitorUsed{ object_id }
-            | Self::RootThreadObject{object_id, .. } => Some(*object_id),
-            _ => None,
-        }
-    }
-}
