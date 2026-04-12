@@ -166,15 +166,22 @@ impl ExternalSorter {
         Ok(())
     }
 
-    /// Merge all chunks into a single sorted file at `output_path`.
-    /// Uses a two-level merge when the chunk count exceeds MAX_MERGE_FAN_IN,
-    /// keeping the final fan-in small regardless of dump size.
+    /// Merge all chunks into a single sorted file at `output_path`, applying
+    /// `fixup` to every entry as it is written.
+    ///
+    /// The fixup is applied only in the final output write, so intermediate
+    /// files (two-level merge) remain unmodified — entries are corrected exactly
+    /// once. This replaces the old separate `fixup_instance_sizes` pass, saving
+    /// a full extra read + write of the entire object index.
+    ///
     /// Returns the total number of entries written.
-    fn finish(mut self, output_path: &Path) -> Result<u64> {
+    fn finish<F>(mut self, output_path: &Path, fixup: F) -> Result<u64>
+    where
+        F: Fn(&mut RawEntry),
+    {
         self.flush_chunk()?;
 
-        // Take ownership of chunk_paths so Drop sees an empty list and doesn't
-        // double-remove files we're about to handle here.
+        // Take ownership so Drop sees an empty list and won't double-delete.
         let chunks = std::mem::take(&mut self.chunk_paths);
 
         match chunks.len() {
@@ -182,18 +189,14 @@ impl ExternalSorter {
                 File::create(output_path).context("create empty object index")?;
                 return Ok(0);
             }
-            1 => {
-                std::fs::rename(&chunks[0], output_path)
-                    .context("rename single sort chunk")?;
-            }
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  merging {} chunks…", n);
-                merge_chunks(&chunks, output_path)?;
+                merge_chunks_with_fixup(&chunks, output_path, &fixup)?;
                 for p in &chunks { let _ = std::fs::remove_file(p); }
             }
             n => {
-                // Two-level merge: group into batches of MAX_MERGE_FAN_IN,
-                // merge each batch into an intermediate file, then final merge.
+                // Two-level merge: intermediate files are written without fixup;
+                // fixup is applied during the final merge pass.
                 let group_size = MAX_MERGE_FAN_IN;
                 let num_groups = (n + group_size - 1) / group_size;
                 eprintln!("  two-level merge: {} chunks → {} groups…", n, num_groups);
@@ -202,13 +205,13 @@ impl ExternalSorter {
                 for (g, group) in chunks.chunks(group_size).enumerate() {
                     let inter = self.output_dir.join(format!("object_index_inter_{g}.bin"));
                     eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
-                    merge_chunks(group, &inter)?;
+                    merge_chunks_with_fixup(group, &inter, |_| {})?;
                     for p in group { let _ = std::fs::remove_file(p); }
                     intermediates.push(inter);
                 }
 
                 eprintln!("  final merge of {} intermediate files…", intermediates.len());
-                merge_chunks(&intermediates, output_path)?;
+                merge_chunks_with_fixup(&intermediates, output_path, &fixup)?;
                 for p in &intermediates { let _ = std::fs::remove_file(p); }
             }
         }
@@ -228,17 +231,24 @@ impl Drop for ExternalSorter {
 }
 
 /// K-way merge of sorted chunk files into a single sorted output file.
-fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+/// `fixup` is called on each entry immediately before it is written, allowing
+/// fields to be corrected in a single pass (e.g. patching instance shallow sizes).
+fn merge_chunks_with_fixup<F>(
+    chunk_paths: &[PathBuf],
+    output_path: &Path,
+    fixup: F,
+) -> Result<()>
+where
+    F: Fn(&mut RawEntry),
+{
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
         .map(|p| Ok(BufReader::new(File::open(p).context("open sort chunk")?)))
         .collect::<Result<_>>()?;
 
-    // Min-heap: (object_id, chunk_index). Reverse for min semantics.
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
     let mut peek: Vec<Option<RawEntry>> = vec![None; readers.len()];
 
-    // Seed the heap with the first entry from each chunk.
     for (i, reader) in readers.iter_mut().enumerate() {
         if let Some(entry) = read_entry(reader)? {
             heap.push(Reverse((entry_id(&entry), i)));
@@ -249,10 +259,10 @@ fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
     let mut w = BufWriter::new(File::create(output_path).context("create merged object index")?);
 
     while let Some(Reverse((_, idx))) = heap.pop() {
-        let entry = peek[idx].take().unwrap();
+        let mut entry = peek[idx].take().unwrap();
+        fixup(&mut entry);
         w.write_all(&entry)?;
 
-        // Advance this chunk's reader.
         if let Some(next) = read_entry(&mut readers[idx])? {
             heap.push(Reverse((entry_id(&next), idx)));
             peek[idx] = Some(next);
@@ -270,51 +280,6 @@ fn read_entry(reader: &mut impl Read) -> Result<Option<RawEntry>> {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
         Err(e) => Err(e).context("read sort chunk entry"),
     }
-}
-
-// ── Instance size fixup ───────────────────────────────────────────────────────
-
-/// Replace the `shallow_size` field for every InstanceDump entry in
-/// `object_index.bin` with the authoritative value from `ClassDump.instance_size`.
-///
-/// InstanceDump entries are identified as those whose `class_id` is:
-///   - not flagged as an object array (`OBJECT_ARRAY_FLAG` unset), and
-///   - above the synthetic range (> `CLASS_ID_LONG_ARRAY` = 0x0B).
-///
-/// Writes to a temp file, then atomically replaces the original.
-fn fixup_instance_sizes(index_path: &Path, class_index: &HashMap<u64, ClassDescriptor>) -> Result<()> {
-    let tmp_path = index_path.with_extension("bin.tmp");
-
-    let mut reader = BufReader::new(File::open(index_path).context("open object index for fixup")?);
-    let mut writer = BufWriter::new(File::create(&tmp_path).context("create object index tmp")?);
-
-    let mut buf: RawEntry = [0u8; ENTRY_SIZE];
-    loop {
-        match reader.read_exact(&mut buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e).context("read object index for fixup"),
-        }
-
-        let (_, class_id, _) = decode_entry(&buf);
-
-        // InstanceDump: class_id is a real heap address (> 0x0B, no array flags).
-        if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
-            if let Some(desc) = class_index.get(&class_id) {
-                // Overwrite bytes [16..20] with the correct instance_size.
-                buf[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
-            }
-        }
-
-        writer.write_all(&buf).context("write object index fixup")?;
-    }
-
-    writer.flush()?;
-    drop(writer);
-    drop(reader);
-
-    std::fs::rename(&tmp_path, index_path).context("rename fixed object index")?;
-    Ok(())
 }
 
 // ── Visitor ───────────────────────────────────────────────────────────────────
@@ -369,17 +334,27 @@ impl IndexVisitor {
             }
         }
 
-        // Write sorted object index.
-        let index_path = self.output_dir.join("object_index.bin");
-        let object_count = self.sorter.finish(&index_path)?;
+        // Take the class index out of self so we can move the sorter while the
+        // fixup closure borrows the class index.
+        let class_index = std::mem::take(&mut self.class_index);
 
-        // Fix up shallow_size for InstanceDump entries.
+        // Write sorted object index.
         //
-        // During streaming, InstanceDump provides only `data_size` (raw field bytes,
-        // no JVM object header). The authoritative size is ClassDump.instance_size,
-        // which includes the JVM object header (~16 bytes). We now have the full
-        // class_index in memory, so patch every InstanceDump entry in place.
-        fixup_instance_sizes(&index_path, &self.class_index)?;
+        // The fixup closure patches shallow_size for every InstanceDump entry
+        // as it is written to the output file. During streaming, InstanceDump
+        // provides only `data_size` (raw field bytes, no JVM object header);
+        // the authoritative value is ClassDump.instance_size, which includes
+        // the header. class_index is fully populated by this point, so we can
+        // correct each entry inline during the merge — no separate pass needed.
+        let index_path = self.output_dir.join("object_index.bin");
+        let object_count = self.sorter.finish(&index_path, |entry| {
+            let (_, class_id, _) = decode_entry(entry);
+            if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
+                if let Some(desc) = class_index.get(&class_id) {
+                    entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
+                }
+            }
+        })?;
 
         // Write roots.
         let roots_path = self.output_dir.join("roots.bin");
@@ -398,7 +373,7 @@ impl IndexVisitor {
             .context("write class_names.bin")?;
 
         Ok(Pass1Output {
-            class_index: self.class_index,
+            class_index,
             roots: self.roots,
             object_count,
             object_index_path: index_path,

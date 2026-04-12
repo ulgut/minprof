@@ -39,5 +39,5 @@ pub fn total_memory_bytes() -> u64 {
 pub fn sort_chunk_bytes() -> usize {
     let mem = total_memory_bytes();
     let target = (mem as f64 * 0.40) as u64;
-    target.clamp(256 * 1024 * 1024, 32 * 1024 * 1024 * 1024) as usize
+    target.clamp(256 * 1024 * 1024, 128 * 1024 * 1024 * 1024) as usize
 }
