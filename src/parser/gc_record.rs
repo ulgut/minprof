@@ -45,7 +45,7 @@ impl FieldType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldInfo {
     /// String ID of the field name (resolvable from the string table).
     /// Parsed from the binary format; not yet used but retained for future

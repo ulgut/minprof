@@ -60,9 +60,6 @@ const TAG_GC_PRIM_ARRAY_DUMP: u8 = 0x23;
 
 pub struct HprofRecordParser {
     id_size: u32,
-    /// When true, InstanceDump and ObjectArrayDump carry their raw bytes /
-    /// decoded element IDs. Set this for pass 2. False in pass 1.
-    include_data: bool,
     /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
     /// Zero means we are between top-level records.
     heap_dump_remaining_len: u32,
@@ -72,15 +69,6 @@ impl HprofRecordParser {
     pub const fn new(id_size: u32) -> Self {
         Self {
             id_size,
-            include_data: false,
-            heap_dump_remaining_len: 0,
-        }
-    }
-
-    pub const fn with_data(id_size: u32) -> Self {
-        Self {
-            id_size,
-            include_data: true,
             heap_dump_remaining_len: 0,
         }
     }
@@ -109,7 +97,7 @@ impl HprofRecordParser {
                     }
                 }
             } else {
-                let (r, gc) = parse_gc_record(self.id_size, self.include_data, i)?;
+                let (r, gc) = parse_gc_record(self.id_size, i)?;
                 let consumed = i.len() - r.len();
                 self.heap_dump_remaining_len =
                     self.heap_dump_remaining_len.saturating_sub(consumed as u32);
@@ -168,7 +156,7 @@ fn parse_field_value(id_size: u32, ty: FieldType, i: &[u8]) -> IResult<&[u8], Fi
 // GC sub-record parsers
 // ---------------------------------------------------------------------------
 
-fn parse_gc_record(id_size: u32, include_data: bool, buf: &[u8]) -> IResult<&[u8], GcRecord> {
+fn parse_gc_record(id_size: u32, buf: &[u8]) -> IResult<&[u8], GcRecord> {
     if buf.is_empty() {
         return Err(nom::Err::Incomplete(nom::Needed::new(1)));
     }
@@ -192,9 +180,8 @@ fn parse_gc_record(id_size: u32, include_data: bool, buf: &[u8]) -> IResult<&[u8
             if data.len() < total {
                 return Err(nom::Err::Incomplete(nom::Needed::new(total - data.len())));
             }
-            let raw_data = if include_data { data[hdr..total].to_vec() } else { Vec::new() };
             Ok((&data[total..], GcRecord::InstanceDump {
-                object_id, class_id, data_size: data_size as u32, raw_data,
+                object_id, class_id, data_size: data_size as u32, raw_data: Vec::new(),
             }))
         }
 
@@ -212,16 +199,8 @@ fn parse_gc_record(id_size: u32, include_data: bool, buf: &[u8]) -> IResult<&[u8
             if data.len() < total {
                 return Err(nom::Err::Incomplete(nom::Needed::new(total - data.len())));
             }
-            let elements = if include_data {
-                data[hdr..total].chunks_exact(is).map(|b| {
-                    if is == 8 { u64::from_be_bytes(b.try_into().unwrap()) }
-                    else       { u32::from_be_bytes(b.try_into().unwrap()) as u64 }
-                }).collect()
-            } else {
-                Vec::new()
-            };
             Ok((&data[total..], GcRecord::ObjectArrayDump {
-                object_id, num_elements, element_class_id, elements,
+                object_id, num_elements, element_class_id, elements: Vec::new(),
             }))
         }
 

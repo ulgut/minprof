@@ -1,12 +1,10 @@
 //! Pass 2 — reference edge extraction.
 //!
-//! Streams the HPROF file a second time with data mode enabled so that
-//! [`GcRecord::InstanceDump`] carries raw field bytes and
-//! [`GcRecord::ObjectArrayDump`] carries decoded element IDs.
-//!
-//! For each object we walk its field descriptors (and those of its superclasses)
-//! to find Object-typed fields, then emit a directed edge (from_id → to_id) for
-//! every non-null reference found.
+//! Streams the HPROF file a second time, extracting reference edges inline in
+//! the parser thread with zero per-object allocation. Each InstanceDump,
+//! ObjectArrayDump, and ClassDump is parsed directly from the 64 MiB work
+//! buffer; the only allocation is the pooled `Vec<RawEdge>` batch that is
+//! handed off to the main thread.
 //!
 //! Edges are accumulated in sorted chunks and merged into a single
 //! `edges.bin` file sorted by `from_id`, forming a disk-backed forward
@@ -17,12 +15,12 @@ use std::cmp::Reverse;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::parser::gc_record::{FieldType, GcRecord};
-use crate::parser::record::Record;
-use crate::parser::record_stream_parser::{RecordVisitor, process_with_data, read_header};
+use crate::parser::gc_record::FieldType;
+use crate::parser::record_stream_parser::{process_with_extractor, read_header};
 use crate::passes::index::{ClassDescriptor, Pass1Output};
 
 // ── On-disk edge format ──────────────────────────────────────────────────────
@@ -261,40 +259,173 @@ pub struct Pass2Output {
     pub edge_count: u64,
 }
 
-// ── Visitor ───────────────────────────────────────────────────────────────────
+// ── Inline edge extractor ─────────────────────────────────────────────────────
 
-pub struct EdgeVisitor<'a> {
-    id_size: u32,
-    class_index: &'a HashMap<u64, ClassDescriptor>,
-    sorter: EdgeSorter,
-    edge_count: u64,
+/// Stateful HPROF parser that extracts reference edges directly from the raw
+/// byte stream with zero per-object allocation. Runs in the extractor thread.
+struct EdgeStreamExtractor {
+    id_size: usize,
+    class_index: Arc<HashMap<u64, ClassDescriptor>>,
+    /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
+    /// Zero means we are parsing outer (top-level) HPROF records.
+    heap_dump_remaining: usize,
 }
 
-impl<'a> EdgeVisitor<'a> {
-    pub fn new(id_size: u32, class_index: &'a HashMap<u64, ClassDescriptor>, output_dir: &Path) -> Self {
+impl EdgeStreamExtractor {
+    fn new(id_size: u32, class_index: Arc<HashMap<u64, ClassDescriptor>>) -> Self {
         Self {
-            id_size,
+            id_size: id_size as usize,
             class_index,
-            sorter: EdgeSorter::new(output_dir.to_path_buf()),
-            edge_count: 0,
+            heap_dump_remaining: 0,
         }
     }
 
-    fn emit(&mut self, from: u64, to: u64) -> Result<()> {
-        if to == 0 {
-            return Ok(()); // null reference — skip
+    /// Walk `buf`, append edges to `out`, return bytes consumed from `buf`.
+    /// Returns 0 if there is not enough data for even one complete record.
+    fn extract(&mut self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
+        let mut pos = 0;
+
+        loop {
+            let rem = &buf[pos..];
+            if rem.is_empty() {
+                break;
+            }
+
+            if self.heap_dump_remaining == 0 {
+                // Outer record: tag(1) + time_offset(4) + length(4) = 9 bytes min.
+                if rem.len() < 9 {
+                    break;
+                }
+                let tag    = rem[0];
+                let length = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
+                match tag {
+                    0x0C | 0x1C => {
+                        // HEAP_DUMP | HEAP_DUMP_SEGMENT — enter GC sub-record mode.
+                        self.heap_dump_remaining = length;
+                        pos += 9;
+                    }
+                    0x2C => {
+                        // HEAP_DUMP_END
+                        pos += 9;
+                    }
+                    _ => {
+                        // Skip tag(1) + time_offset(4) + len(4) + body(length).
+                        let total = 9 + length;
+                        if rem.len() < total {
+                            break;
+                        }
+                        pos += total;
+                    }
+                }
+            } else {
+                // GC sub-record mode.
+                let n = self.extract_gc(rem, out);
+                if n == 0 {
+                    break; // Incomplete — need more data.
+                }
+                self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(n);
+                pos += n;
+            }
         }
-        self.sorter.push(encode_edge(from, to))?;
-        self.edge_count += 1;
-        Ok(())
+
+        pos
     }
 
-    /// Extract all object references from an instance's raw field bytes.
-    ///
-    /// Field layout: the class's own fields come first in the byte stream,
-    /// followed by the superclass's fields, and so on up the hierarchy.
-    /// This matches HotSpot's HPROF output order.
-    fn extract_instance_edges(&mut self, from: u64, class_id: u64, raw: &[u8]) -> Result<()> {
+    /// Parse one GC sub-record from `buf`, emit edges into `out`, and return
+    /// bytes consumed. Returns 0 if `buf` does not hold a complete record.
+    fn extract_gc(&self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
+        if buf.is_empty() {
+            return 0;
+        }
+        let is  = self.id_size;
+        let tag = buf[0];
+        let data = &buf[1..];
+
+        match tag {
+            0x21 => {
+                // TAG_GC_INSTANCE_DUMP
+                // object_id(is) | stack_serial(4) | class_id(is) | data_size(4) | raw[data_size]
+                let hdr = 2 * is + 8;
+                if data.len() < hdr { return 0; }
+                let object_id = read_id_raw(is, data);
+                let class_id  = read_id_raw(is, &data[is + 4..]);
+                let data_size = u32::from_be_bytes(data[2*is+4..2*is+8].try_into().unwrap()) as usize;
+                let total = 1 + hdr + data_size;
+                if buf.len() < total { return 0; }
+                let raw = &data[hdr..hdr + data_size];
+                self.extract_instance_edges(object_id, class_id, raw, out);
+                total
+            }
+            0x22 => {
+                // TAG_GC_OBJ_ARRAY_DUMP
+                // object_id(is) | stack_serial(4) | num_elements(4) | element_class_id(is) | ids[num*is]
+                let hdr = 2 * is + 8;
+                if data.len() < hdr { return 0; }
+                let object_id    = read_id_raw(is, data);
+                let num_elements = u32::from_be_bytes(data[is+4..is+8].try_into().unwrap()) as usize;
+                let payload = num_elements * is;
+                let total = 1 + hdr + payload;
+                if buf.len() < total { return 0; }
+                let elem_data = &data[hdr..hdr + payload];
+                for chunk in elem_data.chunks_exact(is) {
+                    let to = read_id_raw(is, chunk);
+                    if to != 0 {
+                        out.push(encode_edge(object_id, to));
+                    }
+                }
+                total
+            }
+            0x23 => {
+                // TAG_GC_PRIM_ARRAY_DUMP
+                // object_id(is) | stack_serial(4) | num_elements(4) | element_type(1) | data[...]
+                let hdr = is + 9;
+                if data.len() < hdr { return 0; }
+                let num_elements = u32::from_be_bytes(data[is+4..is+8].try_into().unwrap()) as usize;
+                let elem_type    = data[is + 8];
+                let total = 1 + hdr + num_elements * field_type_size(elem_type, is);
+                if buf.len() < total { return 0; }
+                total // no object references in primitive arrays
+            }
+            0x20 => {
+                // TAG_GC_CLASS_DUMP — parse to find static Object-field edges.
+                match class_dump_size_and_edges(is, data, out) {
+                    Some(body_size) => 1 + body_size,
+                    None => 0, // Incomplete
+                }
+            }
+            // Root records — no outgoing object references; just skip.
+            0xFF => { // ROOT_UNKNOWN: object_id(is)
+                if data.len() < is { return 0; }
+                1 + is
+            }
+            0x01 => { // ROOT_JNI_GLOBAL: object_id(is) + jni_ref(is)
+                if data.len() < 2 * is { return 0; }
+                1 + 2 * is
+            }
+            0x02 | 0x03 => { // ROOT_JNI_LOCAL | ROOT_JAVA_FRAME: object_id(is) + thread_serial(4) + frame_num(4)
+                if data.len() < is + 8 { return 0; }
+                1 + is + 8
+            }
+            0x04 | 0x06 => { // ROOT_NATIVE_STACK | ROOT_THREAD_BLOCK: object_id(is) + thread_serial(4)
+                if data.len() < is + 4 { return 0; }
+                1 + is + 4
+            }
+            0x05 | 0x07 => { // ROOT_STICKY_CLASS | ROOT_MONITOR_USED: object_id(is)
+                if data.len() < is { return 0; }
+                1 + is
+            }
+            0x08 => { // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
+                if data.len() < is + 8 { return 0; }
+                1 + is + 8
+            }
+            x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
+        }
+    }
+
+    /// Extract all Object-typed field references from an InstanceDump's raw bytes.
+    /// Walks the superclass chain using the class index built in pass 1.
+    fn extract_instance_edges(&self, from: u64, class_id: u64, raw: &[u8], out: &mut Vec<RawEdge>) {
+        let is = self.id_size;
         let mut cursor = 0usize;
         let mut cur_id = class_id;
 
@@ -303,100 +434,137 @@ impl<'a> EdgeVisitor<'a> {
                 // Unknown class — can't safely interpret remaining bytes.
                 break;
             };
-
             for field in &desc.instance_fields {
-                let field_bytes = field.field_type.byte_size(self.id_size) as usize;
+                let field_bytes = field.field_type.byte_size(is as u32) as usize;
                 if cursor + field_bytes > raw.len() {
-                    return Ok(()); // truncated or misaligned — stop safely
+                    return; // truncated or misaligned — stop safely
                 }
-
                 if field.field_type == FieldType::Object {
-                    let to = read_id_be(self.id_size, &raw[cursor..]);
-                    self.emit(from, to)?;
+                    let to = read_id_raw(is, &raw[cursor..]);
+                    if to != 0 {
+                        out.push(encode_edge(from, to));
+                    }
                 }
-
                 cursor += field_bytes;
             }
-
             cur_id = desc.super_id;
         }
-
-        Ok(())
-    }
-
-    pub fn into_output(self, output_dir: &Path) -> Result<Pass2Output> {
-        let edges_path = output_dir.join("edges.bin");
-        let edge_count = self.sorter.finish(&edges_path)?;
-        let reverse_edges_path = build_reverse_edges(&edges_path, output_dir)?;
-        Ok(Pass2Output { edges_path, reverse_edges_path, edge_count })
-    }
-
-    fn handle_gc(&mut self, gc: GcRecord) {
-        let result = match gc {
-            GcRecord::InstanceDump { object_id, class_id, raw_data, .. } => {
-                if !raw_data.is_empty() {
-                    self.extract_instance_edges(object_id, class_id, &raw_data)
-                } else {
-                    Ok(())
-                }
-            }
-            GcRecord::ObjectArrayDump { object_id, elements, .. } => {
-                let mut r = Ok(());
-                for to in elements {
-                    if let Err(e) = self.emit(object_id, to) {
-                        r = Err(e);
-                        break;
-                    }
-                }
-                r
-            }
-            GcRecord::ClassDump(fields) => {
-                // Emit edges for Object-typed static fields on the class object.
-                let mut r = Ok(());
-                for (fi, fv) in &fields.static_fields {
-                    if fi.field_type == FieldType::Object {
-                        if let crate::parser::gc_record::FieldValue::Object(to_id) = fv {
-                            if let Err(e) = self.emit(fields.class_object_id, *to_id) {
-                                r = Err(e);
-                                break;
-                            }
-                        }
-                    }
-                }
-                r
-            }
-            // PrimitiveArrayDump, roots — no outgoing object references.
-            _ => Ok(()),
-        };
-        result.expect("edge write failed");
     }
 }
 
-impl<'a> RecordVisitor for EdgeVisitor<'a> {
-    fn on_record(&mut self, record: Record) {
-        if let Record::GcSegment(gc) = record {
-            self.handle_gc(gc);
-        }
-    }
-}
+// ── Inline parser helpers ─────────────────────────────────────────────────────
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Read a big-endian object ID from a byte slice.
-/// HPROF stores all integers in network (big-endian) byte order.
-fn read_id_be(id_size: u32, buf: &[u8]) -> u64 {
-    if id_size == 4 {
-        u32::from_be_bytes(buf[0..4].try_into().unwrap()) as u64
+/// Read a big-endian object ID from the start of `buf`. `is` must be 4 or 8.
+#[inline(always)]
+fn read_id_raw(is: usize, buf: &[u8]) -> u64 {
+    if is == 8 {
+        u64::from_be_bytes(buf[..8].try_into().unwrap())
     } else {
-        u64::from_be_bytes(buf[0..8].try_into().unwrap())
+        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
     }
+}
+
+/// Byte size of a field value given its type byte and the heap's id_size.
+/// Matches `FieldType::byte_size` in `gc_record.rs`.
+fn field_type_size(ty: u8, is: usize) -> usize {
+    match ty {
+        2       => is, // Object
+        4 | 8   => 1,  // Bool, Byte
+        5 | 9   => 2,  // Char, Short
+        6 | 10  => 4,  // Float, Int
+        7 | 11  => 8,  // Double, Long
+        _ => panic!("unknown field type byte: {ty}"),
+    }
+}
+
+/// Parse a ClassDump body (starting AFTER the tag byte), emit edges for
+/// Object-typed static fields, and return the number of bytes consumed.
+/// Returns `None` if `buf` does not contain a complete ClassDump.
+fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> Option<usize> {
+    // Fixed header layout (after tag):
+    //   class_object_id(is) + stack_serial(4) + super_class_id(is)
+    //   + class_loader_id(is) + signers_id(is) + protection_domain_id(is)
+    //   + reserved_1(is) + reserved_2(is) + instance_size(4)
+    // = 7 * is + 8 bytes
+    let fixed = 7 * is + 8;
+    if buf.len() < fixed + 2 { return None; } // +2 for cp_count
+
+    let class_object_id = read_id_raw(is, buf);
+    let mut pos = fixed;
+
+    // Constant pool
+    let cp_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    pos += 2;
+    for _ in 0..cp_count {
+        if buf.len() < pos + 3 { return None; } // cp_index(2) + type(1)
+        pos += 2; // cp_index (discarded)
+        let ty = buf[pos];
+        pos += 1;
+        let sz = field_type_size(ty, is);
+        if buf.len() < pos + sz { return None; }
+        pos += sz;
+    }
+
+    // Static fields
+    if buf.len() < pos + 2 { return None; }
+    let static_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    pos += 2;
+    for _ in 0..static_count {
+        if buf.len() < pos + is + 1 { return None; } // name_id(is) + type(1)
+        let ty = buf[pos + is];
+        let sz = field_type_size(ty, is);
+        if buf.len() < pos + is + 1 + sz { return None; }
+        if ty == 2 { // Object
+            let to = read_id_raw(is, &buf[pos + is + 1..]);
+            if to != 0 {
+                out.push(encode_edge(class_object_id, to));
+            }
+        }
+        pos += is + 1 + sz;
+    }
+
+    // Instance field descriptors — name_id(is) + type(1), no value.
+    if buf.len() < pos + 2 { return None; }
+    let instance_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    pos += 2;
+    let descriptors_size = instance_count * (is + 1);
+    if buf.len() < pos + descriptors_size { return None; }
+    pos += descriptors_size;
+
+    Some(pos)
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2Output> {
     let (header, _) = read_header(path)?;
-    let mut visitor = EdgeVisitor::new(header.id_size, &pass1.class_index, output_dir);
-    process_with_data(path, &mut visitor).context("pass 2 streaming")?;
-    visitor.into_output(output_dir)
+    let id_size = header.id_size;
+
+    // Clone the class index into an Arc so it can be moved into the extractor
+    // thread. The class index contains ~thousands of entries (one per class),
+    // so this clone is cheap regardless of heap size.
+    let class_index = Arc::new(pass1.class_index.clone());
+
+    let mut sorter = EdgeSorter::new(output_dir.to_path_buf());
+
+    {
+        let mut extractor = EdgeStreamExtractor::new(id_size, class_index);
+        process_with_extractor(
+            path,
+            move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize {
+                extractor.extract(buf, edges)
+            },
+            &mut |batch: &mut Vec<RawEdge>| {
+                for &edge in batch.iter() {
+                    sorter.push(edge).expect("edge sort write failed");
+                }
+            },
+        )
+        .context("pass 2 streaming")?;
+    }
+
+    let edges_path = output_dir.join("edges.bin");
+    let edge_count = sorter.finish(&edges_path)?;
+    let reverse_edges_path = build_reverse_edges(&edges_path, output_dir)?;
+    Ok(Pass2Output { edges_path, reverse_edges_path, edge_count })
 }

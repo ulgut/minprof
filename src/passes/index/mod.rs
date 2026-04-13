@@ -81,6 +81,7 @@ fn entry_id(buf: &RawEntry) -> u64 {
 /// Type alias for the in-memory class map used throughout the analysis.
 pub type ClassDescriptorMap = std::collections::HashMap<u64, ClassDescriptor>;
 
+#[derive(Clone)]
 pub struct ClassDescriptor {
     /// Dot-separated class name, e.g. `java.lang.String`.
     pub name: String,
