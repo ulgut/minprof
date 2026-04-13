@@ -3,6 +3,12 @@ pub mod edges;
 pub mod index;
 pub mod retained;
 
+/// Buffer size for sequential reads/writes of multi-GB files (chunk flushes,
+/// merge readers/writers, index loads).
+pub const IO_BUF_SIZE: usize = 64 * 1024 * 1024; // 64 MiB
+
+pub const FALLBACK_MEM_SIZE_GB: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Returns total physical memory in bytes.
 ///
 /// Reads `/proc/meminfo` on Linux; runs `sysctl -n hw.memsize` on macOS/BSD.
@@ -29,7 +35,7 @@ pub fn total_memory_bytes() -> u64 {
             }
         }
     }
-    8 * 1024 * 1024 * 1024 // 8 GiB fallback
+    FALLBACK_MEM_SIZE_GB // 8 GiB fallback
 }
 
 /// Target sort-buffer size: 40 % of physical RAM, clamped to [256 MiB, 32 GiB].

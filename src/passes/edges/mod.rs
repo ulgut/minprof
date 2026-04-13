@@ -29,6 +29,8 @@ use crate::passes::index::{ClassDescriptor, Pass1Output};
 pub const EDGE_SIZE: usize = 16;
 pub type RawEdge = [u8; EDGE_SIZE];
 
+use crate::passes::IO_BUF_SIZE;
+
 fn encode_edge(from: u64, to: u64) -> RawEdge {
     let mut buf = [0u8; EDGE_SIZE];
     buf[0..8].copy_from_slice(&from.to_le_bytes());
@@ -98,7 +100,8 @@ impl EdgeSorter {
         let path = self
             .output_dir
             .join(format!("{}_chunk_{}.bin", self.prefix, self.chunk_paths.len()));
-        let mut w = BufWriter::new(File::create(&path).context("create edge chunk")?);
+        let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+            File::create(&path).context("create edge chunk")?);
         for edge in self.current.drain(..) {
             w.write_all(&edge)?;
         }
@@ -132,7 +135,7 @@ impl EdgeSorter {
             self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
             self.current.dedup();
             let count = self.current.len() as u64;
-            let mut w = BufWriter::new(
+            let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
                 File::create(output_path).context("create edge file")?,
             );
             for edge in self.current.drain(..) {
@@ -200,7 +203,8 @@ fn merge_chunks(
 ) -> Result<()> {
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
-        .map(|p| Ok(BufReader::new(File::open(p).context("open edge chunk")?)))
+        .map(|p| Ok(BufReader::with_capacity(IO_BUF_SIZE,
+            File::open(p).context("open edge chunk")?)))
         .collect::<Result<_>>()?;
 
     // Sort by (from, to, chunk_index) so identical edges from different chunks
@@ -215,7 +219,8 @@ fn merge_chunks(
         }
     }
 
-    let mut w = BufWriter::new(File::create(output_path).context("create merged edge file")?);
+    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+        File::create(output_path).context("create merged edge file")?);
     let mut last_edge: Option<RawEdge> = None;
     while let Some(Reverse((_, _, idx))) = heap.pop() {
         let edge = peek[idx].take().unwrap();

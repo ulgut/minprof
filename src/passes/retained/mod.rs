@@ -28,6 +28,8 @@ use crate::passes::index::{Pass1Output, ENTRY_SIZE};
 
 const UNDEFINED: u32 = u32::MAX;
 
+use crate::passes::IO_BUF_SIZE;
+
 // ── Output ────────────────────────────────────────────────────────────────────
 
 pub struct Pass4Output {
@@ -53,7 +55,8 @@ fn load_shallow_sizes(index_path: &Path) -> Result<Vec<u32>> {
     let n = file_len / ENTRY_SIZE;
     let mut sizes = Vec::with_capacity(n);
 
-    let mut reader = BufReader::new(File::open(index_path).context("open object index")?);
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
+        File::open(index_path).context("open object index")?);
     let mut buf = [0u8; ENTRY_SIZE];
 
     while reader.read_exact(&mut buf).is_ok() {
@@ -72,7 +75,8 @@ fn load_idom(idom_path: &Path) -> Result<Vec<u32>> {
     let count = file_len / 4;
     let mut idom = Vec::with_capacity(count);
 
-    let mut reader = BufReader::new(File::open(idom_path).context("open idom file")?);
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
+        File::open(idom_path).context("open idom file")?);
     let mut buf = [0u8; 4];
     while reader.read_exact(&mut buf).is_ok() {
         idom.push(u32::from_le_bytes(buf));
@@ -147,7 +151,8 @@ fn compute_retained(
 // ── Step 4: write retained sizes ─────────────────────────────────────────────
 
 fn write_retained(retained: &[u64], node_count: usize, path: &Path) -> Result<()> {
-    let mut w = BufWriter::new(File::create(path).context("create retained file")?);
+    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+        File::create(path).context("create retained file")?);
     // Write only actual objects (0..N), exclude the virtual root slot at N.
     for &r in &retained[..node_count] {
         w.write_all(&r.to_le_bytes())?;

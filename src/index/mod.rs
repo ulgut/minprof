@@ -12,6 +12,8 @@ use anyhow::{Context, Result};
 use crate::passes::index::{ClassDescriptor, ENTRY_SIZE};
 use std::collections::HashMap;
 
+use crate::passes::IO_BUF_SIZE;
+
 // ── Re-export encoding constants ─────────────────────────────────────────────
 
 pub use crate::passes::index::{
@@ -141,7 +143,7 @@ impl ObjectIndex {
     /// Return a streaming iterator over `(object_id, class_id, shallow_size)` tuples.
     /// Entries arrive in sorted `object_id` order.
     pub fn iter(&self) -> Result<ObjectIndexIter> {
-        let reader = BufReader::new(
+        let reader = BufReader::with_capacity(IO_BUF_SIZE,
             File::open(&self.path).context("open object index")?,
         );
         Ok(ObjectIndexIter { reader, buf: [0u8; ENTRY_SIZE] })
@@ -182,7 +184,8 @@ impl RetainedIndex {
             .len() as usize;
         let count = len / 8;
         let mut data = Vec::with_capacity(count);
-        let mut reader = BufReader::new(File::open(path).context("open retained.bin")?);
+        let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
+            File::open(path).context("open retained.bin")?);
         let mut buf = [0u8; 8];
         while reader.read_exact(&mut buf).is_ok() {
             data.push(u64::from_le_bytes(buf));

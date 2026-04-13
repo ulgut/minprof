@@ -27,6 +27,8 @@ use anyhow::{Context, Result};
 use crate::passes::edges::{Pass2Output, EDGE_SIZE};
 use crate::passes::index::{Pass1Output, ENTRY_SIZE};
 
+use crate::passes::IO_BUF_SIZE;
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const UNDEFINED: u32 = u32::MAX;
@@ -69,7 +71,8 @@ fn load_object_ids(index_path: &Path) -> Result<Vec<u64>> {
     let n = file_len / ENTRY_SIZE;
     let mut ids = Vec::with_capacity(n);
 
-    let mut reader = BufReader::new(File::open(index_path).context("open object index")?);
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
+        File::open(index_path).context("open object index")?);
     let mut buf = [0u8; ENTRY_SIZE];
     while reader.read_exact(&mut buf).is_ok() {
         let object_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -116,7 +119,8 @@ fn build_csrs(
     let edge_count = edge_file_len / EDGE_SIZE;
 
     let mut raw_forward: Vec<(u32, u32)> = Vec::with_capacity(edge_count);
-    let mut reader = BufReader::new(File::open(edges_path).context("open edges file")?);
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
+        File::open(edges_path).context("open edges file")?);
     let mut buf = [0u8; EDGE_SIZE];
 
     while reader.read_exact(&mut buf).is_ok() {
@@ -317,7 +321,8 @@ fn compute_dominators(
 // ── Step 6: write idom to disk ────────────────────────────────────────────────
 
 fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
-    let mut w = BufWriter::new(File::create(path).context("create idom file")?);
+    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+        File::create(path).context("create idom file")?);
     for &v in idom {
         w.write_all(&v.to_le_bytes())?;
     }

@@ -113,6 +113,8 @@ pub struct Pass1Output {
 /// Keeps the final merge fan-in small regardless of dump size.
 const MAX_MERGE_FAN_IN: usize = 64;
 
+use crate::passes::IO_BUF_SIZE;
+
 struct ExternalSorter {
     output_dir: PathBuf,
     chunk_paths: Vec<PathBuf>,
@@ -157,7 +159,8 @@ impl ExternalSorter {
         let path = self
             .output_dir
             .join(format!("object_index_chunk_{}.bin", self.chunk_paths.len()));
-        let mut w = BufWriter::new(File::create(&path).context("create sort chunk")?);
+        let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+            File::create(&path).context("create sort chunk")?);
         for entry in self.current.drain(..) {
             w.write_all(&entry)?;
         }
@@ -194,7 +197,7 @@ impl ExternalSorter {
             let count = self.current.len() as u64;
             eprintln!("  sorting {count} entries in-memory (no chunk files needed)…");
             self.current.par_sort_unstable_by_key(entry_id);
-            let mut w = BufWriter::new(
+            let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
                 File::create(output_path).context("create object index")?,
             );
             for mut entry in self.current.drain(..) {
@@ -269,7 +272,8 @@ where
 {
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
-        .map(|p| Ok(BufReader::new(File::open(p).context("open sort chunk")?)))
+        .map(|p| Ok(BufReader::with_capacity(IO_BUF_SIZE,
+            File::open(p).context("open sort chunk")?)))
         .collect::<Result<_>>()?;
 
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
@@ -282,7 +286,8 @@ where
         }
     }
 
-    let mut w = BufWriter::new(File::create(output_path).context("create merged object index")?);
+    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+        File::create(output_path).context("create merged object index")?);
 
     while let Some(Reverse((_, idx))) = heap.pop() {
         let mut entry = peek[idx].take().unwrap();
