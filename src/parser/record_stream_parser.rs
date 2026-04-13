@@ -64,38 +64,45 @@ where
     let (_, header_bytes_consumed) = read_header(path)?;
     let path = path.to_path_buf();
 
-    let (send_chunk, recv_chunk)           = bounded::<Vec<u8>>(POOL_DEPTH);
+    let (send_chunk, recv_chunk) = bounded::<Vec<u8>>(POOL_DEPTH);
     let (send_pooled_buf, recv_pooled_buf) = bounded::<Vec<u8>>(POOL_DEPTH);
-    let (send_batch, recv_batch)           = bounded::<Vec<T>>(POOL_DEPTH);
+    let (send_batch, recv_batch) = bounded::<Vec<T>>(POOL_DEPTH);
     let (send_pooled_batch, recv_pooled_batch) = bounded::<Vec<T>>(POOL_DEPTH);
 
     for _ in 0..POOL_DEPTH {
-        send_pooled_buf.send(Vec::with_capacity(READ_BUFFER_SIZE)).unwrap();
+        send_pooled_buf
+            .send(Vec::with_capacity(READ_BUFFER_SIZE))
+            .unwrap();
         send_pooled_batch.send(Vec::new()).unwrap();
     }
 
     // -- Reader thread --------------------------------------------------------
-    let reader = thread::Builder::new()
-        .name("hprof-reader".into())
-        .spawn(move || -> Result<()> {
+    let reader = thread::Builder::new().name("hprof-reader".into()).spawn(
+        move || -> Result<()> {
             let mut file = File::open(path).context("open hprof file")?;
             file.seek(SeekFrom::Start(header_bytes_consumed as u64))
                 .context("seek past header")?;
 
-            let mut chunk_count  = 0u64;
-            let mut total_bytes  = 0u64;
+            let mut chunk_count = 0u64;
+            let mut total_bytes = 0u64;
             let mut partial_count = 0u64;
             let t0 = std::time::Instant::now();
 
             loop {
-                let mut buf = recv_pooled_buf.recv().expect("pool channel closed prematurely");
+                let mut buf = recv_pooled_buf
+                    .recv()
+                    .expect("pool channel closed prematurely");
                 buf.resize(READ_BUFFER_SIZE, 0);
                 let n = file.read(&mut buf).context("read hprof chunk")?;
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
 
-                chunk_count  += 1;
-                total_bytes  += n as u64;
-                if n < READ_BUFFER_SIZE { partial_count += 1; }
+                chunk_count += 1;
+                total_bytes += n as u64;
+                if n < READ_BUFFER_SIZE {
+                    partial_count += 1;
+                }
                 if chunk_count % 64 == 0 {
                     let elapsed = t0.elapsed().as_secs_f64();
                     eprintln!(
@@ -122,7 +129,8 @@ where
                 total_bytes as f64 / elapsed / (1 << 20) as f64,
             );
             Ok(())
-        })?;
+        },
+    )?;
 
     // -- Extractor thread -----------------------------------------------------
     let extractor_thread = thread::Builder::new()
@@ -199,9 +207,8 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor) -> Result<()> {
     }
 
     // -- Reader thread --------------------------------------------------------
-    let reader = thread::Builder::new()
-        .name("hprof-reader".into())
-        .spawn(move || -> Result<()> {
+    let reader = thread::Builder::new().name("hprof-reader".into()).spawn(
+        move || -> Result<()> {
             let mut file = File::open(path).context("open hprof file")?;
             file.seek(SeekFrom::Start(header_bytes_consumed as u64))
                 .context("seek past header")?;
@@ -255,7 +262,8 @@ fn process_impl(path: &Path, visitor: &mut dyn RecordVisitor) -> Result<()> {
             );
             // Dropping send_chunk signals EOF to the parser.
             Ok(())
-        })?;
+        },
+    )?;
 
     // -- Parser thread --------------------------------------------------------
     let parser = thread::Builder::new()
@@ -351,8 +359,8 @@ pub fn read_header(path: &Path) -> Result<(FileHeader, usize)> {
     let n = file.read(&mut buf).context("read hprof header bytes")?;
     buf.truncate(n);
 
-    let (rest, header) = parse_file_header(&buf)
-        .map_err(|e| anyhow!("failed to parse HPROF file header: {e:?}"))?;
+    let (rest, header) =
+        parse_file_header(&buf).map_err(|e| anyhow!("failed to parse HPROF file header: {e:?}"))?;
 
     let consumed = buf.len() - rest.len();
     Ok((header, consumed))

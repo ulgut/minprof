@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::passes::edges::{Pass2Output, EDGE_SIZE};
-use crate::passes::index::{Pass1Output, ENTRY_SIZE};
+use crate::passes::edges::{EDGE_SIZE, Pass2Output};
+use crate::passes::index::{ENTRY_SIZE, Pass1Output};
 
 use crate::passes::IO_BUF_SIZE;
 
@@ -57,7 +57,7 @@ struct Csr {
 impl Csr {
     fn neighbors(&self, node: u32) -> &[u32] {
         let start = self.offsets[node as usize] as usize;
-        let end   = self.offsets[node as usize + 1] as usize;
+        let end = self.offsets[node as usize + 1] as usize;
         &self.neighbors[start..end]
     }
 }
@@ -71,8 +71,10 @@ fn load_object_ids(index_path: &Path) -> Result<Vec<u64>> {
     let n = file_len / ENTRY_SIZE;
     let mut ids = Vec::with_capacity(n);
 
-    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
-        File::open(index_path).context("open object index")?);
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(index_path).context("open object index")?,
+    );
     let mut buf = [0u8; ENTRY_SIZE];
     while reader.read_exact(&mut buf).is_ok() {
         let object_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
@@ -106,11 +108,7 @@ fn load_root_nodes(roots: &[u64], ids: &[u64]) -> Vec<u32> {
 ///
 /// The virtual root (node N) is inserted as a predecessor of each GC root
 /// in the reverse CSR so the algorithm has a well-defined entry point.
-fn build_csrs(
-    edges_path: &Path,
-    ids: &[u64],
-    root_nodes: &[u32],
-) -> Result<(Csr, Csr)> {
+fn build_csrs(edges_path: &Path, ids: &[u64], root_nodes: &[u32]) -> Result<(Csr, Csr)> {
     let n = ids.len() as u32;
     let vroot = n; // virtual root index
 
@@ -119,15 +117,18 @@ fn build_csrs(
     let edge_count = edge_file_len / EDGE_SIZE;
 
     let mut raw_forward: Vec<(u32, u32)> = Vec::with_capacity(edge_count);
-    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
-        File::open(edges_path).context("open edges file")?);
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(edges_path).context("open edges file")?,
+    );
     let mut buf = [0u8; EDGE_SIZE];
 
     while reader.read_exact(&mut buf).is_ok() {
         let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let to_id   = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+        let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
 
-        let (Some(from_idx), Some(to_idx)) = (lookup_node(ids, from_id), lookup_node(ids, to_id)) else {
+        let (Some(from_idx), Some(to_idx)) = (lookup_node(ids, from_id), lookup_node(ids, to_id))
+        else {
             continue; // skip edges to objects not in the index
         };
         raw_forward.push((from_idx, to_idx));
@@ -135,10 +136,7 @@ fn build_csrs(
 
     // -- Add virtual root → GC root edges -----------------------------------
     // These appear only in the reverse CSR as (gc_root, vroot) pairs.
-    let vroot_edges: Vec<(u32, u32)> = root_nodes
-        .iter()
-        .map(|&r| (vroot, r))
-        .collect();
+    let vroot_edges: Vec<(u32, u32)> = root_nodes.iter().map(|&r| (vroot, r)).collect();
 
     // -- Build forward CSR (actual object edges only) ----------------------
     // raw_forward is already sorted by from_idx (inherited from edges.bin
@@ -195,15 +193,10 @@ fn build_csr_from_sorted(node_count: u32, sorted_edges: &[(u32, u32)]) -> Csr {
 /// Returns `(node_to_rpo, rpo_to_node)`:
 /// - `node_to_rpo[i]`  = RPO number of node i (`UNDEFINED` if unreachable)
 /// - `rpo_to_node[j]`  = node index with RPO number j
-fn compute_rpo(
-    n: u32,
-    vroot: u32,
-    root_nodes: &[u32],
-    forward: &Csr,
-) -> (Vec<u32>, Vec<u32>) {
+fn compute_rpo(n: u32, vroot: u32, root_nodes: &[u32], forward: &Csr) -> (Vec<u32>, Vec<u32>) {
     let total = (n + 1) as usize; // actual nodes + virtual root
     let mut node_to_rpo = vec![UNDEFINED; total];
-    let mut visited     = vec![false; total];
+    let mut visited = vec![false; total];
     let mut post_order: Vec<u32> = Vec::with_capacity(total);
 
     // Iterative DFS stack: (node_idx, successor_cursor).
@@ -268,11 +261,7 @@ fn intersect(mut b1: u32, mut b2: u32, idom: &[u32]) -> u32 {
 ///
 /// Returns `idom` indexed by RPO number; each value is the RPO number of
 /// the immediate dominator. Virtual root (RPO 0) maps to itself.
-fn compute_dominators(
-    rpo_to_node: &[u32],
-    node_to_rpo: &[u32],
-    reverse: &Csr,
-) -> Vec<u32> {
+fn compute_dominators(rpo_to_node: &[u32], node_to_rpo: &[u32], reverse: &Csr) -> Vec<u32> {
     let rpo_count = rpo_to_node.len();
     let mut idom = vec![UNDEFINED; rpo_count];
     idom[0] = 0; // virtual root dominates itself
@@ -300,7 +289,7 @@ fn compute_dominators(
                 }
 
                 new_idom = Some(match new_idom {
-                    None      => pred_rpo,
+                    None => pred_rpo,
                     Some(cur) => intersect(pred_rpo, cur, &idom),
                 });
             }
@@ -321,8 +310,8 @@ fn compute_dominators(
 // ── Step 6: write idom to disk ────────────────────────────────────────────────
 
 fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
-    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-        File::create(path).context("create idom file")?);
+    let mut w =
+        BufWriter::with_capacity(IO_BUF_SIZE, File::create(path).context("create idom file")?);
     for &v in idom {
         w.write_all(&v.to_le_bytes())?;
     }
@@ -332,11 +321,7 @@ fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn run(
-    pass1: &Pass1Output,
-    pass2: &Pass2Output,
-    output_dir: &Path,
-) -> Result<Pass3Output> {
+pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Result<Pass3Output> {
     let t = std::time::Instant::now();
     eprintln!("  loading object index…");
     let ids = load_object_ids(&pass1.object_index_path)?;
@@ -347,19 +332,30 @@ pub fn run(
     let t = std::time::Instant::now();
     eprintln!("  resolving GC root node indices…");
     let root_nodes = load_root_nodes(&pass1.roots, &ids);
-    eprintln!("    {} roots  [{:.1}s]", root_nodes.len(), t.elapsed().as_secs_f64());
+    eprintln!(
+        "    {} roots  [{:.1}s]",
+        root_nodes.len(),
+        t.elapsed().as_secs_f64()
+    );
 
     let t = std::time::Instant::now();
     eprintln!("  building adjacency lists…");
     let (forward, reverse) = build_csrs(&pass2.edges_path, &ids, &root_nodes)?;
-    eprintln!("    {} forward edges, {} reverse edges  [{:.1}s]",
-        forward.neighbors.len(), reverse.neighbors.len(), t.elapsed().as_secs_f64());
+    eprintln!(
+        "    {} forward edges, {} reverse edges  [{:.1}s]",
+        forward.neighbors.len(),
+        reverse.neighbors.len(),
+        t.elapsed().as_secs_f64()
+    );
 
     let t = std::time::Instant::now();
     eprintln!("  computing RPO via DFS…");
     let (node_to_rpo, rpo_to_node) = compute_rpo(n, vroot, &root_nodes, &forward);
-    eprintln!("    {} reachable nodes  [{:.1}s]",
-        rpo_to_node.len().saturating_sub(1), t.elapsed().as_secs_f64());
+    eprintln!(
+        "    {} reachable nodes  [{:.1}s]",
+        rpo_to_node.len().saturating_sub(1),
+        t.elapsed().as_secs_f64()
+    );
 
     let t = std::time::Instant::now();
     eprintln!("  running CHK dominator algorithm…");

@@ -10,18 +10,27 @@ use super::AnalysisOutput;
 fn fmt_bytes(b: u64) -> String {
     const MIB: u64 = 1 << 20;
     const KIB: u64 = 1 << 10;
-    if b >= MIB      { format!("{:.2} MiB", b as f64 / MIB as f64) }
-    else if b >= KIB { format!("{:.2} KiB", b as f64 / KIB as f64) }
-    else             { format!("{b} B") }
+    if b >= MIB {
+        format!("{:.2} MiB", b as f64 / MIB as f64)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b as f64 / KIB as f64)
+    } else {
+        format!("{b} B")
+    }
 }
 
 fn pct(part: u64, total: u64) -> String {
-    if total == 0 { return "0.0%".to_string(); }
+    if total == 0 {
+        return "0.0%".to_string();
+    }
     format!("{:.1}%", part as f64 / total as f64 * 100.0)
 }
 
 fn he(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 fn js_str(s: &str) -> String {
@@ -29,10 +38,10 @@ fn js_str(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
-            c    => out.push(c),
+            c => out.push(c),
         }
     }
     out.push('"');
@@ -245,7 +254,9 @@ resize();
 // ── SVG horizontal bar chart ──────────────────────────────────────────────────
 
 fn bar_chart(entries: &[(&str, u64)], total: u64) -> String {
-    if entries.is_empty() { return String::new(); }
+    if entries.is_empty() {
+        return String::new();
+    }
     let max_val = entries.iter().map(|e| e.1).max().unwrap_or(1).max(1);
     let row_h = 28usize;
     let label_w = 280usize;
@@ -294,13 +305,23 @@ fn treemap_data_js(out: &AnalysisOutput) -> String {
     let mut s = String::from("const TREEMAP=");
     s.push('[');
     for (i, pkg) in out.treemap_data.iter().enumerate() {
-        if i > 0 { s.push(','); }
-        s.push_str(&format!("{{name:{},value:{},classes:[", js_str(&pkg.name), pkg.retained_bytes));
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!(
+            "{{name:{},value:{},classes:[",
+            js_str(&pkg.name),
+            pkg.retained_bytes
+        ));
         for (j, cls) in pkg.classes.iter().enumerate() {
-            if j > 0 { s.push(','); }
+            if j > 0 {
+                s.push(',');
+            }
             s.push_str(&format!(
                 "{{name:{},value:{},instances:{}}}",
-                js_str(&cls.name), cls.retained_bytes, cls.instance_count,
+                js_str(&cls.name),
+                cls.retained_bytes,
+                cls.instance_count,
             ));
         }
         s.push_str("]}");
@@ -313,17 +334,53 @@ fn treemap_data_js(out: &AnalysisOutput) -> String {
 // ── Section: Overview ─────────────────────────────────────────────────────────
 
 fn section_overview(out: &AnalysisOutput) -> String {
-    let unr_warn = if out.unreachable_count > 0 { " warn" } else { "" };
-    let fin_warn  = if out.finalizer_queue_depth > 10 { " warn" } else { "" };
+    let unr_warn = if out.unreachable_count > 0 {
+        " warn"
+    } else {
+        ""
+    };
+    let fin_warn = if out.finalizer_queue_depth > 10 {
+        " warn"
+    } else {
+        ""
+    };
     let mut s = String::new();
     s.push_str("<section id=\"overview\">\n<h2>Heap Overview</h2>\n<div class=\"cards\">\n");
     let cards = [
-        ("Total heap (shallow)", fmt_bytes(out.total_shallow_bytes), format!("{} objects", out.total_objects), ""),
-        ("Retained (reachable)",  fmt_bytes(out.retained_heap_bytes), format!("{} GC roots", out.gc_roots), ""),
-        ("Classes",               out.total_classes.to_string(), String::new(), ""),
-        ("Unreachable (garbage)", fmt_bytes(out.unreachable_shallow), format!("{} objects", out.unreachable_count), unr_warn),
-        ("Finalizer queue",       out.finalizer_queue_depth.to_string(), "pending finalization".to_string(), fin_warn),
-        ("Soft / Weak / Phantom", format!("{} / {} / {}", out.soft_ref_count, out.weak_ref_count, out.phantom_ref_count), "reference counts".to_string(), ""),
+        (
+            "Total heap (shallow)",
+            fmt_bytes(out.total_shallow_bytes),
+            format!("{} objects", out.total_objects),
+            "",
+        ),
+        (
+            "Retained (reachable)",
+            fmt_bytes(out.retained_heap_bytes),
+            format!("{} GC roots", out.gc_roots),
+            "",
+        ),
+        ("Classes", out.total_classes.to_string(), String::new(), ""),
+        (
+            "Unreachable (garbage)",
+            fmt_bytes(out.unreachable_shallow),
+            format!("{} objects", out.unreachable_count),
+            unr_warn,
+        ),
+        (
+            "Finalizer queue",
+            out.finalizer_queue_depth.to_string(),
+            "pending finalization".to_string(),
+            fin_warn,
+        ),
+        (
+            "Soft / Weak / Phantom",
+            format!(
+                "{} / {} / {}",
+                out.soft_ref_count, out.weak_ref_count, out.phantom_ref_count
+            ),
+            "reference counts".to_string(),
+            "",
+        ),
     ];
     for (label, value, sub, extra_class) in &cards {
         s.push_str(&format!(
@@ -342,8 +399,20 @@ fn section_overview(out: &AnalysisOutput) -> String {
 // ── Section: GC Pressure ──────────────────────────────────────────────────────
 
 fn section_gc_pressure(out: &AnalysisOutput) -> String {
-    let fin_class  = if out.finalizer_queue_depth > 20 { "danger" } else if out.finalizer_queue_depth > 5 { "warn" } else { "" };
-    let unr_class  = if out.unreachable_count > 10_000 { "danger" } else if out.unreachable_count > 1_000 { "warn" } else { "" };
+    let fin_class = if out.finalizer_queue_depth > 20 {
+        "danger"
+    } else if out.finalizer_queue_depth > 5 {
+        "warn"
+    } else {
+        ""
+    };
+    let unr_class = if out.unreachable_count > 10_000 {
+        "danger"
+    } else if out.unreachable_count > 1_000 {
+        "warn"
+    } else {
+        ""
+    };
 
     let mut s = String::new();
     s.push_str("<section id=\"gc-pressure\">\n<h2>GC Pressure</h2>\n<div class=\"gc-grid\">\n");
@@ -351,10 +420,14 @@ fn section_gc_pressure(out: &AnalysisOutput) -> String {
     // Reference statistics box
     s.push_str("<div class=\"gc-box\"><h3>Reference statistics</h3>\n");
     let refs = [
-        ("java.lang.ref.Finalizer",        out.finalizer_queue_depth, fin_class),
-        ("java.lang.ref.SoftReference",    out.soft_ref_count,        ""),
-        ("java.lang.ref.WeakReference",    out.weak_ref_count,        ""),
-        ("java.lang.ref.PhantomReference", out.phantom_ref_count,     ""),
+        (
+            "java.lang.ref.Finalizer",
+            out.finalizer_queue_depth,
+            fin_class,
+        ),
+        ("java.lang.ref.SoftReference", out.soft_ref_count, ""),
+        ("java.lang.ref.WeakReference", out.weak_ref_count, ""),
+        ("java.lang.ref.PhantomReference", out.phantom_ref_count, ""),
     ];
     for (name, count, cls) in &refs {
         s.push_str(&format!(
@@ -367,12 +440,32 @@ fn section_gc_pressure(out: &AnalysisOutput) -> String {
     // Unreachable box
     s.push_str("<div class=\"gc-box\"><h3>Unreachable objects</h3>\n");
     let unr_rows = [
-        ("Object count", format!("<span class=\"gc-val {unr_class}\">{}</span>", out.unreachable_count)),
-        ("Shallow size",  format!("<span class=\"gc-val\">{}</span>", he(&fmt_bytes(out.unreachable_shallow)))),
-        ("% of total heap", format!("<span class=\"gc-val\">{}</span>", pct(out.unreachable_shallow, out.total_shallow_bytes))),
+        (
+            "Object count",
+            format!(
+                "<span class=\"gc-val {unr_class}\">{}</span>",
+                out.unreachable_count
+            ),
+        ),
+        (
+            "Shallow size",
+            format!(
+                "<span class=\"gc-val\">{}</span>",
+                he(&fmt_bytes(out.unreachable_shallow))
+            ),
+        ),
+        (
+            "% of total heap",
+            format!(
+                "<span class=\"gc-val\">{}</span>",
+                pct(out.unreachable_shallow, out.total_shallow_bytes)
+            ),
+        ),
     ];
     for (k, v) in &unr_rows {
-        s.push_str(&format!("<div class=\"gc-row\"><span class=\"gc-key\">{k}</span>{v}</div>\n"));
+        s.push_str(&format!(
+            "<div class=\"gc-row\"><span class=\"gc-key\">{k}</span>{v}</div>\n"
+        ));
     }
     s.push_str("</div>\n</div>\n</section>");
     s
@@ -429,10 +522,14 @@ fn section_treemap() -> String {
 
 fn section_histogram(out: &AnalysisOutput) -> String {
     let total = out.total_shallow_bytes;
-    let alloc: Vec<(&str, u64)> = out.top_allocated.iter()
+    let alloc: Vec<(&str, u64)> = out
+        .top_allocated
+        .iter()
         .map(|e| (e.class_name.as_str(), e.total_shallow_bytes))
         .collect();
-    let retained: Vec<(&str, u64)> = out.retained_by_class.iter()
+    let retained: Vec<(&str, u64)> = out
+        .retained_by_class
+        .iter()
         .map(|e| (e.class_name.as_str(), e.total_retained_bytes))
         .collect();
 
@@ -451,7 +548,9 @@ fn section_histogram(out: &AnalysisOutput) -> String {
 
 fn section_packages(out: &AnalysisOutput) -> String {
     let mut s = String::new();
-    s.push_str("<section id=\"packages\">\n<h2>Package Summary</h2>\n<div class=\"tbl-wrap\">\n<table>\n");
+    s.push_str(
+        "<section id=\"packages\">\n<h2>Package Summary</h2>\n<div class=\"tbl-wrap\">\n<table>\n",
+    );
     s.push_str("<thead><tr><th>Package</th><th class=\"r\">Retained</th><th class=\"r\">% heap</th><th class=\"r\">Shallow</th><th class=\"r\">Classes</th><th class=\"r\">Instances</th></tr></thead>\n<tbody>\n");
     for e in &out.package_summary {
         s.push_str(&format!(
@@ -485,7 +584,9 @@ pub fn render(out: &AnalysisOutput) -> String {
     html.push_str("<header>\n<h1>minprof \u{2014} heap analysis</h1>\n<div class=\"sub\">");
     html.push_str(&format!(
         "{} objects &middot; {} classes &middot; {} GC roots &middot; {}",
-        out.total_objects, out.total_classes, out.gc_roots,
+        out.total_objects,
+        out.total_classes,
+        out.gc_roots,
         he(&fmt_bytes(out.total_shallow_bytes)),
     ));
     html.push_str("</div>\n</header>\n");
@@ -493,12 +594,12 @@ pub fn render(out: &AnalysisOutput) -> String {
     // Nav
     html.push_str("<nav>\n");
     for (id, label) in &[
-        ("overview",     "Overview"),
-        ("gc-pressure",  "GC Pressure"),
-        ("leak-suspects","Leak Suspects"),
-        ("treemap",      "Treemap"),
-        ("histogram",    "Histogram"),
-        ("packages",     "Packages"),
+        ("overview", "Overview"),
+        ("gc-pressure", "GC Pressure"),
+        ("leak-suspects", "Leak Suspects"),
+        ("treemap", "Treemap"),
+        ("histogram", "Histogram"),
+        ("packages", "Packages"),
     ] {
         html.push_str(&format!("<a href=\"#{id}\">{label}</a>\n"));
     }

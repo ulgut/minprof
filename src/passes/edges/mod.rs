@@ -10,12 +10,12 @@
 //! `edges.bin` file sorted by `from_id`, forming a disk-backed forward
 //! adjacency list for the dominator pass.
 
-use std::collections::{BinaryHeap, HashMap};
+use anyhow::{Context, Result};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
 
 use crate::parser::gc_record::FieldType;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
@@ -94,21 +94,30 @@ impl EdgeSorter {
         }
         // Parallel sort + dedup within chunk.
         use rayon::slice::ParallelSliceMut;
-        self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
+        self.current
+            .par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
         self.current.dedup();
 
-        let path = self
-            .output_dir
-            .join(format!("{}_chunk_{}.bin", self.prefix, self.chunk_paths.len()));
-        let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-            File::create(&path).context("create edge chunk")?);
+        let path = self.output_dir.join(format!(
+            "{}_chunk_{}.bin",
+            self.prefix,
+            self.chunk_paths.len()
+        ));
+        let mut w = BufWriter::with_capacity(
+            IO_BUF_SIZE,
+            File::create(&path).context("create edge chunk")?,
+        );
         for edge in self.current.drain(..) {
             w.write_all(&edge)?;
         }
         w.flush()?;
         self.chunk_paths.push(path);
-        eprintln!("  [{}] flushed chunk {} ({} total)",
-            self.prefix, self.chunk_paths.len(), self.chunk_paths.len());
+        eprintln!(
+            "  [{}] flushed chunk {} ({} total)",
+            self.prefix,
+            self.chunk_paths.len(),
+            self.chunk_paths.len()
+        );
         Ok(())
     }
 
@@ -130,12 +139,17 @@ impl EdgeSorter {
                 return Ok(0);
             }
             use rayon::slice::ParallelSliceMut;
-            eprintln!("  [{}] sorting {} edges in-memory (no chunk files needed)…",
-                self.prefix, self.current.len());
-            self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
+            eprintln!(
+                "  [{}] sorting {} edges in-memory (no chunk files needed)…",
+                self.prefix,
+                self.current.len()
+            );
+            self.current
+                .par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
             self.current.dedup();
             let count = self.current.len() as u64;
-            let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+            let mut w = BufWriter::with_capacity(
+                IO_BUF_SIZE,
                 File::create(output_path).context("create edge file")?,
             );
             for edge in self.current.drain(..) {
@@ -158,27 +172,45 @@ impl EdgeSorter {
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  [{}] merging {} edge chunks…", self.prefix, n);
                 merge_chunks(&chunks, output_path, on_edge)?;
-                for p in &chunks { let _ = std::fs::remove_file(p); }
+                for p in &chunks {
+                    let _ = std::fs::remove_file(p);
+                }
             }
             n => {
                 let group_size = MAX_MERGE_FAN_IN;
                 let num_groups = (n + group_size - 1) / group_size;
-                eprintln!("  [{}] two-level edge merge: {} chunks → {} groups…",
-                    self.prefix, n, num_groups);
+                eprintln!(
+                    "  [{}] two-level edge merge: {} chunks → {} groups…",
+                    self.prefix, n, num_groups
+                );
 
                 let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
                 for (g, group) in chunks.chunks(group_size).enumerate() {
-                    let inter = self.output_dir.join(format!("{}_inter_{g}.bin", self.prefix));
-                    eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
+                    let inter = self
+                        .output_dir
+                        .join(format!("{}_inter_{g}.bin", self.prefix));
+                    eprintln!(
+                        "    merging group {}/{} ({} chunks)…",
+                        g + 1,
+                        num_groups,
+                        group.len()
+                    );
                     merge_chunks(group, &inter, &mut |_| {})?;
-                    for p in group { let _ = std::fs::remove_file(p); }
+                    for p in group {
+                        let _ = std::fs::remove_file(p);
+                    }
                     intermediates.push(inter);
                 }
 
-                eprintln!("  [{}] final merge of {} intermediate files…",
-                    self.prefix, intermediates.len());
+                eprintln!(
+                    "  [{}] final merge of {} intermediate files…",
+                    self.prefix,
+                    intermediates.len()
+                );
                 merge_chunks(&intermediates, output_path, on_edge)?;
-                for p in &intermediates { let _ = std::fs::remove_file(p); }
+                for p in &intermediates {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
 
@@ -203,8 +235,12 @@ fn merge_chunks(
 ) -> Result<()> {
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
-        .map(|p| Ok(BufReader::with_capacity(IO_BUF_SIZE,
-            File::open(p).context("open edge chunk")?)))
+        .map(|p| {
+            Ok(BufReader::with_capacity(
+                IO_BUF_SIZE,
+                File::open(p).context("open edge chunk")?,
+            ))
+        })
         .collect::<Result<_>>()?;
 
     // Sort by (from, to, chunk_index) so identical edges from different chunks
@@ -219,8 +255,10 @@ fn merge_chunks(
         }
     }
 
-    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-        File::create(output_path).context("create merged edge file")?);
+    let mut w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(output_path).context("create merged edge file")?,
+    );
     let mut last_edge: Option<RawEdge> = None;
     while let Some(Reverse((_, _, idx))) = heap.pop() {
         let edge = peek[idx].take().unwrap();
@@ -285,8 +323,7 @@ struct EdgeStreamExtractor {
 impl EdgeStreamExtractor {
     fn new(id_size: u32, class_index: &HashMap<u64, ClassDescriptor>) -> Self {
         let is = id_size as usize;
-        let mut field_offsets: HashMap<u64, Vec<u32>> =
-            HashMap::with_capacity(class_index.len());
+        let mut field_offsets: HashMap<u64, Vec<u32>> = HashMap::with_capacity(class_index.len());
 
         for &class_id in class_index.keys() {
             let mut offsets: Vec<u32> = Vec::new();
@@ -294,7 +331,9 @@ impl EdgeStreamExtractor {
             let mut cur_id = class_id;
 
             while cur_id != 0 {
-                let Some(desc) = class_index.get(&cur_id) else { break; };
+                let Some(desc) = class_index.get(&cur_id) else {
+                    break;
+                };
                 for field in &desc.instance_fields {
                     let field_bytes = field.field_type.byte_size(id_size);
                     if field.field_type == FieldType::Object {
@@ -336,7 +375,7 @@ impl EdgeStreamExtractor {
                 if rem.len() < 9 {
                     break;
                 }
-                let tag    = rem[0];
+                let tag = rem[0];
                 let length = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
                 match tag {
                     0x0C | 0x1C => {
@@ -377,7 +416,7 @@ impl EdgeStreamExtractor {
         if buf.is_empty() {
             return 0;
         }
-        let is  = self.id_size;
+        let is = self.id_size;
         let tag = buf[0];
         let data = &buf[1..];
 
@@ -386,12 +425,17 @@ impl EdgeStreamExtractor {
                 // TAG_GC_INSTANCE_DUMP
                 // object_id(is) | stack_serial(4) | class_id(is) | data_size(4) | raw[data_size]
                 let hdr = 2 * is + 8;
-                if data.len() < hdr { return 0; }
+                if data.len() < hdr {
+                    return 0;
+                }
                 let object_id = read_id_raw(is, data);
-                let class_id  = read_id_raw(is, &data[is + 4..]);
-                let data_size = u32::from_be_bytes(data[2*is+4..2*is+8].try_into().unwrap()) as usize;
+                let class_id = read_id_raw(is, &data[is + 4..]);
+                let data_size =
+                    u32::from_be_bytes(data[2 * is + 4..2 * is + 8].try_into().unwrap()) as usize;
                 let total = 1 + hdr + data_size;
-                if buf.len() < total { return 0; }
+                if buf.len() < total {
+                    return 0;
+                }
                 let raw = &data[hdr..hdr + data_size];
                 self.extract_instance_edges(object_id, class_id, raw, out);
                 total
@@ -400,12 +444,17 @@ impl EdgeStreamExtractor {
                 // TAG_GC_OBJ_ARRAY_DUMP
                 // object_id(is) | stack_serial(4) | num_elements(4) | element_class_id(is) | ids[num*is]
                 let hdr = 2 * is + 8;
-                if data.len() < hdr { return 0; }
-                let object_id    = read_id_raw(is, data);
-                let num_elements = u32::from_be_bytes(data[is+4..is+8].try_into().unwrap()) as usize;
+                if data.len() < hdr {
+                    return 0;
+                }
+                let object_id = read_id_raw(is, data);
+                let num_elements =
+                    u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap()) as usize;
                 let payload = num_elements * is;
                 let total = 1 + hdr + payload;
-                if buf.len() < total { return 0; }
+                if buf.len() < total {
+                    return 0;
+                }
                 let elem_data = &data[hdr..hdr + payload];
                 for chunk in elem_data.chunks_exact(is) {
                     let to = read_id_raw(is, chunk);
@@ -419,11 +468,16 @@ impl EdgeStreamExtractor {
                 // TAG_GC_PRIM_ARRAY_DUMP
                 // object_id(is) | stack_serial(4) | num_elements(4) | element_type(1) | data[...]
                 let hdr = is + 9;
-                if data.len() < hdr { return 0; }
-                let num_elements = u32::from_be_bytes(data[is+4..is+8].try_into().unwrap()) as usize;
-                let elem_type    = data[is + 8];
+                if data.len() < hdr {
+                    return 0;
+                }
+                let num_elements =
+                    u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap()) as usize;
+                let elem_type = data[is + 8];
                 let total = 1 + hdr + num_elements * field_type_size(elem_type, is);
-                if buf.len() < total { return 0; }
+                if buf.len() < total {
+                    return 0;
+                }
                 total // no object references in primitive arrays
             }
             0x20 => {
@@ -434,28 +488,46 @@ impl EdgeStreamExtractor {
                 }
             }
             // Root records — no outgoing object references; just skip.
-            0xFF => { // ROOT_UNKNOWN: object_id(is)
-                if data.len() < is { return 0; }
+            0xFF => {
+                // ROOT_UNKNOWN: object_id(is)
+                if data.len() < is {
+                    return 0;
+                }
                 1 + is
             }
-            0x01 => { // ROOT_JNI_GLOBAL: object_id(is) + jni_ref(is)
-                if data.len() < 2 * is { return 0; }
+            0x01 => {
+                // ROOT_JNI_GLOBAL: object_id(is) + jni_ref(is)
+                if data.len() < 2 * is {
+                    return 0;
+                }
                 1 + 2 * is
             }
-            0x02 | 0x03 => { // ROOT_JNI_LOCAL | ROOT_JAVA_FRAME: object_id(is) + thread_serial(4) + frame_num(4)
-                if data.len() < is + 8 { return 0; }
+            0x02 | 0x03 => {
+                // ROOT_JNI_LOCAL | ROOT_JAVA_FRAME: object_id(is) + thread_serial(4) + frame_num(4)
+                if data.len() < is + 8 {
+                    return 0;
+                }
                 1 + is + 8
             }
-            0x04 | 0x06 => { // ROOT_NATIVE_STACK | ROOT_THREAD_BLOCK: object_id(is) + thread_serial(4)
-                if data.len() < is + 4 { return 0; }
+            0x04 | 0x06 => {
+                // ROOT_NATIVE_STACK | ROOT_THREAD_BLOCK: object_id(is) + thread_serial(4)
+                if data.len() < is + 4 {
+                    return 0;
+                }
                 1 + is + 4
             }
-            0x05 | 0x07 => { // ROOT_STICKY_CLASS | ROOT_MONITOR_USED: object_id(is)
-                if data.len() < is { return 0; }
+            0x05 | 0x07 => {
+                // ROOT_STICKY_CLASS | ROOT_MONITOR_USED: object_id(is)
+                if data.len() < is {
+                    return 0;
+                }
                 1 + is
             }
-            0x08 => { // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
-                if data.len() < is + 8 { return 0; }
+            0x08 => {
+                // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
+                if data.len() < is + 8 {
+                    return 0;
+                }
                 1 + is + 8
             }
             x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
@@ -467,10 +539,14 @@ impl EdgeStreamExtractor {
     #[inline]
     fn extract_instance_edges(&self, from: u64, class_id: u64, raw: &[u8], out: &mut Vec<RawEdge>) {
         let is = self.id_size;
-        let Some(offsets) = self.field_offsets.get(&class_id) else { return; };
+        let Some(offsets) = self.field_offsets.get(&class_id) else {
+            return;
+        };
         for &off in offsets {
             let off = off as usize;
-            if off + is > raw.len() { break; } // offsets are ascending; safe to stop
+            if off + is > raw.len() {
+                break;
+            } // offsets are ascending; safe to stop
             let to = read_id_raw(is, &raw[off..]);
             if to != 0 {
                 out.push(encode_edge(from, to));
@@ -495,11 +571,11 @@ fn read_id_raw(is: usize, buf: &[u8]) -> u64 {
 /// Matches `FieldType::byte_size` in `gc_record.rs`.
 fn field_type_size(ty: u8, is: usize) -> usize {
     match ty {
-        2       => is, // Object
-        4 | 8   => 1,  // Bool, Byte
-        5 | 9   => 2,  // Char, Short
-        6 | 10  => 4,  // Float, Int
-        7 | 11  => 8,  // Double, Long
+        2 => is,     // Object
+        4 | 8 => 1,  // Bool, Byte
+        5 | 9 => 2,  // Char, Short
+        6 | 10 => 4, // Float, Int
+        7 | 11 => 8, // Double, Long
         _ => panic!("unknown field type byte: {ty}"),
     }
 }
@@ -514,34 +590,47 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
     //   + reserved_1(is) + reserved_2(is) + instance_size(4)
     // = 7 * is + 8 bytes
     let fixed = 7 * is + 8;
-    if buf.len() < fixed + 2 { return None; } // +2 for cp_count
+    if buf.len() < fixed + 2 {
+        return None;
+    } // +2 for cp_count
 
     let class_object_id = read_id_raw(is, buf);
     let mut pos = fixed;
 
     // Constant pool
-    let cp_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    let cp_count = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
     pos += 2;
     for _ in 0..cp_count {
-        if buf.len() < pos + 3 { return None; } // cp_index(2) + type(1)
+        if buf.len() < pos + 3 {
+            return None;
+        } // cp_index(2) + type(1)
         pos += 2; // cp_index (discarded)
         let ty = buf[pos];
         pos += 1;
         let sz = field_type_size(ty, is);
-        if buf.len() < pos + sz { return None; }
+        if buf.len() < pos + sz {
+            return None;
+        }
         pos += sz;
     }
 
     // Static fields
-    if buf.len() < pos + 2 { return None; }
-    let static_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    if buf.len() < pos + 2 {
+        return None;
+    }
+    let static_count = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
     pos += 2;
     for _ in 0..static_count {
-        if buf.len() < pos + is + 1 { return None; } // name_id(is) + type(1)
+        if buf.len() < pos + is + 1 {
+            return None;
+        } // name_id(is) + type(1)
         let ty = buf[pos + is];
         let sz = field_type_size(ty, is);
-        if buf.len() < pos + is + 1 + sz { return None; }
-        if ty == 2 { // Object
+        if buf.len() < pos + is + 1 + sz {
+            return None;
+        }
+        if ty == 2 {
+            // Object
             let to = read_id_raw(is, &buf[pos + is + 1..]);
             if to != 0 {
                 out.push(encode_edge(class_object_id, to));
@@ -551,11 +640,15 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
     }
 
     // Instance field descriptors — name_id(is) + type(1), no value.
-    if buf.len() < pos + 2 { return None; }
-    let instance_count = u16::from_be_bytes(buf[pos..pos+2].try_into().unwrap()) as usize;
+    if buf.len() < pos + 2 {
+        return None;
+    }
+    let instance_count = u16::from_be_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
     pos += 2;
     let descriptors_size = instance_count * (is + 1);
-    if buf.len() < pos + descriptors_size { return None; }
+    if buf.len() < pos + descriptors_size {
+        return None;
+    }
     pos += descriptors_size;
 
     Some(pos)
@@ -575,9 +668,7 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
         let mut extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
         process_with_extractor(
             path,
-            move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize {
-                extractor.extract(buf, edges)
-            },
+            move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize { extractor.extract(buf, edges) },
             &mut |batch: &mut Vec<RawEdge>| {
                 for &edge in batch.iter() {
                     sorter.push(edge).expect("edge sort write failed");
@@ -604,5 +695,9 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     })?;
     rev_sorter.finish(&reverse_edges_path, &mut |_| {})?;
 
-    Ok(Pass2Output { edges_path, reverse_edges_path, edge_count })
+    Ok(Pass2Output {
+        edges_path,
+        reverse_edges_path,
+        edge_count,
+    })
 }

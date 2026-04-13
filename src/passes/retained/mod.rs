@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::passes::dominators::Pass3Output;
-use crate::passes::index::{Pass1Output, ENTRY_SIZE};
+use crate::passes::index::{ENTRY_SIZE, Pass1Output};
 
 const UNDEFINED: u32 = u32::MAX;
 
@@ -55,8 +55,10 @@ fn load_shallow_sizes(index_path: &Path) -> Result<Vec<u32>> {
     let n = file_len / ENTRY_SIZE;
     let mut sizes = Vec::with_capacity(n);
 
-    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
-        File::open(index_path).context("open object index")?);
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(index_path).context("open object index")?,
+    );
     let mut buf = [0u8; ENTRY_SIZE];
 
     while reader.read_exact(&mut buf).is_ok() {
@@ -75,8 +77,10 @@ fn load_idom(idom_path: &Path) -> Result<Vec<u32>> {
     let count = file_len / 4;
     let mut idom = Vec::with_capacity(count);
 
-    let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
-        File::open(idom_path).context("open idom file")?);
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(idom_path).context("open idom file")?,
+    );
     let mut buf = [0u8; 4];
     while reader.read_exact(&mut buf).is_ok() {
         idom.push(u32::from_le_bytes(buf));
@@ -91,10 +95,10 @@ fn load_idom(idom_path: &Path) -> Result<Vec<u32>> {
 /// `retained` is indexed by node_idx (0..N for actual objects, N for vroot).
 /// Returns `(retained, unreachable_count, unreachable_shallow)`.
 fn compute_retained(
-    shallow: &[u32],         // indexed by node_idx, length N
-    idom: &[u32],            // indexed by RPO number, length = reachable node count
-    rpo_to_node: &[u32],     // RPO number → node_idx (includes vroot at RPO 0)
-    node_count: u32,         // N: number of actual objects
+    shallow: &[u32],     // indexed by node_idx, length N
+    idom: &[u32],        // indexed by RPO number, length = reachable node count
+    rpo_to_node: &[u32], // RPO number → node_idx (includes vroot at RPO 0)
+    node_count: u32,     // N: number of actual objects
 ) -> (Vec<u64>, u64, u64) {
     let n = node_count as usize;
 
@@ -120,8 +124,8 @@ fn compute_retained(
     // propagate node j's retained size into idom[j], node j is fully
     // accumulated (all nodes it dominates have already been folded in).
     for rpo in (1..rpo_to_node.len()).rev() {
-        let node     = rpo_to_node[rpo] as usize;
-        let dom_rpo  = idom[rpo];
+        let node = rpo_to_node[rpo] as usize;
+        let dom_rpo = idom[rpo];
 
         if dom_rpo == UNDEFINED {
             continue; // unreachable node — no dominator
@@ -151,8 +155,10 @@ fn compute_retained(
 // ── Step 4: write retained sizes ─────────────────────────────────────────────
 
 fn write_retained(retained: &[u64], node_count: usize, path: &Path) -> Result<()> {
-    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-        File::create(path).context("create retained file")?);
+    let mut w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(path).context("create retained file")?,
+    );
     // Write only actual objects (0..N), exclude the virtual root slot at N.
     for &r in &retained[..node_count] {
         w.write_all(&r.to_le_bytes())?;
@@ -163,11 +169,7 @@ fn write_retained(retained: &[u64], node_count: usize, path: &Path) -> Result<()
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-pub fn run(
-    pass1: &Pass1Output,
-    pass3: &Pass3Output,
-    output_dir: &Path,
-) -> Result<Pass4Output> {
+pub fn run(pass1: &Pass1Output, pass3: &Pass3Output, output_dir: &Path) -> Result<Pass4Output> {
     let n = pass3.node_count as usize;
 
     let shallow = load_shallow_sizes(&pass1.object_index_path)?;

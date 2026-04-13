@@ -5,8 +5,8 @@
 //! - Sorted object index on disk: `(object_id, class_id, shallow_size)` per object
 //! - GC root ID list on disk
 
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -33,23 +33,23 @@ pub type RawEntry = [u8; ENTRY_SIZE];
 // safe to use as synthetic identifiers for objects that have no Java class_id.
 
 /// Class object — java.lang.Class (from ClassDump records).
-pub const CLASS_ID_JAVA_CLASS:   u64 = 0x01;
+pub const CLASS_ID_JAVA_CLASS: u64 = 0x01;
 /// boolean[] primitive array.
-pub const CLASS_ID_BOOL_ARRAY:   u64 = 0x04; // FieldType::Bool   = 4
+pub const CLASS_ID_BOOL_ARRAY: u64 = 0x04; // FieldType::Bool   = 4
 /// char[] primitive array.
-pub const CLASS_ID_CHAR_ARRAY:   u64 = 0x05; // FieldType::Char   = 5
+pub const CLASS_ID_CHAR_ARRAY: u64 = 0x05; // FieldType::Char   = 5
 /// float[] primitive array.
-pub const CLASS_ID_FLOAT_ARRAY:  u64 = 0x06; // FieldType::Float  = 6
+pub const CLASS_ID_FLOAT_ARRAY: u64 = 0x06; // FieldType::Float  = 6
 /// double[] primitive array.
 pub const CLASS_ID_DOUBLE_ARRAY: u64 = 0x07; // FieldType::Double = 7
 /// byte[] primitive array.
-pub const CLASS_ID_BYTE_ARRAY:   u64 = 0x08; // FieldType::Byte   = 8
+pub const CLASS_ID_BYTE_ARRAY: u64 = 0x08; // FieldType::Byte   = 8
 /// short[] primitive array.
-pub const CLASS_ID_SHORT_ARRAY:  u64 = 0x09; // FieldType::Short  = 9
+pub const CLASS_ID_SHORT_ARRAY: u64 = 0x09; // FieldType::Short  = 9
 /// int[] primitive array.
-pub const CLASS_ID_INT_ARRAY:    u64 = 0x0A; // FieldType::Int    = 10
+pub const CLASS_ID_INT_ARRAY: u64 = 0x0A; // FieldType::Int    = 10
 /// long[] primitive array.
-pub const CLASS_ID_LONG_ARRAY:   u64 = 0x0B; // FieldType::Long   = 11
+pub const CLASS_ID_LONG_ARRAY: u64 = 0x0B; // FieldType::Long   = 11
 
 /// Flag ORed into the class_id field of ObjectArrayDump entries.
 /// Bit 63 is always 0 for real heap addresses on x86_64, so this is safe.
@@ -159,14 +159,20 @@ impl ExternalSorter {
         let path = self
             .output_dir
             .join(format!("object_index_chunk_{}.bin", self.chunk_paths.len()));
-        let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-            File::create(&path).context("create sort chunk")?);
+        let mut w = BufWriter::with_capacity(
+            IO_BUF_SIZE,
+            File::create(&path).context("create sort chunk")?,
+        );
         for entry in self.current.drain(..) {
             w.write_all(&entry)?;
         }
         w.flush()?;
         self.chunk_paths.push(path);
-        eprintln!("  flushed chunk {} ({} total)", self.chunk_paths.len(), self.chunk_paths.len());
+        eprintln!(
+            "  flushed chunk {} ({} total)",
+            self.chunk_paths.len(),
+            self.chunk_paths.len()
+        );
         Ok(())
     }
 
@@ -197,7 +203,8 @@ impl ExternalSorter {
             let count = self.current.len() as u64;
             eprintln!("  sorting {count} entries in-memory (no chunk files needed)…");
             self.current.par_sort_unstable_by_key(entry_id);
-            let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
+            let mut w = BufWriter::with_capacity(
+                IO_BUF_SIZE,
                 File::create(output_path).context("create object index")?,
             );
             for mut entry in self.current.drain(..) {
@@ -221,7 +228,9 @@ impl ExternalSorter {
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  merging {} chunks…", n);
                 merge_chunks_with_fixup(&chunks, output_path, &fixup)?;
-                for p in &chunks { let _ = std::fs::remove_file(p); }
+                for p in &chunks {
+                    let _ = std::fs::remove_file(p);
+                }
             }
             n => {
                 // Two-level merge: intermediate files are written without fixup;
@@ -233,15 +242,27 @@ impl ExternalSorter {
                 let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
                 for (g, group) in chunks.chunks(group_size).enumerate() {
                     let inter = self.output_dir.join(format!("object_index_inter_{g}.bin"));
-                    eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
+                    eprintln!(
+                        "    merging group {}/{} ({} chunks)…",
+                        g + 1,
+                        num_groups,
+                        group.len()
+                    );
                     merge_chunks_with_fixup(group, &inter, |_| {})?;
-                    for p in group { let _ = std::fs::remove_file(p); }
+                    for p in group {
+                        let _ = std::fs::remove_file(p);
+                    }
                     intermediates.push(inter);
                 }
 
-                eprintln!("  final merge of {} intermediate files…", intermediates.len());
+                eprintln!(
+                    "  final merge of {} intermediate files…",
+                    intermediates.len()
+                );
                 merge_chunks_with_fixup(&intermediates, output_path, &fixup)?;
-                for p in &intermediates { let _ = std::fs::remove_file(p); }
+                for p in &intermediates {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
 
@@ -262,18 +283,18 @@ impl Drop for ExternalSorter {
 /// K-way merge of sorted chunk files into a single sorted output file.
 /// `fixup` is called on each entry immediately before it is written, allowing
 /// fields to be corrected in a single pass (e.g. patching instance shallow sizes).
-fn merge_chunks_with_fixup<F>(
-    chunk_paths: &[PathBuf],
-    output_path: &Path,
-    fixup: F,
-) -> Result<()>
+fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, fixup: F) -> Result<()>
 where
     F: Fn(&mut RawEntry),
 {
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
-        .map(|p| Ok(BufReader::with_capacity(IO_BUF_SIZE,
-            File::open(p).context("open sort chunk")?)))
+        .map(|p| {
+            Ok(BufReader::with_capacity(
+                IO_BUF_SIZE,
+                File::open(p).context("open sort chunk")?,
+            ))
+        })
         .collect::<Result<_>>()?;
 
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
@@ -286,8 +307,10 @@ where
         }
     }
 
-    let mut w = BufWriter::with_capacity(IO_BUF_SIZE,
-        File::create(output_path).context("create merged object index")?);
+    let mut w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(output_path).context("create merged object index")?,
+    );
 
     while let Some(Reverse((_, idx))) = heap.pop() {
         let mut entry = peek[idx].take().unwrap();
@@ -400,8 +423,7 @@ impl IndexVisitor {
 
         // Write class names so later runs can skip re-parsing the HPROF.
         let class_names_path = self.output_dir.join("class_names.bin");
-        write_class_names(&class_index, &class_names_path)
-            .context("write class_names.bin")?;
+        write_class_names(&class_index, &class_names_path).context("write class_names.bin")?;
 
         Ok(Pass1Output {
             class_index,
@@ -414,15 +436,15 @@ impl IndexVisitor {
     fn handle_gc_record(&mut self, gc: GcRecord) {
         match gc {
             // ── GC roots ─────────────────────────────────────────────────────
-            GcRecord::RootUnknown      { object_id }
-            | GcRecord::RootJniGlobal  { object_id, .. }
-            | GcRecord::RootJniLocal   { object_id, .. }
-            | GcRecord::RootJavaFrame  { object_id, .. }
-            | GcRecord::RootNativeStack{ object_id, .. }
-            | GcRecord::RootStickyClass{ object_id }
-            | GcRecord::RootThreadBlock{ object_id, .. }
-            | GcRecord::RootMonitorUsed{ object_id }
-            | GcRecord::RootThreadObject{object_id, .. } => {
+            GcRecord::RootUnknown { object_id }
+            | GcRecord::RootJniGlobal { object_id, .. }
+            | GcRecord::RootJniLocal { object_id, .. }
+            | GcRecord::RootJavaFrame { object_id, .. }
+            | GcRecord::RootNativeStack { object_id, .. }
+            | GcRecord::RootStickyClass { object_id }
+            | GcRecord::RootThreadBlock { object_id, .. }
+            | GcRecord::RootMonitorUsed { object_id }
+            | GcRecord::RootThreadObject { object_id, .. } => {
                 self.roots.push(object_id);
             }
 
@@ -455,7 +477,12 @@ impl IndexVisitor {
             }
 
             // ── Object instances ─────────────────────────────────────────────
-            GcRecord::InstanceDump { object_id, class_id, data_size, .. } => {
+            GcRecord::InstanceDump {
+                object_id,
+                class_id,
+                data_size,
+                ..
+            } => {
                 // TODO: resolve shallow_size from class_index.instance_size after
                 // all ClassDump records are seen. For now, data_size is the raw
                 // field-data byte count — close but excludes the JVM object header.
@@ -465,7 +492,12 @@ impl IndexVisitor {
             }
 
             // ── Arrays ───────────────────────────────────────────────────────
-            GcRecord::ObjectArrayDump { object_id, num_elements, element_class_id, .. } => {
+            GcRecord::ObjectArrayDump {
+                object_id,
+                num_elements,
+                element_class_id,
+                ..
+            } => {
                 let shallow = self.object_array_shallow_size(num_elements);
                 // Encode element_class_id with OBJECT_ARRAY_FLAG so the query layer
                 // can distinguish "SomeClass[]" from plain "SomeClass" instances.
@@ -474,7 +506,11 @@ impl IndexVisitor {
                 self.object_count += 1;
             }
 
-            GcRecord::PrimitiveArrayDump { object_id, num_elements, element_type } => {
+            GcRecord::PrimitiveArrayDump {
+                object_id,
+                num_elements,
+                element_type,
+            } => {
                 let shallow = self.primitive_array_shallow_size(element_type, num_elements);
                 // Use the FieldType discriminant as a synthetic class_id (values 4..11)
                 // so the query layer can display the correct array type name.
@@ -493,7 +529,8 @@ impl RecordVisitor for IndexVisitor {
                 self.string_table.insert(id, str.into_string());
             }
             Record::LoadClass(lc) => {
-                self.name_id_map.insert(lc.class_object_id, lc.class_name_id);
+                self.name_id_map
+                    .insert(lc.class_object_id, lc.class_name_id);
             }
             Record::GcSegment(gc) => {
                 self.handle_gc_record(gc);
@@ -554,12 +591,15 @@ pub fn load_class_index(path: &Path) -> Result<ClassDescriptorMap> {
         let mut name_bytes = vec![0u8; name_len];
         r.read_exact(&mut name_bytes)?;
         let name = String::from_utf8(name_bytes).context("class name UTF-8")?;
-        map.insert(class_id, ClassDescriptor {
-            name,
-            super_id,
-            instance_size: 0,
-            instance_fields: Vec::new(),
-        });
+        map.insert(
+            class_id,
+            ClassDescriptor {
+                name,
+                super_id,
+                instance_size: 0,
+                instance_fields: Vec::new(),
+            },
+        );
     }
     Ok(map)
 }

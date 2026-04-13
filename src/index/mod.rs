@@ -17,12 +17,9 @@ use crate::passes::IO_BUF_SIZE;
 // ── Re-export encoding constants ─────────────────────────────────────────────
 
 pub use crate::passes::index::{
-    CLASS_ID_JAVA_CLASS,
-    CLASS_ID_BOOL_ARRAY, CLASS_ID_CHAR_ARRAY,
-    CLASS_ID_FLOAT_ARRAY, CLASS_ID_DOUBLE_ARRAY,
-    CLASS_ID_BYTE_ARRAY, CLASS_ID_SHORT_ARRAY,
-    CLASS_ID_INT_ARRAY, CLASS_ID_LONG_ARRAY,
-    OBJECT_ARRAY_FLAG,
+    CLASS_ID_BOOL_ARRAY, CLASS_ID_BYTE_ARRAY, CLASS_ID_CHAR_ARRAY, CLASS_ID_DOUBLE_ARRAY,
+    CLASS_ID_FLOAT_ARRAY, CLASS_ID_INT_ARRAY, CLASS_ID_JAVA_CLASS, CLASS_ID_LONG_ARRAY,
+    CLASS_ID_SHORT_ARRAY, OBJECT_ARRAY_FLAG,
 };
 
 // ── Class name resolution ────────────────────────────────────────────────────
@@ -56,7 +53,8 @@ fn normalize_class_name(raw: &str) -> String {
             "D" => "double",
             "J" => "long",
             other => other,
-        }.to_string()
+        }
+        .to_string()
     };
     format!("{}{}", base, "[]".repeat(dims))
 }
@@ -81,10 +79,7 @@ pub fn class_name(class_id: u64, class_index: &HashMap<u64, ClassDescriptor>) ->
         //
         // Fallback: if the stored class_id resolves to a plain (non-array) class
         // name, the JVM stored the element type instead — append "[]" in that case.
-        let raw = class_index
-            .get(&cid)
-            .map(|d| d.name.as_str())
-            .unwrap_or("");
+        let raw = class_index.get(&cid).map(|d| d.name.as_str()).unwrap_or("");
         if raw.starts_with('[') {
             return normalize_class_name(raw);
         } else if raw.is_empty() {
@@ -95,15 +90,15 @@ pub fn class_name(class_id: u64, class_index: &HashMap<u64, ClassDescriptor>) ->
     }
 
     match cid {
-        CLASS_ID_JAVA_CLASS   => "java.lang.Class".to_string(),
-        CLASS_ID_BOOL_ARRAY   => "boolean[]".to_string(),
-        CLASS_ID_CHAR_ARRAY   => "char[]".to_string(),
-        CLASS_ID_FLOAT_ARRAY  => "float[]".to_string(),
+        CLASS_ID_JAVA_CLASS => "java.lang.Class".to_string(),
+        CLASS_ID_BOOL_ARRAY => "boolean[]".to_string(),
+        CLASS_ID_CHAR_ARRAY => "char[]".to_string(),
+        CLASS_ID_FLOAT_ARRAY => "float[]".to_string(),
         CLASS_ID_DOUBLE_ARRAY => "double[]".to_string(),
-        CLASS_ID_BYTE_ARRAY   => "byte[]".to_string(),
-        CLASS_ID_SHORT_ARRAY  => "short[]".to_string(),
-        CLASS_ID_INT_ARRAY    => "int[]".to_string(),
-        CLASS_ID_LONG_ARRAY   => "long[]".to_string(),
+        CLASS_ID_BYTE_ARRAY => "byte[]".to_string(),
+        CLASS_ID_SHORT_ARRAY => "short[]".to_string(),
+        CLASS_ID_INT_ARRAY => "int[]".to_string(),
+        CLASS_ID_LONG_ARRAY => "long[]".to_string(),
         _ => resolve_instance_name(cid, class_index),
     }
 }
@@ -143,10 +138,14 @@ impl ObjectIndex {
     /// Return a streaming iterator over `(object_id, class_id, shallow_size)` tuples.
     /// Entries arrive in sorted `object_id` order.
     pub fn iter(&self) -> Result<ObjectIndexIter> {
-        let reader = BufReader::with_capacity(IO_BUF_SIZE,
+        let reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
             File::open(&self.path).context("open object index")?,
         );
-        Ok(ObjectIndexIter { reader, buf: [0u8; ENTRY_SIZE] })
+        Ok(ObjectIndexIter {
+            reader,
+            buf: [0u8; ENTRY_SIZE],
+        })
     }
 }
 
@@ -162,7 +161,7 @@ impl Iterator for ObjectIndexIter {
         self.reader.read_exact(&mut self.buf).ok()?;
         let oid = u64::from_le_bytes(self.buf[0..8].try_into().unwrap());
         let cid = u64::from_le_bytes(self.buf[8..16].try_into().unwrap());
-        let sz  = u32::from_le_bytes(self.buf[16..20].try_into().unwrap());
+        let sz = u32::from_le_bytes(self.buf[16..20].try_into().unwrap());
         Some((oid, cid, sz))
     }
 }
@@ -184,8 +183,8 @@ impl RetainedIndex {
             .len() as usize;
         let count = len / 8;
         let mut data = Vec::with_capacity(count);
-        let mut reader = BufReader::with_capacity(IO_BUF_SIZE,
-            File::open(path).context("open retained.bin")?);
+        let mut reader =
+            BufReader::with_capacity(IO_BUF_SIZE, File::open(path).context("open retained.bin")?);
         let mut buf = [0u8; 8];
         while reader.read_exact(&mut buf).is_ok() {
             data.push(u64::from_le_bytes(buf));

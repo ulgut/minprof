@@ -60,14 +60,22 @@ pub enum FieldValue {
     // Primitive variants are parsed to correctly advance the byte cursor.
     // Only Object references are used in analysis; the others are kept for
     // completeness and potential future use (e.g. string content extraction).
-    #[allow(dead_code)] Bool(bool),
-    #[allow(dead_code)] Byte(i8),
-    #[allow(dead_code)] Char(u16),
-    #[allow(dead_code)] Short(i16),
-    #[allow(dead_code)] Int(i32),
-    #[allow(dead_code)] Long(i64),
-    #[allow(dead_code)] Float(f32),
-    #[allow(dead_code)] Double(f64),
+    #[allow(dead_code)]
+    Bool(bool),
+    #[allow(dead_code)]
+    Byte(i8),
+    #[allow(dead_code)]
+    Char(u16),
+    #[allow(dead_code)]
+    Short(i16),
+    #[allow(dead_code)]
+    Int(i32),
+    #[allow(dead_code)]
+    Long(i64),
+    #[allow(dead_code)]
+    Float(f32),
+    #[allow(dead_code)]
+    Double(f64),
     Object(u64),
 }
 
@@ -90,30 +98,57 @@ pub struct ClassDumpFields {
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum GcRecord {
-    RootUnknown       { object_id: u64 },
-    RootJniGlobal     { object_id: u64, jni_global_ref_id: u64 },
-    RootJniLocal      { object_id: u64, thread_serial: u32, frame_num: u32 },
-    RootJavaFrame     { object_id: u64, thread_serial: u32, frame_num: u32 },
-    RootNativeStack   { object_id: u64, thread_serial: u32 },
-    RootStickyClass   { object_id: u64 },
-    RootThreadBlock   { object_id: u64, thread_serial: u32 },
-    RootMonitorUsed   { object_id: u64 },
-    RootThreadObject  { object_id: u64, thread_serial: u32, stack_serial: u32 },
+    RootUnknown {
+        object_id: u64,
+    },
+    RootJniGlobal {
+        object_id: u64,
+        jni_global_ref_id: u64,
+    },
+    RootJniLocal {
+        object_id: u64,
+        thread_serial: u32,
+        frame_num: u32,
+    },
+    RootJavaFrame {
+        object_id: u64,
+        thread_serial: u32,
+        frame_num: u32,
+    },
+    RootNativeStack {
+        object_id: u64,
+        thread_serial: u32,
+    },
+    RootStickyClass {
+        object_id: u64,
+    },
+    RootThreadBlock {
+        object_id: u64,
+        thread_serial: u32,
+    },
+    RootMonitorUsed {
+        object_id: u64,
+    },
+    RootThreadObject {
+        object_id: u64,
+        thread_serial: u32,
+        stack_serial: u32,
+    },
 
     ClassDump(Box<ClassDumpFields>),
 
     InstanceDump {
         object_id: u64,
-        class_id:  u64,
+        class_id: u64,
         data_size: u32,
         /// Raw instance field bytes, in HPROF big-endian layout.
         /// Empty in pass 1 (skip mode); populated in pass 2 (data mode).
-        raw_data:  Vec<u8>,
+        raw_data: Vec<u8>,
     },
 
     ObjectArrayDump {
-        object_id:        u64,
-        num_elements:     u32,
+        object_id: u64,
+        num_elements: u32,
         element_class_id: u64,
         /// Element object IDs (big-endian decoded).
         /// Empty in pass 1 (skip mode); populated in pass 2 (data mode).
@@ -121,9 +156,8 @@ pub enum GcRecord {
     },
 
     PrimitiveArrayDump {
-        object_id:    u64,
+        object_id: u64,
         num_elements: u32,
         element_type: FieldType,
     },
 }
-

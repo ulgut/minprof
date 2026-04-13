@@ -19,9 +19,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::index::{class_name, ObjectIndex, RetainedIndex};
-use crate::passes::edges::{Pass2Output, EDGE_SIZE};
-use crate::passes::index::{ClassDescriptorMap, Pass1Output, ENTRY_SIZE};
+use crate::index::{ObjectIndex, RetainedIndex, class_name};
+use crate::passes::edges::{EDGE_SIZE, Pass2Output};
+use crate::passes::index::{ClassDescriptorMap, ENTRY_SIZE, Pass1Output};
 use crate::passes::retained::Pass4Output;
 
 // ── Report selection ──────────────────────────────────────────────────────────
@@ -42,117 +42,122 @@ pub struct ReportConfig {
 
 impl ReportConfig {
     pub fn all() -> Self {
-        Self { histogram: true, retained_by_class: true, leak_suspects: true, package_summary: true }
+        Self {
+            histogram: true,
+            retained_by_class: true,
+            leak_suspects: true,
+            package_summary: true,
+        }
     }
 }
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
 pub struct AnalysisOutput {
-    pub total_objects:          usize,
-    pub total_classes:          usize,
-    pub gc_roots:               usize,
-    pub total_shallow_bytes:    u64,
-    pub retained_heap_bytes:    u64,
-    pub unreachable_count:      u64,
-    pub unreachable_shallow:    u64,
+    pub total_objects: usize,
+    pub total_classes: usize,
+    pub gc_roots: usize,
+    pub total_shallow_bytes: u64,
+    pub retained_heap_bytes: u64,
+    pub unreachable_count: u64,
+    pub unreachable_shallow: u64,
     /// Top 20 classes by total shallow allocation.
-    pub top_allocated:          Vec<ClassHistEntry>,
+    pub top_allocated: Vec<ClassHistEntry>,
     /// Top 20 classes by largest single instance.
-    pub top_largest:            Vec<ClassHistEntry>,
+    pub top_largest: Vec<ClassHistEntry>,
     /// Top 20 individual objects by retained heap. Object IDs can be passed to --path.
-    pub top_retained_objects:   Vec<RetainedObjectEntry>,
+    pub top_retained_objects: Vec<RetainedObjectEntry>,
     /// Top 20 classes by total retained heap.
-    pub retained_by_class:      Vec<RetainedByClassEntry>,
+    pub retained_by_class: Vec<RetainedByClassEntry>,
     /// Top 20 Java packages by total retained heap.
-    pub package_summary:        Vec<PackageSummaryEntry>,
+    pub package_summary: Vec<PackageSummaryEntry>,
     /// Classes retaining ≥ 1% of heap (Eclipse MAT "Leak Suspects").
-    pub leak_suspects:          Vec<LeakSuspectEntry>,
+    pub leak_suspects: Vec<LeakSuspectEntry>,
     /// Full package hierarchy for the HTML treemap (all packages, not truncated).
-    pub treemap_data:           Vec<TreemapPackage>,
+    pub treemap_data: Vec<TreemapPackage>,
     // ── GC pressure metrics (Eclipse MAT "System Overview") ──────────────────
-    pub finalizer_queue_depth:  u64,
-    pub soft_ref_count:         u64,
-    pub weak_ref_count:         u64,
-    pub phantom_ref_count:      u64,
+    pub finalizer_queue_depth: u64,
+    pub soft_ref_count: u64,
+    pub weak_ref_count: u64,
+    pub phantom_ref_count: u64,
 }
 
 pub struct ClassHistEntry {
-    pub class_name:          String,
-    pub instances:           u64,
+    pub class_name: String,
+    pub instances: u64,
     pub total_shallow_bytes: u64,
-    pub max_shallow_bytes:   u32,
+    pub max_shallow_bytes: u32,
 }
 
 pub struct RetainedObjectEntry {
-    pub object_id:      u64,
-    pub class_name:     String,
-    pub shallow_bytes:  u32,
+    pub object_id: u64,
+    pub class_name: String,
+    pub shallow_bytes: u32,
     pub retained_bytes: u64,
 }
 
 pub struct RetainedByClassEntry {
-    pub class_name:           String,
-    pub instance_count:       u64,
+    pub class_name: String,
+    pub instance_count: u64,
     pub total_retained_bytes: u64,
-    pub total_shallow_bytes:  u64,
+    pub total_shallow_bytes: u64,
 }
 
 pub struct PackageSummaryEntry {
-    pub package:              String,
-    pub class_count:          u64,
-    pub instance_count:       u64,
-    pub total_shallow_bytes:  u64,
+    pub package: String,
+    pub class_count: u64,
+    pub instance_count: u64,
+    pub total_shallow_bytes: u64,
     pub total_retained_bytes: u64,
 }
 
 /// A classified leak suspect — class retaining ≥ 1% of heap.
 #[allow(dead_code)]
 pub struct LeakSuspectEntry {
-    pub class_name:           String,
-    pub instance_count:       u64,
+    pub class_name: String,
+    pub instance_count: u64,
     pub total_retained_bytes: u64,
-    pub total_shallow_bytes:  u64,
-    pub avg_retained_bytes:   u64,
-    pub pct_of_heap:          f64,
-    pub pattern:              &'static str,
+    pub total_shallow_bytes: u64,
+    pub avg_retained_bytes: u64,
+    pub pct_of_heap: f64,
+    pub pattern: &'static str,
 }
 
 /// Package node in the treemap hierarchy.
 pub struct TreemapPackage {
-    pub name:          String,
+    pub name: String,
     pub retained_bytes: u64,
-    pub classes:       Vec<TreemapClass>,
+    pub classes: Vec<TreemapClass>,
 }
 
 pub struct TreemapClass {
-    pub name:           String,
+    pub name: String,
     pub retained_bytes: u64,
     pub instance_count: u64,
 }
 
 pub struct PathStep {
-    pub object_id:    u64,
-    pub class_name:   String,
+    pub object_id: u64,
+    pub class_name: String,
     pub shallow_bytes: u32,
-    pub is_gc_root:   bool,
-    pub is_target:    bool,
+    pub is_gc_root: bool,
+    pub is_target: bool,
 }
 
 // ── Internal collection types ─────────────────────────────────────────────────
 
 #[derive(Default)]
 struct ClassStats {
-    count:         u64,
+    count: u64,
     total_shallow: u64,
-    max_shallow:   u32,
+    max_shallow: u32,
 }
 
 struct RawRetainedRow {
     object_id: u64,
-    class_id:  u64,
-    shallow:   u32,
-    retained:  u64,
+    class_id: u64,
+    shallow: u32,
+    retained: u64,
 }
 
 // ── Size formatting ───────────────────────────────────────────────────────────
@@ -174,7 +179,9 @@ fn fmt_size_u32(bytes: u32) -> String {
 }
 
 fn fmt_pct(part: u64, total: u64) -> String {
-    if total == 0 { return "  0.0%".to_string(); }
+    if total == 0 {
+        return "  0.0%".to_string();
+    }
     format!("{:5.1}%", part as f64 / total as f64 * 100.0)
 }
 
@@ -185,12 +192,12 @@ fn json_str(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str("\\\""),
+            '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c    => out.push(c),
+            c => out.push(c),
         }
     }
     out.push('"');
@@ -220,7 +227,7 @@ fn package_of(class_name: &str) -> String {
     }
     match base.rfind('.') {
         Some(pos) => base[..pos].to_string(),
-        None      => base.to_string(),
+        None => base.to_string(),
     }
 }
 
@@ -245,9 +252,9 @@ fn collect_output(
         stats.max_shallow = stats.max_shallow.max(shallow);
         raw_retained.push(RawRetainedRow {
             object_id: oid,
-            class_id:  cid,
+            class_id: cid,
             shallow,
-            retained:  ret_idx.get(node_idx),
+            retained: ret_idx.get(node_idx),
         });
     }
 
@@ -256,39 +263,55 @@ fn collect_output(
     // ── Top by total allocation ───────────────────────────────────────────────
     let mut by_total: Vec<(&u64, &ClassStats)> = histogram.iter().collect();
     by_total.sort_by(|a, b| {
-        b.1.total_shallow.cmp(&a.1.total_shallow)
+        b.1.total_shallow
+            .cmp(&a.1.total_shallow)
             .then_with(|| class_name(*a.0, class_index).cmp(&class_name(*b.0, class_index)))
     });
-    let top_allocated = by_total.iter().take(TOP_N).map(|(cid, s)| ClassHistEntry {
-        class_name:          class_name(**cid, class_index),
-        instances:           s.count,
-        total_shallow_bytes: s.total_shallow,
-        max_shallow_bytes:   s.max_shallow,
-    }).collect();
+    let top_allocated = by_total
+        .iter()
+        .take(TOP_N)
+        .map(|(cid, s)| ClassHistEntry {
+            class_name: class_name(**cid, class_index),
+            instances: s.count,
+            total_shallow_bytes: s.total_shallow,
+            max_shallow_bytes: s.max_shallow,
+        })
+        .collect();
 
     // ── Top by largest single instance ────────────────────────────────────────
     let mut by_largest: Vec<(&u64, &ClassStats)> = histogram.iter().collect();
     by_largest.sort_by(|a, b| {
-        b.1.max_shallow.cmp(&a.1.max_shallow)
+        b.1.max_shallow
+            .cmp(&a.1.max_shallow)
             .then_with(|| class_name(*a.0, class_index).cmp(&class_name(*b.0, class_index)))
     });
-    let top_largest = by_largest.iter().take(TOP_N).map(|(cid, s)| ClassHistEntry {
-        class_name:          class_name(**cid, class_index),
-        instances:           s.count,
-        total_shallow_bytes: s.total_shallow,
-        max_shallow_bytes:   s.max_shallow,
-    }).collect();
+    let top_largest = by_largest
+        .iter()
+        .take(TOP_N)
+        .map(|(cid, s)| ClassHistEntry {
+            class_name: class_name(**cid, class_index),
+            instances: s.count,
+            total_shallow_bytes: s.total_shallow,
+            max_shallow_bytes: s.max_shallow,
+        })
+        .collect();
 
     // ── Top individual objects by retained heap ───────────────────────────────
     raw_retained.sort_unstable_by(|a, b| {
-        b.retained.cmp(&a.retained).then_with(|| a.object_id.cmp(&b.object_id))
+        b.retained
+            .cmp(&a.retained)
+            .then_with(|| a.object_id.cmp(&b.object_id))
     });
-    let top_retained_objects: Vec<RetainedObjectEntry> = raw_retained.iter().take(TOP_N).map(|r| RetainedObjectEntry {
-        object_id:      r.object_id,
-        class_name:     class_name(r.class_id, class_index),
-        shallow_bytes:  r.shallow,
-        retained_bytes: r.retained,
-    }).collect();
+    let top_retained_objects: Vec<RetainedObjectEntry> = raw_retained
+        .iter()
+        .take(TOP_N)
+        .map(|r| RetainedObjectEntry {
+            object_id: r.object_id,
+            class_name: class_name(r.class_id, class_index),
+            shallow_bytes: r.shallow,
+            retained_bytes: r.retained,
+        })
+        .collect();
 
     // ── Retained heap aggregated by class ─────────────────────────────────────
     // Group all objects by class_id, summing retained and shallow.
@@ -302,51 +325,57 @@ fn collect_output(
     let mut retained_by_class_full: Vec<RetainedByClassEntry> = retained_by_class_map
         .iter()
         .map(|(cid, (total_ret, total_sh, count))| RetainedByClassEntry {
-            class_name:           class_name(*cid, class_index),
-            instance_count:       *count,
+            class_name: class_name(*cid, class_index),
+            instance_count: *count,
             total_retained_bytes: *total_ret,
-            total_shallow_bytes:  *total_sh,
+            total_shallow_bytes: *total_sh,
         })
         .collect();
     retained_by_class_full.sort_by(|a, b| {
-        b.total_retained_bytes.cmp(&a.total_retained_bytes)
+        b.total_retained_bytes
+            .cmp(&a.total_retained_bytes)
             .then_with(|| a.class_name.cmp(&b.class_name))
     });
 
     // ── Package summary + treemap data (computed from full retained-by-class) ──
     let package_summary = compute_package_summary(&retained_by_class_full);
-    let treemap_data    = compute_treemap_data(&retained_by_class_full);
+    let treemap_data = compute_treemap_data(&retained_by_class_full);
 
     // ── Leak suspects ─────────────────────────────────────────────────────────
     let threshold = (total_shallow_bytes / 100).max(1);
-    let leak_suspects: Vec<LeakSuspectEntry> = retained_by_class_full.iter()
+    let leak_suspects: Vec<LeakSuspectEntry> = retained_by_class_full
+        .iter()
         .filter(|e| e.total_retained_bytes >= threshold)
         .map(|e| {
-            let avg = if e.instance_count > 0 { e.total_retained_bytes / e.instance_count } else { 0 };
+            let avg = if e.instance_count > 0 {
+                e.total_retained_bytes / e.instance_count
+            } else {
+                0
+            };
             let pct = e.total_retained_bytes as f64 / total_shallow_bytes as f64 * 100.0;
             LeakSuspectEntry {
-                class_name:           e.class_name.clone(),
-                instance_count:       e.instance_count,
+                class_name: e.class_name.clone(),
+                instance_count: e.instance_count,
                 total_retained_bytes: e.total_retained_bytes,
-                total_shallow_bytes:  e.total_shallow_bytes,
-                avg_retained_bytes:   avg,
-                pct_of_heap:          pct,
-                pattern:              classify_suspect(e.instance_count, avg, e.total_retained_bytes),
+                total_shallow_bytes: e.total_shallow_bytes,
+                avg_retained_bytes: avg,
+                pct_of_heap: pct,
+                pattern: classify_suspect(e.instance_count, avg, e.total_retained_bytes),
             }
         })
         .collect();
 
     // ── GC pressure metrics ───────────────────────────────────────────────────
     let mut finalizer_queue_depth = 0u64;
-    let mut soft_ref_count        = 0u64;
-    let mut weak_ref_count        = 0u64;
-    let mut phantom_ref_count     = 0u64;
+    let mut soft_ref_count = 0u64;
+    let mut weak_ref_count = 0u64;
+    let mut phantom_ref_count = 0u64;
     for e in &retained_by_class_full {
         match e.class_name.as_str() {
-            "java.lang.ref.Finalizer"       => finalizer_queue_depth = e.instance_count,
-            "java.lang.ref.SoftReference"   => soft_ref_count        = e.instance_count,
-            "java.lang.ref.WeakReference"   => weak_ref_count        = e.instance_count,
-            "java.lang.ref.PhantomReference" => phantom_ref_count    = e.instance_count,
+            "java.lang.ref.Finalizer" => finalizer_queue_depth = e.instance_count,
+            "java.lang.ref.SoftReference" => soft_ref_count = e.instance_count,
+            "java.lang.ref.WeakReference" => weak_ref_count = e.instance_count,
+            "java.lang.ref.PhantomReference" => phantom_ref_count = e.instance_count,
             _ => {}
         }
     }
@@ -355,17 +384,17 @@ fn collect_output(
     retained_by_class_full.truncate(TOP_N);
 
     Ok(AnalysisOutput {
-        total_objects:        obj_idx.entry_count,
-        total_classes:        pass1.class_index.len(),
-        gc_roots:             pass1.roots.len(),
+        total_objects: obj_idx.entry_count,
+        total_classes: pass1.class_index.len(),
+        gc_roots: pass1.roots.len(),
         total_shallow_bytes,
-        retained_heap_bytes:  pass4.total_heap_bytes,
-        unreachable_count:    pass4.unreachable_count,
-        unreachable_shallow:  pass4.unreachable_shallow,
+        retained_heap_bytes: pass4.total_heap_bytes,
+        unreachable_count: pass4.unreachable_count,
+        unreachable_shallow: pass4.unreachable_shallow,
         top_allocated,
         top_largest,
         top_retained_objects,
-        retained_by_class:    retained_by_class_full,
+        retained_by_class: retained_by_class_full,
         package_summary,
         leak_suspects,
         treemap_data,
@@ -383,19 +412,30 @@ fn compute_treemap_data(retained_by_class: &[RetainedByClassEntry]) -> Vec<Treem
         let entry = by_pkg.entry(pkg).or_insert_with(|| (0, Vec::new()));
         entry.0 += e.total_retained_bytes;
         entry.1.push(TreemapClass {
-            name:           e.class_name.clone(),
+            name: e.class_name.clone(),
             retained_bytes: e.total_retained_bytes,
             instance_count: e.instance_count,
         });
     }
-    let mut pkgs: Vec<TreemapPackage> = by_pkg.into_iter().map(|(name, (retained_bytes, mut classes))| {
-        classes.sort_by(|a, b| {
-            b.retained_bytes.cmp(&a.retained_bytes).then_with(|| a.name.cmp(&b.name))
-        });
-        TreemapPackage { name, retained_bytes, classes }
-    }).collect();
+    let mut pkgs: Vec<TreemapPackage> = by_pkg
+        .into_iter()
+        .map(|(name, (retained_bytes, mut classes))| {
+            classes.sort_by(|a, b| {
+                b.retained_bytes
+                    .cmp(&a.retained_bytes)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            TreemapPackage {
+                name,
+                retained_bytes,
+                classes,
+            }
+        })
+        .collect();
     pkgs.sort_by(|a, b| {
-        b.retained_bytes.cmp(&a.retained_bytes).then_with(|| a.name.cmp(&b.name))
+        b.retained_bytes
+            .cmp(&a.retained_bytes)
+            .then_with(|| a.name.cmp(&b.name))
     });
     pkgs
 }
@@ -404,21 +444,24 @@ fn compute_package_summary(retained_by_class: &[RetainedByClassEntry]) -> Vec<Pa
     let mut by_pkg: HashMap<String, PackageSummaryEntry> = HashMap::new();
     for entry in retained_by_class {
         let pkg = package_of(&entry.class_name);
-        let e = by_pkg.entry(pkg.clone()).or_insert_with(|| PackageSummaryEntry {
-            package:              pkg,
-            class_count:          0,
-            instance_count:       0,
-            total_shallow_bytes:  0,
-            total_retained_bytes: 0,
-        });
-        e.class_count          += 1;
-        e.instance_count       += entry.instance_count;
-        e.total_shallow_bytes  += entry.total_shallow_bytes;
+        let e = by_pkg
+            .entry(pkg.clone())
+            .or_insert_with(|| PackageSummaryEntry {
+                package: pkg,
+                class_count: 0,
+                instance_count: 0,
+                total_shallow_bytes: 0,
+                total_retained_bytes: 0,
+            });
+        e.class_count += 1;
+        e.instance_count += entry.instance_count;
+        e.total_shallow_bytes += entry.total_shallow_bytes;
         e.total_retained_bytes += entry.total_retained_bytes;
     }
     let mut result: Vec<PackageSummaryEntry> = by_pkg.into_values().collect();
     result.sort_by(|a, b| {
-        b.total_retained_bytes.cmp(&a.total_retained_bytes)
+        b.total_retained_bytes
+            .cmp(&a.total_retained_bytes)
             .then_with(|| a.package.cmp(&b.package))
     });
     result.truncate(TOP_N);
@@ -427,25 +470,46 @@ fn compute_package_summary(retained_by_class: &[RetainedByClassEntry]) -> Vec<Pa
 
 // ── Table renderer ────────────────────────────────────────────────────────────
 
-struct Col { header: &'static str, width: usize, right: bool }
+struct Col {
+    header: &'static str,
+    width: usize,
+    right: bool,
+}
 
 fn print_table(cols: &[Col], rows: &[Vec<String>]) {
-    let sep: String = cols.iter()
+    let sep: String = cols
+        .iter()
         .map(|c| format!("+{:-<width$}", "", width = c.width + 2))
-        .collect::<String>() + "+";
+        .collect::<String>()
+        + "+";
     println!("{sep}");
-    let header: String = cols.iter().map(|c| {
-        if c.right { format!("| {:>width$} ", c.header, width = c.width) }
-        else       { format!("| {:<width$} ", c.header, width = c.width) }
-    }).collect::<String>() + "|";
+    let header: String = cols
+        .iter()
+        .map(|c| {
+            if c.right {
+                format!("| {:>width$} ", c.header, width = c.width)
+            } else {
+                format!("| {:<width$} ", c.header, width = c.width)
+            }
+        })
+        .collect::<String>()
+        + "|";
     println!("{header}");
     println!("{sep}");
     for row in rows {
-        let line: String = cols.iter().enumerate().map(|(i, c)| {
-            let val = row.get(i).map(String::as_str).unwrap_or("");
-            if c.right { format!("| {:>width$} ", val, width = c.width) }
-            else       { format!("| {:<width$} ", val, width = c.width) }
-        }).collect::<String>() + "|";
+        let line: String = cols
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let val = row.get(i).map(String::as_str).unwrap_or("");
+                if c.right {
+                    format!("| {:>width$} ", val, width = c.width)
+                } else {
+                    format!("| {:<width$} ", val, width = c.width)
+                }
+            })
+            .collect::<String>()
+            + "|";
         println!("{line}");
     }
     println!("{sep}");
@@ -482,17 +546,38 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
         println!();
         print_table(
             &[
-                Col { header: "Total",     width: 12, right: true  },
-                Col { header: "Instances", width: 9,  right: true  },
-                Col { header: "Largest",   width: 12, right: true  },
-                Col { header: "Class",     width: 48, right: false },
+                Col {
+                    header: "Total",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Instances",
+                    width: 9,
+                    right: true,
+                },
+                Col {
+                    header: "Largest",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Class",
+                    width: 48,
+                    right: false,
+                },
             ],
-            &out.top_allocated.iter().map(|e| vec![
-                fmt_size(e.total_shallow_bytes),
-                e.instances.to_string(),
-                fmt_size_u32(e.max_shallow_bytes),
-                e.class_name.clone(),
-            ]).collect::<Vec<_>>(),
+            &out.top_allocated
+                .iter()
+                .map(|e| {
+                    vec![
+                        fmt_size(e.total_shallow_bytes),
+                        e.instances.to_string(),
+                        fmt_size_u32(e.max_shallow_bytes),
+                        e.class_name.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
         );
 
         println!();
@@ -500,17 +585,38 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
         println!();
         print_table(
             &[
-                Col { header: "Total",     width: 12, right: true  },
-                Col { header: "Instances", width: 9,  right: true  },
-                Col { header: "Largest",   width: 12, right: true  },
-                Col { header: "Class",     width: 48, right: false },
+                Col {
+                    header: "Total",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Instances",
+                    width: 9,
+                    right: true,
+                },
+                Col {
+                    header: "Largest",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Class",
+                    width: 48,
+                    right: false,
+                },
             ],
-            &out.top_largest.iter().map(|e| vec![
-                fmt_size(e.total_shallow_bytes),
-                e.instances.to_string(),
-                fmt_size_u32(e.max_shallow_bytes),
-                e.class_name.clone(),
-            ]).collect::<Vec<_>>(),
+            &out.top_largest
+                .iter()
+                .map(|e| {
+                    vec![
+                        fmt_size(e.total_shallow_bytes),
+                        e.instances.to_string(),
+                        fmt_size_u32(e.max_shallow_bytes),
+                        e.class_name.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -521,24 +627,55 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
         println!();
         print_table(
             &[
-                Col { header: "Retained",  width: 12, right: true  },
-                Col { header: "% heap",    width: 7,  right: true  },
-                Col { header: "Shallow",   width: 12, right: true  },
-                Col { header: "Instances", width: 9,  right: true  },
-                Col { header: "Avg/inst",  width: 12, right: true  },
-                Col { header: "Class",     width: 40, right: false },
+                Col {
+                    header: "Retained",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "% heap",
+                    width: 7,
+                    right: true,
+                },
+                Col {
+                    header: "Shallow",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Instances",
+                    width: 9,
+                    right: true,
+                },
+                Col {
+                    header: "Avg/inst",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Class",
+                    width: 40,
+                    right: false,
+                },
             ],
-            &out.retained_by_class.iter().map(|e| {
-                let avg = if e.instance_count > 0 { e.total_retained_bytes / e.instance_count } else { 0 };
-                vec![
-                    fmt_size(e.total_retained_bytes),
-                    fmt_pct(e.total_retained_bytes, out.total_shallow_bytes),
-                    fmt_size(e.total_shallow_bytes),
-                    e.instance_count.to_string(),
-                    fmt_size(avg),
-                    e.class_name.clone(),
-                ]
-            }).collect::<Vec<_>>(),
+            &out.retained_by_class
+                .iter()
+                .map(|e| {
+                    let avg = if e.instance_count > 0 {
+                        e.total_retained_bytes / e.instance_count
+                    } else {
+                        0
+                    };
+                    vec![
+                        fmt_size(e.total_retained_bytes),
+                        fmt_pct(e.total_retained_bytes, out.total_shallow_bytes),
+                        fmt_size(e.total_shallow_bytes),
+                        e.instance_count.to_string(),
+                        fmt_size(avg),
+                        e.class_name.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
         );
 
         println!();
@@ -547,19 +684,44 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
         println!();
         print_table(
             &[
-                Col { header: "Retained",  width: 12, right: true  },
-                Col { header: "% heap",    width: 7,  right: true  },
-                Col { header: "Shallow",   width: 12, right: true  },
-                Col { header: "Object ID", width: 18, right: false },
-                Col { header: "Class",     width: 40, right: false },
+                Col {
+                    header: "Retained",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "% heap",
+                    width: 7,
+                    right: true,
+                },
+                Col {
+                    header: "Shallow",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Object ID",
+                    width: 18,
+                    right: false,
+                },
+                Col {
+                    header: "Class",
+                    width: 40,
+                    right: false,
+                },
             ],
-            &out.top_retained_objects.iter().map(|e| vec![
-                fmt_size(e.retained_bytes),
-                fmt_pct(e.retained_bytes, out.total_shallow_bytes),
-                fmt_size_u32(e.shallow_bytes),
-                format!("0x{:016x}", e.object_id),
-                e.class_name.clone(),
-            ]).collect::<Vec<_>>(),
+            &out.top_retained_objects
+                .iter()
+                .map(|e| {
+                    vec![
+                        fmt_size(e.retained_bytes),
+                        fmt_pct(e.retained_bytes, out.total_shallow_bytes),
+                        fmt_size_u32(e.shallow_bytes),
+                        format!("0x{:016x}", e.object_id),
+                        e.class_name.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
         );
     }
 
@@ -602,21 +764,50 @@ fn emit_text(out: &AnalysisOutput, config: &ReportConfig) {
         println!();
         print_table(
             &[
-                Col { header: "Retained",  width: 12, right: true  },
-                Col { header: "% heap",    width: 7,  right: true  },
-                Col { header: "Shallow",   width: 12, right: true  },
-                Col { header: "Classes",   width: 7,  right: true  },
-                Col { header: "Instances", width: 9,  right: true  },
-                Col { header: "Package",   width: 40, right: false },
+                Col {
+                    header: "Retained",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "% heap",
+                    width: 7,
+                    right: true,
+                },
+                Col {
+                    header: "Shallow",
+                    width: 12,
+                    right: true,
+                },
+                Col {
+                    header: "Classes",
+                    width: 7,
+                    right: true,
+                },
+                Col {
+                    header: "Instances",
+                    width: 9,
+                    right: true,
+                },
+                Col {
+                    header: "Package",
+                    width: 40,
+                    right: false,
+                },
             ],
-            &out.package_summary.iter().map(|e| vec![
-                fmt_size(e.total_retained_bytes),
-                fmt_pct(e.total_retained_bytes, out.total_shallow_bytes),
-                fmt_size(e.total_shallow_bytes),
-                e.class_count.to_string(),
-                e.instance_count.to_string(),
-                e.package.clone(),
-            ]).collect::<Vec<_>>(),
+            &out.package_summary
+                .iter()
+                .map(|e| {
+                    vec![
+                        fmt_size(e.total_retained_bytes),
+                        fmt_pct(e.total_retained_bytes, out.total_shallow_bytes),
+                        fmt_size(e.total_shallow_bytes),
+                        e.class_count.to_string(),
+                        e.instance_count.to_string(),
+                        e.package.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
         );
     }
 }
@@ -641,13 +832,16 @@ fn classify_suspect(instance_count: u64, avg_retained: u64, total_retained: u64)
 fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
     println!("{{");
     println!("  \"summary\": {{");
-    println!("    \"total_objects\": {},",          out.total_objects);
-    println!("    \"total_classes\": {},",          out.total_classes);
-    println!("    \"gc_roots\": {},",               out.gc_roots);
-    println!("    \"total_shallow_bytes\": {},",    out.total_shallow_bytes);
-    println!("    \"retained_heap_bytes\": {},",    out.retained_heap_bytes);
-    println!("    \"unreachable_count\": {},",      out.unreachable_count);
-    println!("    \"unreachable_shallow_bytes\": {}", out.unreachable_shallow);
+    println!("    \"total_objects\": {},", out.total_objects);
+    println!("    \"total_classes\": {},", out.total_classes);
+    println!("    \"gc_roots\": {},", out.gc_roots);
+    println!("    \"total_shallow_bytes\": {},", out.total_shallow_bytes);
+    println!("    \"retained_heap_bytes\": {},", out.retained_heap_bytes);
+    println!("    \"unreachable_count\": {},", out.unreachable_count);
+    println!(
+        "    \"unreachable_shallow_bytes\": {}",
+        out.unreachable_shallow
+    );
     println!("  }},");
 
     let mut sections: Vec<String> = Vec::new();
@@ -660,8 +854,14 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
             )).collect();
             format!("[\n{}\n  ]", rows.join(",\n"))
         };
-        sections.push(format!("  \"top_allocated_classes\": {}", render(&out.top_allocated)));
-        sections.push(format!("  \"top_largest_instances\": {}", render(&out.top_largest)));
+        sections.push(format!(
+            "  \"top_allocated_classes\": {}",
+            render(&out.top_allocated)
+        ));
+        sections.push(format!(
+            "  \"top_largest_instances\": {}",
+            render(&out.top_largest)
+        ));
     }
 
     if config.retained_by_class {
@@ -672,13 +872,19 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
                 json_str(&e.class_name), e.instance_count, e.total_retained_bytes, e.total_shallow_bytes, avg,
             )
         }).collect();
-        sections.push(format!("  \"retained_by_class\": [\n{}\n  ]", rows.join(",\n")));
+        sections.push(format!(
+            "  \"retained_by_class\": [\n{}\n  ]",
+            rows.join(",\n")
+        ));
 
         let obj_rows: Vec<String> = out.top_retained_objects.iter().map(|e| format!(
             "    {{\"object_id\":\"0x{:016x}\",\"class_name\":{},\"shallow_bytes\":{},\"retained_bytes\":{}}}",
             e.object_id, json_str(&e.class_name), e.shallow_bytes, e.retained_bytes,
         )).collect();
-        sections.push(format!("  \"top_retained_objects\": [\n{}\n  ]", obj_rows.join(",\n")));
+        sections.push(format!(
+            "  \"top_retained_objects\": [\n{}\n  ]",
+            obj_rows.join(",\n")
+        ));
     }
 
     if config.leak_suspects {
@@ -692,7 +898,10 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
                 json_str(e.pattern),
             )
         }).collect();
-        sections.push(format!("  \"leak_suspects\": [\n{}\n  ]", suspect_rows.join(",\n")));
+        sections.push(format!(
+            "  \"leak_suspects\": [\n{}\n  ]",
+            suspect_rows.join(",\n")
+        ));
     }
 
     if config.package_summary {
@@ -700,7 +909,10 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
             "    {{\"package\":{},\"class_count\":{},\"instance_count\":{},\"total_shallow_bytes\":{},\"total_retained_bytes\":{}}}",
             json_str(&e.package), e.class_count, e.instance_count, e.total_shallow_bytes, e.total_retained_bytes,
         )).collect();
-        sections.push(format!("  \"package_summary\": [\n{}\n  ]", rows.join(",\n")));
+        sections.push(format!(
+            "  \"package_summary\": [\n{}\n  ]",
+            rows.join(",\n")
+        ));
     }
 
     println!("{}", sections.join(",\n"));
@@ -715,16 +927,18 @@ fn lookup_object(file: &mut File, entry_count: u64, target_id: u64) -> Result<Op
     let mut buf = [0u8; ENTRY_SIZE];
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        file.seek(SeekFrom::Start(mid * ENTRY_SIZE as u64)).context("seek object index")?;
-        file.read_exact(&mut buf).context("read object index entry")?;
+        file.seek(SeekFrom::Start(mid * ENTRY_SIZE as u64))
+            .context("seek object index")?;
+        file.read_exact(&mut buf)
+            .context("read object index entry")?;
         let oid = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         match oid.cmp(&target_id) {
             std::cmp::Ordering::Equal => {
                 let cid = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-                let sz  = u32::from_le_bytes(buf[16..20].try_into().unwrap());
+                let sz = u32::from_le_bytes(buf[16..20].try_into().unwrap());
                 return Ok(Some((cid, sz)));
             }
-            std::cmp::Ordering::Less    => lo = mid + 1,
+            std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
         }
     }
@@ -737,24 +951,35 @@ fn find_referrers(file: &mut File, entry_count: u64, target_id: u64) -> Result<V
     let mut buf = [0u8; EDGE_SIZE];
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        file.seek(SeekFrom::Start(mid * EDGE_SIZE as u64)).context("seek reverse edges")?;
-        file.read_exact(&mut buf).context("read reverse edge entry")?;
+        file.seek(SeekFrom::Start(mid * EDGE_SIZE as u64))
+            .context("seek reverse edges")?;
+        file.read_exact(&mut buf)
+            .context("read reverse edge entry")?;
         let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        if to_id < target_id { lo = mid + 1; } else { hi = mid; }
+        if to_id < target_id {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     let mut referrers = Vec::new();
     let mut pos = lo;
-    file.seek(SeekFrom::Start(pos * EDGE_SIZE as u64)).context("seek reverse edges to lower bound")?;
+    file.seek(SeekFrom::Start(pos * EDGE_SIZE as u64))
+        .context("seek reverse edges to lower bound")?;
     loop {
-        if pos >= entry_count { break; }
+        if pos >= entry_count {
+            break;
+        }
         match file.read_exact(&mut buf) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e).context("read reverse edge"),
         }
-        let to_id   = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        if to_id != target_id { break; }
+        if to_id != target_id {
+            break;
+        }
         referrers.push(from_id);
         pos += 1;
     }
@@ -770,11 +995,11 @@ pub fn path_to_root(
     let roots: HashSet<u64> = pass1.roots.iter().copied().collect();
 
     let obj_entry_count = std::fs::metadata(&pass1.object_index_path)?.len() / ENTRY_SIZE as u64;
-    let mut obj_file = File::open(&pass1.object_index_path)
-        .context("open object index for path query")?;
+    let mut obj_file =
+        File::open(&pass1.object_index_path).context("open object index for path query")?;
     let rev_entry_count = std::fs::metadata(&pass2.reverse_edges_path)?.len() / EDGE_SIZE as u64;
-    let mut rev_file = File::open(&pass2.reverse_edges_path)
-        .context("open reverse edges for path query")?;
+    let mut rev_file =
+        File::open(&pass2.reverse_edges_path).context("open reverse edges for path query")?;
 
     if lookup_object(&mut obj_file, obj_entry_count, target_id)?.is_none() {
         if json {
@@ -798,9 +1023,14 @@ pub fn path_to_root(
         let mut found = None;
         'bfs: while let Some(obj) = queue.pop_front() {
             for referrer in find_referrers(&mut rev_file, rev_entry_count, obj)? {
-                if prev.contains_key(&referrer) { continue; }
+                if prev.contains_key(&referrer) {
+                    continue;
+                }
                 prev.insert(referrer, obj);
-                if roots.contains(&referrer) { found = Some(referrer); break 'bfs; }
+                if roots.contains(&referrer) {
+                    found = Some(referrer);
+                    break 'bfs;
+                }
                 queue.push_back(referrer);
             }
         }
@@ -830,11 +1060,11 @@ pub fn path_to_root(
     for &oid in &path_ids {
         let (cid, sz) = lookup_object(&mut obj_file, obj_entry_count, oid)?.unwrap_or((0, 0));
         steps.push(PathStep {
-            object_id:    oid,
-            class_name:   class_name(cid, &pass1.class_index),
+            object_id: oid,
+            class_name: class_name(cid, &pass1.class_index),
             shallow_bytes: sz,
-            is_gc_root:   oid == root,
-            is_target:    oid == target_id,
+            is_gc_root: oid == root,
+            is_target: oid == target_id,
         });
     }
 
@@ -852,14 +1082,25 @@ pub fn path_to_root(
         println!("Path from GC root to 0x{target_id:016x}:");
         println!();
         for (i, s) in steps.iter().enumerate() {
-            let label  = if s.is_gc_root && s.is_target { " ← GC root + target" }
-                         else if s.is_gc_root           { " ← GC root"           }
-                         else if s.is_target            { " ← target"            }
-                         else                           { ""                     };
-            let prefix = if i == 0 { "  ".to_string() } else { "  → ".to_string() };
+            let label = if s.is_gc_root && s.is_target {
+                " ← GC root + target"
+            } else if s.is_gc_root {
+                " ← GC root"
+            } else if s.is_target {
+                " ← target"
+            } else {
+                ""
+            };
+            let prefix = if i == 0 {
+                "  ".to_string()
+            } else {
+                "  → ".to_string()
+            };
             println!(
                 "{prefix}0x{:016x}  {:<48}  (shallow: {}){label}",
-                s.object_id, s.class_name, fmt_size_u32(s.shallow_bytes),
+                s.object_id,
+                s.class_name,
+                fmt_size_u32(s.shallow_bytes),
             );
         }
         println!();
@@ -882,16 +1123,16 @@ pub fn run(
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
     let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
     let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;
-    if json { emit_json(&out, config); } else { emit_text(&out, config); }
+    if json {
+        emit_json(&out, config);
+    } else {
+        emit_text(&out, config);
+    }
     Ok(())
 }
 
 /// Generate a self-contained HTML report and write it to `html_path`.
-pub fn run_html(
-    pass1: &Pass1Output,
-    pass4: &Pass4Output,
-    html_path: &Path,
-) -> Result<()> {
+pub fn run_html(pass1: &Pass1Output, pass4: &Pass4Output, html_path: &Path) -> Result<()> {
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
     let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
     let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;

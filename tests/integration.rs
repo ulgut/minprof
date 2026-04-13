@@ -53,8 +53,7 @@ fn run_minprof(hprof_path: &Path, out_dir: &Path) {
         panic!("minprof failed for {}: {}", hprof_path.display(), stderr);
     }
 
-    std::fs::write(out_dir.join("stdout.txt"), &output.stdout)
-        .expect("write stdout.txt");
+    std::fs::write(out_dir.join("stdout.txt"), &output.stdout).expect("write stdout.txt");
 }
 
 /// Run minprof via `-i` (index cache) and return the captured stdout.
@@ -77,7 +76,7 @@ fn run_minprof_index(index_dir: &Path) -> Vec<u8> {
 /// Panics with a helpful diff-style message on the first mismatch.
 fn compare_dirs(label: &str, test_dir: &Path, expected_dir: &Path) {
     for name in COMPARED_FILES {
-        let test_path     = test_dir.join(name);
+        let test_path = test_dir.join(name);
         let expected_path = expected_dir.join(name);
 
         let test_bytes = match std::fs::read(&test_path) {
@@ -116,10 +115,10 @@ fn compare_dirs(label: &str, test_dir: &Path, expected_dir: &Path) {
 
 #[test]
 fn hprof_32_full_run() {
-    let root      = workspace_root();
-    let hprof     = root.join("tests/hprof-32.bin");
-    let test_dir  = root.join("tests/.test/hprof-32");
-    let expected  = root.join("tests/.expected/hprof-32");
+    let root = workspace_root();
+    let hprof = root.join("tests/hprof-32.bin");
+    let test_dir = root.join("tests/.test/hprof-32");
+    let expected = root.join("tests/.expected/hprof-32");
 
     // Clean previous test output so stale files don't mask regressions.
     if test_dir.exists() {
@@ -132,10 +131,10 @@ fn hprof_32_full_run() {
 
 #[test]
 fn hprof_64_full_run() {
-    let root      = workspace_root();
-    let hprof     = root.join("tests/hprof-64.bin");
-    let test_dir  = root.join("tests/.test/hprof-64");
-    let expected  = root.join("tests/.expected/hprof-64");
+    let root = workspace_root();
+    let hprof = root.join("tests/hprof-64.bin");
+    let test_dir = root.join("tests/.test/hprof-64");
+    let expected = root.join("tests/.expected/hprof-64");
 
     if test_dir.exists() {
         std::fs::remove_dir_all(&test_dir).expect("clean test dir");
@@ -149,8 +148,8 @@ fn hprof_64_full_run() {
 /// to the fresh `-p` run (i.e. no output depends on re-parsing the HPROF).
 #[test]
 fn hprof_64_index_cache_matches() {
-    let root     = workspace_root();
-    let hprof    = root.join("tests/hprof-64.bin");
+    let root = workspace_root();
+    let hprof = root.join("tests/hprof-64.bin");
     let test_dir = root.join("tests/.test/hprof-64-cache");
     let expected = root.join("tests/.expected/hprof-64");
 
@@ -181,8 +180,8 @@ fn hprof_64_index_cache_matches() {
 
 #[test]
 fn hprof_32_index_cache_matches() {
-    let root     = workspace_root();
-    let hprof    = root.join("tests/hprof-32.bin");
+    let root = workspace_root();
+    let hprof = root.join("tests/hprof-32.bin");
     let test_dir = root.join("tests/.test/hprof-32-cache");
     let expected = root.join("tests/.expected/hprof-32");
 
