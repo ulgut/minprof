@@ -76,6 +76,7 @@ pub enum FieldValue {
     Float(f32),
     #[allow(dead_code)]
     Double(f64),
+    #[allow(dead_code)]
     Object(u64),
 }
 
