@@ -51,22 +51,27 @@ const MAX_MERGE_FAN_IN: usize = 64;
 
 struct EdgeSorter {
     output_dir: PathBuf,
+    /// Filename prefix used for temporary chunk and intermediate files.
+    /// Different sorters in the same directory must use different prefixes to
+    /// avoid clobbering each other when both are active simultaneously.
+    prefix: String,
     chunk_paths: Vec<PathBuf>,
     current: Vec<RawEdge>,
     edges_per_chunk: usize,
 }
 
 impl EdgeSorter {
-    fn new(output_dir: PathBuf) -> Self {
+    fn new(output_dir: PathBuf, prefix: &str) -> Self {
         let chunk_bytes = crate::passes::sort_chunk_bytes();
         let edges_per_chunk = chunk_bytes / EDGE_SIZE;
         eprintln!(
-            "  sort buffer: {:.1} GiB ({} edges/chunk)",
+            "  sort buffer [{prefix}]: {:.1} GiB ({} edges/chunk)",
             chunk_bytes as f64 / (1 << 30) as f64,
             edges_per_chunk
         );
         Self {
             output_dir,
+            prefix: prefix.to_string(),
             chunk_paths: Vec::new(),
             current: Vec::with_capacity(edges_per_chunk),
             edges_per_chunk,
@@ -92,18 +97,28 @@ impl EdgeSorter {
 
         let path = self
             .output_dir
-            .join(format!("edge_chunk_{}.bin", self.chunk_paths.len()));
+            .join(format!("{}_chunk_{}.bin", self.prefix, self.chunk_paths.len()));
         let mut w = BufWriter::new(File::create(&path).context("create edge chunk")?);
         for edge in self.current.drain(..) {
             w.write_all(&edge)?;
         }
         w.flush()?;
         self.chunk_paths.push(path);
-        eprintln!("  flushed edge chunk {} ({} total)", self.chunk_paths.len(), self.chunk_paths.len());
+        eprintln!("  [{}] flushed chunk {} ({} total)",
+            self.prefix, self.chunk_paths.len(), self.chunk_paths.len());
         Ok(())
     }
 
-    fn finish(mut self, output_path: &Path) -> Result<u64> {
+    /// Finish sorting, writing the final merged output to `output_path`.
+    ///
+    /// `on_edge` is called for every deduplicated edge **in the final output
+    /// write** (in sorted order). The caller can use this to feed a second
+    /// sorter (e.g. for reverse edges) without an extra read pass over the
+    /// output file.
+    ///
+    /// For intermediate merge passes (two-level merge), `on_edge` is NOT called
+    /// — only the final pass that produces `output_path` triggers it.
+    fn finish(mut self, output_path: &Path, on_edge: &mut dyn FnMut(RawEdge)) -> Result<u64> {
         // Fast path: no chunks have been flushed to disk — sort in-memory and
         // write directly. Avoids one temporary file write + read cycle.
         if self.chunk_paths.is_empty() {
@@ -112,7 +127,8 @@ impl EdgeSorter {
                 return Ok(0);
             }
             use rayon::slice::ParallelSliceMut;
-            eprintln!("  sorting {} edges in-memory (no chunk files needed)…", self.current.len());
+            eprintln!("  [{}] sorting {} edges in-memory (no chunk files needed)…",
+                self.prefix, self.current.len());
             self.current.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
             self.current.dedup();
             let count = self.current.len() as u64;
@@ -121,6 +137,7 @@ impl EdgeSorter {
             );
             for edge in self.current.drain(..) {
                 w.write_all(&edge)?;
+                on_edge(edge);
             }
             w.flush()?;
             return Ok(count);
@@ -135,31 +152,29 @@ impl EdgeSorter {
                 File::create(output_path).context("create empty edge file")?;
                 return Ok(0);
             }
-            1 => {
-                std::fs::rename(&chunks[0], output_path)
-                    .context("rename single edge chunk")?;
-            }
             n if n <= MAX_MERGE_FAN_IN => {
-                eprintln!("  merging {} edge chunks…", n);
-                merge_chunks(&chunks, output_path)?;
+                eprintln!("  [{}] merging {} edge chunks…", self.prefix, n);
+                merge_chunks(&chunks, output_path, on_edge)?;
                 for p in &chunks { let _ = std::fs::remove_file(p); }
             }
             n => {
                 let group_size = MAX_MERGE_FAN_IN;
                 let num_groups = (n + group_size - 1) / group_size;
-                eprintln!("  two-level edge merge: {} chunks → {} groups…", n, num_groups);
+                eprintln!("  [{}] two-level edge merge: {} chunks → {} groups…",
+                    self.prefix, n, num_groups);
 
                 let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
                 for (g, group) in chunks.chunks(group_size).enumerate() {
-                    let inter = self.output_dir.join(format!("edge_inter_{g}.bin"));
+                    let inter = self.output_dir.join(format!("{}_inter_{g}.bin", self.prefix));
                     eprintln!("    merging group {}/{} ({} chunks)…", g + 1, num_groups, group.len());
-                    merge_chunks(group, &inter)?;
+                    merge_chunks(group, &inter, &mut |_| {})?;
                     for p in group { let _ = std::fs::remove_file(p); }
                     intermediates.push(inter);
                 }
 
-                eprintln!("  final edge merge of {} intermediate files…", intermediates.len());
-                merge_chunks(&intermediates, output_path)?;
+                eprintln!("  [{}] final merge of {} intermediate files…",
+                    self.prefix, intermediates.len());
+                merge_chunks(&intermediates, output_path, on_edge)?;
                 for p in &intermediates { let _ = std::fs::remove_file(p); }
             }
         }
@@ -178,7 +193,11 @@ impl Drop for EdgeSorter {
     }
 }
 
-fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
+fn merge_chunks(
+    chunk_paths: &[PathBuf],
+    output_path: &Path,
+    on_edge: &mut dyn FnMut(RawEdge),
+) -> Result<()> {
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
         .map(|p| Ok(BufReader::new(File::open(p).context("open edge chunk")?)))
@@ -203,6 +222,7 @@ fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
         // Skip duplicate (from, to) pairs that appear across chunk boundaries.
         if last_edge.as_ref() != Some(&edge) {
             w.write_all(&edge)?;
+            on_edge(edge); // RawEdge is Copy — no move occurs here
             last_edge = Some(edge);
         }
         if let Some(next) = read_edge(&mut readers[idx])? {
@@ -224,27 +244,8 @@ fn read_edge(r: &mut impl Read) -> Result<Option<RawEdge>> {
 }
 
 // ── Reverse edge index ────────────────────────────────────────────────────────
-
-/// Build `reverse_edges.bin` from the already-sorted `edges.bin`.
-///
-/// Stores `(to_id: u64, from_id: u64)` pairs sorted by `to_id`.
-/// Binary-searching by `to_id` yields all objects that hold a reference to a
-/// given target — i.e. the target's referrers. Used for path-to-GC-root queries.
-pub fn build_reverse_edges(edges_path: &Path, output_dir: &Path) -> Result<PathBuf> {
-    let output_path = output_dir.join("reverse_edges.bin");
-    let mut sorter = EdgeSorter::new(output_dir.to_path_buf());
-
-    let mut reader = BufReader::new(
-        File::open(edges_path).context("open edges.bin for reverse build")?,
-    );
-    while let Some(e) = read_edge(&mut reader)? {
-        // Swap (from, to) → (to, from) so the sorter orders by to_id.
-        sorter.push(encode_edge(edge_to(&e), edge_from(&e)))?;
-    }
-
-    sorter.finish(&output_path)?;
-    Ok(output_path)
-}
+// reverse_edges.bin is now built simultaneously with edges.bin during the
+// final merge pass of the forward sorter. See `run()` for details.
 
 // ── Pass 2 output ─────────────────────────────────────────────────────────────
 
@@ -561,7 +562,7 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     let (header, _) = read_header(path)?;
     let id_size = header.id_size;
 
-    let mut sorter = EdgeSorter::new(output_dir.to_path_buf());
+    let mut sorter = EdgeSorter::new(output_dir.to_path_buf(), "edge");
 
     {
         // Precompute flat Object-field offsets from the class index (cheap: ~MBs).
@@ -581,8 +582,22 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
         .context("pass 2 streaming")?;
     }
 
+    // The reverse sorter receives swapped edges as the forward sorter emits each
+    // deduplicated edge during its final merge pass. This eliminates the separate
+    // `build_reverse_edges` step (a full extra read + sort of edges.bin).
+    //
+    // Peak RAM: the forward sorter's in-memory buffer is empty during its merge
+    // (all data is in chunk files), so the reverse sorter has the full sort-buffer
+    // budget available — same peak RAM as before.
     let edges_path = output_dir.join("edges.bin");
-    let edge_count = sorter.finish(&edges_path)?;
-    let reverse_edges_path = build_reverse_edges(&edges_path, output_dir)?;
+    let reverse_edges_path = output_dir.join("reverse_edges.bin");
+    let mut rev_sorter = EdgeSorter::new(output_dir.to_path_buf(), "rev_edge");
+    let edge_count = sorter.finish(&edges_path, &mut |edge: RawEdge| {
+        rev_sorter
+            .push(encode_edge(edge_to(&edge), edge_from(&edge)))
+            .expect("reverse edge sort write failed");
+    })?;
+    rev_sorter.finish(&reverse_edges_path, &mut |_| {})?;
+
     Ok(Pass2Output { edges_path, reverse_edges_path, edge_count })
 }
