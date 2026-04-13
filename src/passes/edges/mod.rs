@@ -15,8 +15,6 @@ use std::cmp::Reverse;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 
 use crate::parser::gc_record::FieldType;
@@ -265,17 +263,53 @@ pub struct Pass2Output {
 /// byte stream with zero per-object allocation. Runs in the extractor thread.
 struct EdgeStreamExtractor {
     id_size: usize,
-    class_index: Arc<HashMap<u64, ClassDescriptor>>,
+    /// Precomputed per-class flat list of byte offsets (within the InstanceDump
+    /// raw-data block) at which an Object-typed field lives. Covers the class's
+    /// own fields AND all inherited fields from the full superclass chain, in
+    /// HPROF layout order. Built once at construction time.
+    ///
+    /// Per-object extraction becomes: one HashMap lookup + a flat u32 scan.
+    /// No superclass-chain walking or per-field FieldType comparison at runtime.
+    field_offsets: HashMap<u64, Vec<u32>>,
     /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
     /// Zero means we are parsing outer (top-level) HPROF records.
     heap_dump_remaining: usize,
 }
 
 impl EdgeStreamExtractor {
-    fn new(id_size: u32, class_index: Arc<HashMap<u64, ClassDescriptor>>) -> Self {
+    fn new(id_size: u32, class_index: &HashMap<u64, ClassDescriptor>) -> Self {
+        let is = id_size as usize;
+        let mut field_offsets: HashMap<u64, Vec<u32>> =
+            HashMap::with_capacity(class_index.len());
+
+        for &class_id in class_index.keys() {
+            let mut offsets: Vec<u32> = Vec::new();
+            let mut cursor: u32 = 0;
+            let mut cur_id = class_id;
+
+            while cur_id != 0 {
+                let Some(desc) = class_index.get(&cur_id) else { break; };
+                for field in &desc.instance_fields {
+                    let field_bytes = field.field_type.byte_size(id_size);
+                    if field.field_type == FieldType::Object {
+                        offsets.push(cursor);
+                    }
+                    cursor += field_bytes;
+                }
+                cur_id = desc.super_id;
+            }
+
+            field_offsets.insert(class_id, offsets);
+        }
+
+        eprintln!(
+            "  precomputed Object-field offsets for {} classes",
+            field_offsets.len()
+        );
+
         Self {
-            id_size: id_size as usize,
-            class_index,
+            id_size: is,
+            field_offsets,
             heap_dump_remaining: 0,
         }
     }
@@ -423,31 +457,18 @@ impl EdgeStreamExtractor {
     }
 
     /// Extract all Object-typed field references from an InstanceDump's raw bytes.
-    /// Walks the superclass chain using the class index built in pass 1.
+    /// Uses the precomputed flat offset list — one HashMap lookup, no chain walking.
+    #[inline]
     fn extract_instance_edges(&self, from: u64, class_id: u64, raw: &[u8], out: &mut Vec<RawEdge>) {
         let is = self.id_size;
-        let mut cursor = 0usize;
-        let mut cur_id = class_id;
-
-        while cur_id != 0 {
-            let Some(desc) = self.class_index.get(&cur_id) else {
-                // Unknown class — can't safely interpret remaining bytes.
-                break;
-            };
-            for field in &desc.instance_fields {
-                let field_bytes = field.field_type.byte_size(is as u32) as usize;
-                if cursor + field_bytes > raw.len() {
-                    return; // truncated or misaligned — stop safely
-                }
-                if field.field_type == FieldType::Object {
-                    let to = read_id_raw(is, &raw[cursor..]);
-                    if to != 0 {
-                        out.push(encode_edge(from, to));
-                    }
-                }
-                cursor += field_bytes;
+        let Some(offsets) = self.field_offsets.get(&class_id) else { return; };
+        for &off in offsets {
+            let off = off as usize;
+            if off + is > raw.len() { break; } // offsets are ascending; safe to stop
+            let to = read_id_raw(is, &raw[off..]);
+            if to != 0 {
+                out.push(encode_edge(from, to));
             }
-            cur_id = desc.super_id;
         }
     }
 }
@@ -540,15 +561,12 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     let (header, _) = read_header(path)?;
     let id_size = header.id_size;
 
-    // Clone the class index into an Arc so it can be moved into the extractor
-    // thread. The class index contains ~thousands of entries (one per class),
-    // so this clone is cheap regardless of heap size.
-    let class_index = Arc::new(pass1.class_index.clone());
-
     let mut sorter = EdgeSorter::new(output_dir.to_path_buf());
 
     {
-        let mut extractor = EdgeStreamExtractor::new(id_size, class_index);
+        // Precompute flat Object-field offsets from the class index (cheap: ~MBs).
+        // The extractor owns this table and is moved into the parser thread.
+        let mut extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
         process_with_extractor(
             path,
             move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize {

@@ -47,7 +47,8 @@ pub struct Pass3Output {
 
 struct Csr {
     /// offsets[i]..offsets[i+1] is the range of `neighbors` for node i.
-    offsets: Vec<u32>,
+    /// u64 because total edge count can exceed u32::MAX on large heap dumps.
+    offsets: Vec<u64>,
     neighbors: Vec<u32>,
 }
 
@@ -158,7 +159,9 @@ fn build_csrs(
 /// Build a CSR from a list of `(source, target)` pairs **sorted by source**.
 fn build_csr_from_sorted(node_count: u32, sorted_edges: &[(u32, u32)]) -> Csr {
     let n = node_count as usize;
-    let mut offsets = vec![0u32; n + 1];
+    // u64 offsets: total edge count can exceed u32::MAX on large heap dumps
+    // (e.g. 13.3 B edges >> u32::MAX = 4.29 B).
+    let mut offsets = vec![0u64; n + 1];
 
     // Count out-degree per node.
     for &(src, _) in sorted_edges {
