@@ -109,9 +109,15 @@ impl EdgeSorter {
             IO_BUF_SIZE,
             File::create(&path).context("create edge chunk")?,
         );
-        for edge in self.current.drain(..) {
-            w.write_all(&edge)?;
+        // Iterate by reference so the backing allocation is reused for the next
+        // chunk — no malloc round-trip, and the next push overwrites already-hot
+        // physical pages without faulting in new ones.  The allocation is released
+        // explicitly in finish() before the merge, where holding it would add to
+        // peak RSS alongside the rev-sorter buffer.
+        for edge in &self.current {
+            w.write_all(edge)?;
         }
+        self.current.clear(); // len → 0, capacity and physical pages retained
         w.flush()?;
         self.chunk_paths.push(path);
         eprintln!(
@@ -154,7 +160,8 @@ impl EdgeSorter {
                 IO_BUF_SIZE,
                 File::create(output_path).context("create edge file")?,
             );
-            for edge in self.current.drain(..) {
+            let edges = std::mem::take(&mut self.current);
+            for edge in edges {
                 w.write_all(&edge)?;
                 on_edge(edge);
             }
@@ -163,6 +170,9 @@ impl EdgeSorter {
         }
 
         self.flush_chunk()?;
+        // flush_chunk replaced self.current with a fresh Vec::with_capacity(edges_per_chunk).
+        // Free that virtual reservation now so the merge runs with zero sort-buffer overhead.
+        self.current = Vec::new();
 
         let chunks = std::mem::take(&mut self.chunk_paths);
 
