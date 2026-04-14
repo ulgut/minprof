@@ -16,6 +16,8 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use crate::parser::gc_record::FieldType;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
@@ -233,11 +235,14 @@ fn merge_chunks(
     output_path: &Path,
     on_edge: &mut dyn FnMut(RawEdge),
 ) -> Result<()> {
+    // Divide IO_BUF_SIZE across all readers so total buffer memory stays at
+    // ~IO_BUF_SIZE regardless of fan-in (64 chunks × 64 MiB = 4 GiB otherwise).
+    let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
         .map(|p| {
             Ok(BufReader::with_capacity(
-                IO_BUF_SIZE,
+                per_reader_buf,
                 File::open(p).context("open edge chunk")?,
             ))
         })
@@ -678,22 +683,41 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
         .context("pass 2 streaming")?;
     }
 
-    // The reverse sorter receives swapped edges as the forward sorter emits each
-    // deduplicated edge during its final merge pass. This eliminates the separate
-    // `build_reverse_edges` step (a full extra read + sort of edges.bin).
-    //
-    // Peak RAM: the forward sorter's in-memory buffer is empty during its merge
-    // (all data is in chunk files), so the reverse sorter has the full sort-buffer
-    // budget available — same peak RAM as before.
+    // The reverse sorter runs in a background thread, fed via a bounded channel.
+    // This decouples the forward merge from reverse sort/flush: when rev_sorter's
+    // buffer fills and flush_chunk() fires (par_sort of 40%-of-RAM worth of edges
+    // + disk write), the forward merge keeps running instead of stalling. The
+    // channel provides backpressure if the rev thread falls behind.
     let edges_path = output_dir.join("edges.bin");
     let reverse_edges_path = output_dir.join("reverse_edges.bin");
-    let mut rev_sorter = EdgeSorter::new(output_dir.to_path_buf(), "rev_edge");
+
+    // 64 Ki edges = 1 MiB of channel buffering — enough to absorb minor jitter
+    // without letting the forward merge race arbitrarily far ahead.
+    let (rev_tx, rev_rx) = mpsc::sync_channel::<RawEdge>(64 * 1024);
+    let rev_output_dir = output_dir.to_path_buf();
+    let rev_path = reverse_edges_path.clone();
+    let rev_thread = thread::Builder::new()
+        .name("rev-edge-sorter".into())
+        .spawn(move || -> Result<()> {
+            let mut rev_sorter = EdgeSorter::new(rev_output_dir, "rev_edge");
+            for edge in rev_rx {
+                rev_sorter
+                    .push(encode_edge(edge_to(&edge), edge_from(&edge)))
+                    .context("rev_sorter push")?;
+            }
+            rev_sorter.finish(&rev_path, &mut |_| {})?;
+            Ok(())
+        })
+        .context("spawn rev-edge-sorter thread")?;
+
     let edge_count = sorter.finish(&edges_path, &mut |edge: RawEdge| {
-        rev_sorter
-            .push(encode_edge(edge_to(&edge), edge_from(&edge)))
-            .expect("reverse edge sort write failed");
+        rev_tx.send(edge).expect("rev-edge-sorter thread died");
     })?;
-    rev_sorter.finish(&reverse_edges_path, &mut |_| {})?;
+    drop(rev_tx); // close channel → rev thread drains and finishes
+    rev_thread
+        .join()
+        .expect("rev-edge-sorter thread panicked")
+        .context("rev-edge-sorter thread error")?;
 
     Ok(Pass2Output {
         edges_path,

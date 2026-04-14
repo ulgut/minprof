@@ -287,11 +287,12 @@ fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, fixup
 where
     F: Fn(&mut RawEntry),
 {
+    let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
         .map(|p| {
             Ok(BufReader::with_capacity(
-                IO_BUF_SIZE,
+                per_reader_buf,
                 File::open(p).context("open sort chunk")?,
             ))
         })
