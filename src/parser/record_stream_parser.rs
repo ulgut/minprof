@@ -25,6 +25,7 @@ const POOL_DEPTH: usize = 3;
 
 /// Implement this to consume records produced by the pipeline.
 /// Called on the main thread sequentially — no synchronization needed.
+#[allow(dead_code)]
 pub trait RecordVisitor {
     fn on_record(&mut self, record: Record);
 
@@ -40,6 +41,7 @@ pub trait RecordVisitor {
 /// Peak RAM: O(READ_BUFFER_SIZE * POOL_DEPTH) for I/O buffers, plus whatever
 /// the visitor accumulates. The parser working buffer grows only as large as
 /// the largest single HPROF record.
+#[allow(dead_code)]
 pub fn process(path: &Path, visitor: &mut dyn RecordVisitor) -> Result<()> {
     process_impl(path, visitor)
 }

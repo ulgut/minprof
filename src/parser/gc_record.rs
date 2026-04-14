@@ -80,6 +80,7 @@ pub enum FieldValue {
     Object(u64),
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct ClassDumpFields {
     pub class_object_id: u64,

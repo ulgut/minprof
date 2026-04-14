@@ -1,6 +1,7 @@
 //! Pass 1 — streaming index build.
 //!
-//! Streams the HPROF file once via [`RecordVisitor`] and produces:
+//! Streams the HPROF file once via [`IndexStreamExtractor`] (inline byte scanner
+//! running in the parser thread) and produces:
 //! - [`ClassDescriptor`] map in memory (needed for pass 2 field interpretation)
 //! - Sorted object index on disk: `(object_id, class_id, shallow_size)` per object
 //! - GC root ID list on disk
@@ -10,12 +11,13 @@ use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::thread;
 
 use anyhow::{Context, Result};
 
-use crate::parser::gc_record::{FieldInfo, FieldType, GcRecord};
-use crate::parser::record::Record;
-use crate::parser::record_stream_parser::{RecordVisitor, process, read_header};
+use crate::parser::gc_record::{FieldInfo, FieldType};
+use crate::parser::record_stream_parser::{process_with_extractor, read_header};
+use crate::passes::IO_BUF_SIZE;
 
 // ── On-disk entry format ─────────────────────────────────────────────────────
 //
@@ -113,18 +115,21 @@ pub struct Pass1Output {
 /// Keeps the final merge fan-in small regardless of dump size.
 const MAX_MERGE_FAN_IN: usize = 64;
 
-use crate::passes::IO_BUF_SIZE;
-
 struct ExternalSorter {
     output_dir: PathBuf,
     chunk_paths: Vec<PathBuf>,
     current: Vec<RawEntry>,
     entries_per_chunk: usize,
+    /// Monotonically increasing chunk counter — used for filenames so that
+    /// background flushes that haven't been collected yet still get unique names.
+    chunk_count: usize,
+    /// In-flight background sort+write task. At most one pending at a time;
+    /// collected (joined) at the start of each subsequent `flush_chunk` call.
+    pending_flush: Option<thread::JoinHandle<Result<PathBuf>>>,
 }
 
 impl ExternalSorter {
     fn new(output_dir: PathBuf) -> Self {
-        // Compute chunk capacity once from physical-RAM detection.
         let chunk_bytes = crate::passes::sort_chunk_bytes();
         let entries_per_chunk = chunk_bytes / ENTRY_SIZE;
         eprintln!(
@@ -137,6 +142,8 @@ impl ExternalSorter {
             chunk_paths: Vec::new(),
             current: Vec::with_capacity(entries_per_chunk),
             entries_per_chunk,
+            chunk_count: 0,
+            pending_flush: None,
         }
     }
 
@@ -148,52 +155,72 @@ impl ExternalSorter {
         Ok(())
     }
 
+    /// Join the in-flight sort+write thread (if any) and record its output path.
+    fn collect_pending(&mut self) -> Result<()> {
+        if let Some(handle) = self.pending_flush.take() {
+            let path = handle.join().expect("sort-flush thread panicked")?;
+            self.chunk_paths.push(path);
+        }
+        Ok(())
+    }
+
+    /// Sort the current buffer and write it to disk on a background thread,
+    /// overlapping the write with continued parsing on the main thread.
     fn flush_chunk(&mut self) -> Result<()> {
         if self.current.is_empty() {
             return Ok(());
         }
-        // Parallel sort via rayon — cuts sort time proportionally to core count.
-        use rayon::slice::ParallelSliceMut;
-        self.current.par_sort_unstable_by_key(entry_id);
+        // Join the previous background flush before starting a new one.
+        self.collect_pending()?;
 
-        let path = self
+        let chunk_idx = self.chunk_count;
+        self.chunk_count += 1;
+        let out_path = self
             .output_dir
-            .join(format!("object_index_chunk_{}.bin", self.chunk_paths.len()));
-        let mut w = BufWriter::with_capacity(
-            IO_BUF_SIZE,
-            File::create(&path).context("create sort chunk")?,
+            .join(format!("object_index_chunk_{chunk_idx}.bin"));
+
+        // Swap out the full buffer for a fresh one so parsing can continue
+        // immediately while the old buffer is sorted and written in a thread.
+        let to_sort = std::mem::replace(
+            &mut self.current,
+            Vec::with_capacity(self.entries_per_chunk),
         );
-        for entry in self.current.drain(..) {
-            w.write_all(&entry)?;
-        }
-        w.flush()?;
-        self.chunk_paths.push(path);
-        eprintln!(
-            "  flushed chunk {} ({} total)",
-            self.chunk_paths.len(),
-            self.chunk_paths.len()
-        );
+
+        let path_clone = out_path.clone();
+        let handle = thread::Builder::new()
+            .name(format!("sort-flush-{chunk_idx}"))
+            .spawn(move || -> Result<PathBuf> {
+                use rayon::slice::ParallelSliceMut;
+                let mut buf = to_sort;
+                buf.par_sort_unstable_by_key(entry_id);
+                let mut w = BufWriter::with_capacity(
+                    IO_BUF_SIZE,
+                    File::create(&path_clone).context("create sort chunk")?,
+                );
+                for entry in &buf {
+                    w.write_all(entry)?;
+                }
+                w.flush()?;
+                eprintln!("  chunk {} written", chunk_idx + 1);
+                Ok(path_clone)
+            })?;
+
+        self.pending_flush = Some(handle);
         Ok(())
     }
 
     /// Merge all chunks into a single sorted file at `output_path`, applying
     /// `fixup` to every entry as it is written.
     ///
-    /// The fixup is applied only in the final output write, so intermediate
-    /// files (two-level merge) remain unmodified — entries are corrected exactly
-    /// once. This replaces the old separate `fixup_instance_sizes` pass, saving
-    /// a full extra read + write of the entire object index.
-    ///
     /// Returns the total number of entries written.
     fn finish<F>(mut self, output_path: &Path, fixup: F) -> Result<u64>
     where
         F: Fn(&mut RawEntry),
     {
-        // Fast path: no chunks have been flushed to disk yet — all data lives in
-        // `current`. Sort and write directly to the output file without ever
-        // touching a temporary chunk file. This saves one full write + one full
-        // read cycle (≈ 2× the object index size in disk I/O) compared with
-        // flushing to a chunk and then merging it.
+        // Collect any in-flight background flush first.
+        self.collect_pending()?;
+
+        // Fast path: no chunks flushed — all data still lives in `current`.
         if self.chunk_paths.is_empty() {
             if self.current.is_empty() {
                 File::create(output_path).context("create empty object index")?;
@@ -215,7 +242,9 @@ impl ExternalSorter {
             return Ok(count);
         }
 
+        // Flush any remaining in-memory entries, then collect that flush.
         self.flush_chunk()?;
+        self.collect_pending()?;
 
         // Take ownership so Drop sees an empty list and won't double-delete.
         let chunks = std::mem::take(&mut self.chunk_paths);
@@ -233,8 +262,8 @@ impl ExternalSorter {
                 }
             }
             n => {
-                // Two-level merge: intermediate files are written without fixup;
-                // fixup is applied during the final merge pass.
+                // Two-level merge: intermediate files written without fixup;
+                // fixup applied during the final merge pass.
                 let group_size = MAX_MERGE_FAN_IN;
                 let num_groups = (n + group_size - 1) / group_size;
                 eprintln!("  two-level merge: {} chunks → {} groups…", n, num_groups);
@@ -274,6 +303,12 @@ impl ExternalSorter {
 /// Clean up any chunk files if the sorter is dropped before `finish()` (e.g. on panic).
 impl Drop for ExternalSorter {
     fn drop(&mut self) {
+        // Join in-flight flush so we can retrieve its file path and delete it.
+        if let Some(handle) = self.pending_flush.take() {
+            if let Ok(Ok(path)) = handle.join() {
+                self.chunk_paths.push(path);
+            }
+        }
         for p in &self.chunk_paths {
             let _ = std::fs::remove_file(p);
         }
@@ -281,8 +316,7 @@ impl Drop for ExternalSorter {
 }
 
 /// K-way merge of sorted chunk files into a single sorted output file.
-/// `fixup` is called on each entry immediately before it is written, allowing
-/// fields to be corrected in a single pass (e.g. patching instance shallow sizes).
+/// `fixup` is called on each entry immediately before it is written.
 fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, fixup: F) -> Result<()>
 where
     F: Fn(&mut RawEntry),
@@ -337,209 +371,320 @@ fn read_entry(reader: &mut impl Read) -> Result<Option<RawEntry>> {
     }
 }
 
-// ── Visitor ───────────────────────────────────────────────────────────────────
+// ── IndexItem ─────────────────────────────────────────────────────────────────
 
-pub struct IndexVisitor {
-    id_size: u32,
-    /// string_id → UTF-8 string content.
-    string_table: HashMap<u64, String>,
-    /// class_object_id → class_name_string_id (from LoadClass records).
-    name_id_map: HashMap<u64, u64>,
-    /// class_object_id → ClassDescriptor (populated from ClassDump records).
-    class_index: HashMap<u64, ClassDescriptor>,
-    /// Accumulated GC root object IDs.
-    roots: Vec<u64>,
-    sorter: ExternalSorter,
-    object_count: u64,
-    output_dir: PathBuf,
+/// Items emitted by the extractor thread and consumed on the main thread.
+enum IndexItem {
+    Entry(RawEntry),
+    Root(u64),
+    Utf8String { id: u64, value: String },
+    LoadClass { class_object_id: u64, class_name_id: u64 },
+    ClassDump {
+        class_object_id: u64,
+        super_id: u64,
+        instance_size: u32,
+        /// Sum of static field data sizes — used to compute the class object's shallow size.
+        static_shallow_size: u32,
+        instance_fields: Vec<FieldInfo>,
+    },
 }
 
-impl IndexVisitor {
-    pub fn new(id_size: u32, output_dir: &Path) -> Self {
-        Self {
-            id_size,
-            string_table: HashMap::new(),
-            name_id_map: HashMap::new(),
-            class_index: HashMap::new(),
-            roots: Vec::new(),
-            sorter: ExternalSorter::new(output_dir.to_path_buf()),
-            object_count: 0,
-            output_dir: output_dir.to_path_buf(),
+// ── IndexStreamExtractor ──────────────────────────────────────────────────────
+
+/// Inline byte-scanner state.  Moved into the extractor closure and runs on the
+/// parser thread alongside the reader thread, avoiding all nom overhead.
+struct IndexStreamExtractor {
+    id_size: usize,
+    /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
+    /// When zero we are between top-level records.
+    heap_dump_remaining: usize,
+}
+
+impl IndexStreamExtractor {
+    /// Scan `buf` (the unconsumed tail of the work buffer), appending items to
+    /// `batch`.  Returns the number of bytes consumed from `buf`.
+    fn extract(&mut self, buf: &[u8], batch: &mut Vec<IndexItem>) -> usize {
+        let mut pos = 0;
+        loop {
+            let advanced = if self.heap_dump_remaining == 0 {
+                self.try_outer(buf, &mut pos, batch)
+            } else {
+                self.try_gc(buf, &mut pos, batch)
+            };
+            if !advanced {
+                break;
+            }
+        }
+        pos
+    }
+
+    /// Try to parse one outer (top-level) HPROF record starting at `buf[*pos]`.
+    /// Returns true and advances `*pos` on success; returns false if more data needed.
+    fn try_outer(&mut self, buf: &[u8], pos: &mut usize, batch: &mut Vec<IndexItem>) -> bool {
+        let avail = buf.len() - *pos;
+        // Outer record header: tag(1) + time_offset(4) + body_length(4) = 9 bytes.
+        if avail < 9 {
+            return false;
+        }
+        let tag = buf[*pos];
+        let length = u32::from_be_bytes(buf[*pos + 5..*pos + 9].try_into().unwrap()) as usize;
+
+        match tag {
+            0x01 => {
+                // UTF8_STRING: body = id(is) + utf8_bytes[length - is]
+                if avail < 9 + length {
+                    return false;
+                }
+                let body = &buf[*pos + 9..*pos + 9 + length];
+                let id = read_id_be(self.id_size, body);
+                let value = String::from_utf8_lossy(&body[self.id_size..]).into_owned();
+                batch.push(IndexItem::Utf8String { id, value });
+                *pos += 9 + length;
+                true
+            }
+            0x02 => {
+                // LOAD_CLASS: body = serial(4) + class_id(is) + stack_serial(4) + name_id(is)
+                if avail < 9 + length {
+                    return false;
+                }
+                let body = &buf[*pos + 9..*pos + 9 + length];
+                let class_object_id = read_id_be(self.id_size, &body[4..]);
+                let class_name_id = read_id_be(self.id_size, &body[4 + self.id_size + 4..]);
+                batch.push(IndexItem::LoadClass { class_object_id, class_name_id });
+                *pos += 9 + length;
+                true
+            }
+            0x0C | 0x1C => {
+                // HEAP_DUMP / HEAP_DUMP_SEGMENT — body is GC sub-records, not a blob.
+                self.heap_dump_remaining = length;
+                *pos += 9;
+                true
+            }
+            _ => {
+                // All other outer records: skip body entirely.
+                if avail < 9 + length {
+                    return false;
+                }
+                *pos += 9 + length;
+                true
+            }
         }
     }
 
-    fn primitive_array_shallow_size(&self, element_type: FieldType, num_elements: u32) -> u32 {
-        // JVM object header (16) + array length field (4) + element data.
-        16 + 4 + num_elements * element_type.byte_size(self.id_size)
-    }
+    /// Try to parse one GC sub-record starting at `buf[*pos]` (within a heap dump).
+    /// Returns true and advances `*pos` on success; returns false if more data needed.
+    fn try_gc(&mut self, buf: &[u8], pos: &mut usize, batch: &mut Vec<IndexItem>) -> bool {
+        let avail = buf.len() - *pos;
+        if avail == 0 {
+            return false;
+        }
+        let is = self.id_size;
+        let tag = buf[*pos];
+        // `data` is the slice starting immediately after the tag byte.
+        let data = &buf[*pos + 1..];
+        let data_avail = avail - 1;
 
-    fn object_array_shallow_size(&self, num_elements: u32) -> u32 {
-        16 + 4 + num_elements * self.id_size
-    }
-
-    /// Finalise: resolve class names, write sorted index and roots to disk.
-    pub fn into_output(mut self) -> Result<Pass1Output> {
-        // Resolve class names now that all Utf8String + LoadClass records are seen.
-        for (class_id, desc) in &mut self.class_index {
-            if let Some(&name_sid) = self.name_id_map.get(class_id) {
-                if let Some(raw) = self.string_table.get(&name_sid) {
-                    // JVM internal names use '/' as separator; convert to '.'.
-                    desc.name = raw.replace('/', ".");
+        let consumed = match tag {
+            0xFF => {
+                // ROOT_UNKNOWN: object_id(is)
+                if data_avail < is { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + is
+            }
+            0x01 => {
+                // ROOT_JNI_GLOBAL: object_id(is) + jni_ref_id(is)
+                if data_avail < 2 * is { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + 2 * is
+            }
+            0x02 | 0x03 => {
+                // ROOT_JNI_LOCAL / ROOT_JAVA_FRAME: object_id(is) + thread(4) + frame(4)
+                if data_avail < is + 8 { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + is + 8
+            }
+            0x04 | 0x06 => {
+                // ROOT_NATIVE_STACK / ROOT_THREAD_BLOCK: object_id(is) + thread(4)
+                if data_avail < is + 4 { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + is + 4
+            }
+            0x05 | 0x07 => {
+                // ROOT_STICKY_CLASS / ROOT_MONITOR_USED: object_id(is)
+                if data_avail < is { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + is
+            }
+            0x08 => {
+                // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
+                if data_avail < is + 8 { return false; }
+                batch.push(IndexItem::Root(read_id_be(is, data)));
+                1 + is + 8
+            }
+            0x20 => {
+                // CLASS_DUMP — variable-length record
+                match try_parse_class_dump(is, data) {
+                    Some((n, item)) => { batch.push(item); 1 + n }
+                    None => return false,
                 }
             }
-        }
-
-        // Take the class index out of self so we can move the sorter while the
-        // fixup closure borrows the class index.
-        let class_index = std::mem::take(&mut self.class_index);
-
-        // Write sorted object index.
-        //
-        // The fixup closure patches shallow_size for every InstanceDump entry
-        // as it is written to the output file. During streaming, InstanceDump
-        // provides only `data_size` (raw field bytes, no JVM object header);
-        // the authoritative value is ClassDump.instance_size, which includes
-        // the header. class_index is fully populated by this point, so we can
-        // correct each entry inline during the merge — no separate pass needed.
-        let index_path = self.output_dir.join("object_index.bin");
-        let object_count = self.sorter.finish(&index_path, |entry| {
-            let (_, class_id, _) = decode_entry(entry);
-            if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
-                if let Some(desc) = class_index.get(&class_id) {
-                    entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
-                }
+            0x21 => {
+                // INSTANCE_DUMP: object_id(is) + stack(4) + class_id(is) + data_size(4) + data[data_size]
+                let hdr = 2 * is + 8;
+                if data_avail < hdr { return false; }
+                let oid = read_id_be(is, data);
+                let class_id = read_id_be(is, &data[is + 4..]);
+                let data_size =
+                    u32::from_be_bytes(data[2 * is + 4..2 * is + 8].try_into().unwrap());
+                let total = hdr + data_size as usize;
+                if data_avail < total { return false; }
+                // Use data_size as placeholder; fixup corrects to instance_size in finish().
+                batch.push(IndexItem::Entry(encode_entry(oid, class_id, data_size)));
+                1 + total
             }
-        })?;
-
-        // Write roots.
-        let roots_path = self.output_dir.join("roots.bin");
-        let mut rw = BufWriter::new(File::create(&roots_path).context("create roots file")?);
-        // De-duplicate: roots can be reported multiple times via different root types.
-        self.roots.sort_unstable();
-        self.roots.dedup();
-        for &id in &self.roots {
-            rw.write_all(&id.to_le_bytes())?;
-        }
-        rw.flush()?;
-
-        // Write class names so later runs can skip re-parsing the HPROF.
-        let class_names_path = self.output_dir.join("class_names.bin");
-        write_class_names(&class_index, &class_names_path).context("write class_names.bin")?;
-
-        Ok(Pass1Output {
-            class_index,
-            roots: self.roots,
-            object_count,
-            object_index_path: index_path,
-        })
-    }
-
-    fn handle_gc_record(&mut self, gc: GcRecord) {
-        match gc {
-            // ── GC roots ─────────────────────────────────────────────────────
-            GcRecord::RootUnknown { object_id }
-            | GcRecord::RootJniGlobal { object_id, .. }
-            | GcRecord::RootJniLocal { object_id, .. }
-            | GcRecord::RootJavaFrame { object_id, .. }
-            | GcRecord::RootNativeStack { object_id, .. }
-            | GcRecord::RootStickyClass { object_id }
-            | GcRecord::RootThreadBlock { object_id, .. }
-            | GcRecord::RootMonitorUsed { object_id }
-            | GcRecord::RootThreadObject { object_id, .. } => {
-                self.roots.push(object_id);
+            0x22 => {
+                // OBJ_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + class_id(is) + elems[num*is]
+                let hdr = 2 * is + 8;
+                if data_avail < hdr { return false; }
+                let oid = read_id_be(is, data);
+                let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
+                let class_id = read_id_be(is, &data[is + 8..]);
+                let total = hdr + num as usize * is;
+                if data_avail < total { return false; }
+                // JVM header (16) + array length field (4) + element references.
+                let shallow = 16u32 + 4 + num.saturating_mul(is as u32);
+                batch.push(IndexItem::Entry(
+                    encode_entry(oid, class_id | OBJECT_ARRAY_FLAG, shallow),
+                ));
+                1 + total
             }
-
-            // ── Class definitions ─────────────────────────────────────────────
-            GcRecord::ClassDump(fields) => {
-                // Compute approximate shallow size of the class object itself:
-                // JVM object header (16) + static field data.
-                let static_bytes: u32 = fields
-                    .static_fields
-                    .iter()
-                    .map(|(fi, _)| fi.field_type.byte_size(self.id_size))
-                    .sum();
-                let shallow = 16 + static_bytes;
-                // Index the class object so it participates in reachability /
-                // dominator computation.
-                let entry = encode_entry(fields.class_object_id, CLASS_ID_JAVA_CLASS, shallow);
-                self.sorter.push(entry).expect("object index write failed");
-                self.object_count += 1;
-
-                self.class_index.insert(
-                    fields.class_object_id,
-                    ClassDescriptor {
-                        // Name resolved in into_output() once all Utf8String records are seen.
-                        name: String::new(),
-                        super_id: fields.super_class_object_id,
-                        instance_size: fields.instance_size,
-                        instance_fields: fields.instance_fields,
-                    },
-                );
+            0x23 => {
+                // PRIM_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + elem_type(1) + data
+                let hdr = is + 9;
+                if data_avail < hdr { return false; }
+                let oid = read_id_be(is, data);
+                let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
+                let elem_type = FieldType::from_value(data[is + 8]);
+                let elem_size = elem_type.byte_size(is as u32); // u32
+                let total = hdr + num as usize * elem_size as usize;
+                if data_avail < total { return false; }
+                let shallow = 16u32 + 4 + num.saturating_mul(elem_size);
+                batch.push(IndexItem::Entry(encode_entry(oid, elem_type as u64, shallow)));
+                1 + total
             }
+            x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
+        };
 
-            // ── Object instances ─────────────────────────────────────────────
-            GcRecord::InstanceDump {
-                object_id,
-                class_id,
-                data_size,
-                ..
-            } => {
-                // TODO: resolve shallow_size from class_index.instance_size after
-                // all ClassDump records are seen. For now, data_size is the raw
-                // field-data byte count — close but excludes the JVM object header.
-                let entry = encode_entry(object_id, class_id, data_size);
-                self.sorter.push(entry).expect("object index write failed");
-                self.object_count += 1;
-            }
-
-            // ── Arrays ───────────────────────────────────────────────────────
-            GcRecord::ObjectArrayDump {
-                object_id,
-                num_elements,
-                element_class_id,
-                ..
-            } => {
-                let shallow = self.object_array_shallow_size(num_elements);
-                // Encode element_class_id with OBJECT_ARRAY_FLAG so the query layer
-                // can distinguish "SomeClass[]" from plain "SomeClass" instances.
-                let entry = encode_entry(object_id, element_class_id | OBJECT_ARRAY_FLAG, shallow);
-                self.sorter.push(entry).expect("object index write failed");
-                self.object_count += 1;
-            }
-
-            GcRecord::PrimitiveArrayDump {
-                object_id,
-                num_elements,
-                element_type,
-            } => {
-                let shallow = self.primitive_array_shallow_size(element_type, num_elements);
-                // Use the FieldType discriminant as a synthetic class_id (values 4..11)
-                // so the query layer can display the correct array type name.
-                let entry = encode_entry(object_id, element_type as u64, shallow);
-                self.sorter.push(entry).expect("object index write failed");
-                self.object_count += 1;
-            }
-        }
+        self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(consumed);
+        *pos += consumed;
+        true
     }
 }
 
-impl RecordVisitor for IndexVisitor {
-    fn on_record(&mut self, record: Record) {
-        match record {
-            Record::Utf8String { id, str } => {
-                self.string_table.insert(id, str.into_string());
-            }
-            Record::LoadClass(lc) => {
-                self.name_id_map
-                    .insert(lc.class_object_id, lc.class_name_id);
-            }
-            Record::GcSegment(gc) => {
-                self.handle_gc_record(gc);
-            }
-            // HeapDumpStart, HeapDumpEnd, Ignored — nothing to do.
-            _ => {}
-        }
+/// Read a big-endian object ID (4 or 8 bytes) from the start of `buf`.
+#[inline(always)]
+fn read_id_be(is: usize, buf: &[u8]) -> u64 {
+    if is == 8 {
+        u64::from_be_bytes(buf[..8].try_into().unwrap())
+    } else {
+        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
     }
+}
+
+/// Try to parse a CLASS_DUMP sub-record from `buf` (the bytes immediately after
+/// the 0x20 tag byte).  Returns `(bytes_consumed, IndexItem)` or `None` if there
+/// is not enough data in the buffer.
+fn try_parse_class_dump(is: usize, buf: &[u8]) -> Option<(usize, IndexItem)> {
+    // Fixed header layout (all big-endian):
+    //   class_id(is) + stack_serial(4) + super_id(is)
+    //   + class_loader_id(is) + signers_id(is) + protection_domain_id(is)
+    //   + reserved_1(is) + reserved_2(is) + instance_size(4)
+    // = 7*is + 8 bytes, followed by cp_count(2).
+    let fixed = 7 * is + 8;
+    if buf.len() < fixed + 2 {
+        return None;
+    }
+
+    let mut p = 0;
+    let class_object_id = read_id_be(is, &buf[p..]);
+    p += is;
+    p += 4; // skip stack_serial
+    let super_id = read_id_be(is, &buf[p..]);
+    p += is;
+    p += 5 * is; // skip class_loader_id, signers_id, prot_domain, reserved_1, reserved_2
+    let instance_size = u32::from_be_bytes(buf[p..p + 4].try_into().unwrap());
+    p += 4;
+
+    // Constant pool — scan through and discard.
+    let cp_count = u16::from_be_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
+    p += 2;
+    for _ in 0..cp_count {
+        // constant_pool_index(2) + type(1) + value
+        if buf.len() < p + 3 {
+            return None;
+        }
+        p += 2; // skip index
+        let ty = FieldType::from_value(buf[p]);
+        p += 1;
+        let sz = ty.byte_size(is as u32) as usize;
+        if buf.len() < p + sz {
+            return None;
+        }
+        p += sz;
+    }
+
+    // Static fields — sum their data sizes for the class object's shallow size.
+    if buf.len() < p + 2 {
+        return None;
+    }
+    let static_count = u16::from_be_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
+    p += 2;
+    let mut static_shallow_size: u32 = 0;
+    for _ in 0..static_count {
+        // name_id(is) + type(1) + value
+        if buf.len() < p + is + 1 {
+            return None;
+        }
+        p += is; // skip name_id
+        let ty = FieldType::from_value(buf[p]);
+        p += 1;
+        let sz = ty.byte_size(is as u32) as usize;
+        if buf.len() < p + sz {
+            return None;
+        }
+        static_shallow_size += sz as u32;
+        p += sz;
+    }
+
+    // Instance fields — kept for pass 2 reference extraction.
+    if buf.len() < p + 2 {
+        return None;
+    }
+    let instance_count = u16::from_be_bytes(buf[p..p + 2].try_into().unwrap()) as usize;
+    p += 2;
+    let mut instance_fields = Vec::with_capacity(instance_count);
+    for _ in 0..instance_count {
+        // name_id(is) + type(1)
+        if buf.len() < p + is + 1 {
+            return None;
+        }
+        let name_id = read_id_be(is, &buf[p..]);
+        p += is;
+        let ty = FieldType::from_value(buf[p]);
+        p += 1;
+        instance_fields.push(FieldInfo { name_id, field_type: ty });
+    }
+
+    Some((
+        p,
+        IndexItem::ClassDump {
+            class_object_id,
+            super_id,
+            instance_size,
+            static_shallow_size,
+            instance_fields,
+        },
+    ))
 }
 
 // ── class_names.bin serialisation ────────────────────────────────────────────
@@ -628,7 +773,114 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     std::fs::create_dir_all(output_dir).context("create output directory")?;
 
     let (header, _) = read_header(path)?;
-    let mut visitor = IndexVisitor::new(header.id_size, output_dir);
-    process(path, &mut visitor).context("pass 1 streaming")?;
-    visitor.into_output()
+    let id_size = header.id_size as usize;
+
+    let mut string_table: HashMap<u64, String> = HashMap::new();
+    let mut name_id_map: HashMap<u64, u64> = HashMap::new();
+    let mut class_index: HashMap<u64, ClassDescriptor> = HashMap::new();
+    let mut roots: Vec<u64> = Vec::new();
+    let mut sorter = ExternalSorter::new(output_dir.to_path_buf());
+
+    let mut extractor = IndexStreamExtractor { id_size, heap_dump_remaining: 0 };
+
+    process_with_extractor(
+        path,
+        move |buf, batch| extractor.extract(buf, batch),
+        &mut |batch: &mut Vec<IndexItem>| {
+            for item in batch.drain(..) {
+                match item {
+                    IndexItem::Utf8String { id, value } => {
+                        string_table.insert(id, value);
+                    }
+                    IndexItem::LoadClass { class_object_id, class_name_id } => {
+                        name_id_map.insert(class_object_id, class_name_id);
+                    }
+                    IndexItem::Root(oid) => {
+                        roots.push(oid);
+                    }
+                    IndexItem::ClassDump {
+                        class_object_id,
+                        super_id,
+                        instance_size,
+                        static_shallow_size,
+                        instance_fields,
+                    } => {
+                        // JVM object header (16) + static field data.
+                        let shallow = 16u32 + static_shallow_size;
+                        sorter
+                            .push(encode_entry(class_object_id, CLASS_ID_JAVA_CLASS, shallow))
+                            .expect("object index write failed");
+                        class_index.insert(
+                            class_object_id,
+                            ClassDescriptor {
+                                name: String::new(), // resolved below
+                                super_id,
+                                instance_size,
+                                instance_fields,
+                            },
+                        );
+                    }
+                    IndexItem::Entry(entry) => {
+                        sorter.push(entry).expect("object index write failed");
+                    }
+                }
+            }
+        },
+    )
+    .context("pass 1 streaming")?;
+
+    // Resolve class names now that all Utf8String + LoadClass records have been seen.
+    for (class_id, desc) in &mut class_index {
+        if let Some(&name_sid) = name_id_map.get(class_id) {
+            if let Some(raw) = string_table.get(&name_sid) {
+                desc.name = raw.replace('/', ".");
+            }
+        }
+    }
+
+    // Write sorted object index.
+    //
+    // The fixup closure patches shallow_size for InstanceDump entries:
+    // `data_size` (raw field bytes, no header) is corrected to
+    // `ClassDump.instance_size` (which includes the JVM object header).
+    let index_path = output_dir.join("object_index.bin");
+    let object_count = sorter.finish(&index_path, |entry| {
+        let (_, class_id, _) = decode_entry(entry);
+        if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
+            if let Some(desc) = class_index.get(&class_id) {
+                entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
+            }
+        }
+    })?;
+
+    // Write roots (de-duplicated).
+    let roots_path = output_dir.join("roots.bin");
+    let mut rw = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&roots_path).context("create roots file")?,
+    );
+    roots.sort_unstable();
+    roots.dedup();
+    for &id in &roots {
+        rw.write_all(&id.to_le_bytes())?;
+    }
+    rw.flush()?;
+
+    // Write class names for subsequent runs / query phase.
+    let class_names_path = output_dir.join("class_names.bin");
+    write_class_names(&class_index, &class_names_path).context("write class_names.bin")?;
+
+    eprintln!(
+        "  {} objects, {} classes, {} roots",
+        object_count,
+        class_index.len(),
+        roots.len()
+    );
+
+    Ok(Pass1Output {
+        class_index,
+        roots,
+        object_count,
+        object_index_path: index_path,
+    })
 }
