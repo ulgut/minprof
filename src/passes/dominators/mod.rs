@@ -25,13 +25,19 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::passes::edges::{EDGE_SIZE, Pass2Output};
-use crate::passes::index::{ENTRY_SIZE, Pass1Output};
-
+use crate::passes::index::Pass1Output;
+use crate::passes::sort::RecordSorter;
 use crate::passes::IO_BUF_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const UNDEFINED: u32 = u32::MAX;
+
+// Intermediate record sizes:
+//   PARTIAL_SIZE: (key_id: u64, idx: u32)  — first sort pass result
+//   INDEXED_SIZE: (idx_a: u32, idx_b: u32) — second sort pass result / CSR input
+const PARTIAL_SIZE: usize = 12;
+const INDEXED_SIZE: usize = 8;
 
 // ── Output ────────────────────────────────────────────────────────────────────
 
@@ -64,24 +70,7 @@ impl Csr {
 
 // ── Step 1: load object IDs ───────────────────────────────────────────────────
 
-/// Load the sorted object ID array from `object_index.bin`.
-/// Position i in this array is the node index for that object.
-fn load_object_ids(index_path: &Path) -> Result<Vec<u64>> {
-    let file_len = std::fs::metadata(index_path)?.len() as usize;
-    let n = file_len / ENTRY_SIZE;
-    let mut ids = Vec::with_capacity(n);
-
-    let mut reader = BufReader::with_capacity(
-        IO_BUF_SIZE,
-        File::open(index_path).context("open object index")?,
-    );
-    let mut buf = [0u8; ENTRY_SIZE];
-    while reader.read_exact(&mut buf).is_ok() {
-        let object_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        ids.push(object_id);
-    }
-    Ok(ids)
-}
+use crate::passes::index::load_object_ids;
 
 /// Binary search: object_id → node index (position in sorted `ids`).
 /// Returns `None` if the object_id is not in the index (malformed dump).
@@ -102,167 +91,291 @@ fn load_root_nodes(roots: &[u64], ids: &[u64]) -> Vec<u32> {
 }
 
 // ── Step 3: build forward and reverse CSR from edge files ────────────────────
+//
+// Strategy: eliminate all binary searches by resolving object IDs to node
+// indices via merge-scan (possible because each edge file is sorted by its
+// first field).  Since a single scan can only handle one sorted field at a
+// time, we use a two-sort pipeline for each CSR:
+//
+//   Forward CSR  (edges.bin sorted by from_id):
+//     A. Scan edges.bin, merge-scan from_id → from_idx,
+//        write (to_id: u64, from_idx: u32) → sort by to_id
+//     B. Scan sorted partial, merge-scan to_id → to_idx,
+//        write (from_idx: u32, to_idx: u32) → sort by from_idx
+//     C. Build CSR from sorted (from_idx, to_idx) — pure streaming, no lookup
+//
+//   Reverse CSR  (reverse_edges.bin sorted by to_id):
+//     A. Scan reverse_edges.bin, merge-scan to_id → to_idx,
+//        write (from_id: u64, to_idx: u32) → sort by from_id
+//     B. Scan sorted partial, merge-scan from_id → from_idx,
+//        write (to_idx: u32, from_idx: u32) → sort by to_idx
+//     C. Build CSR from sorted (to_idx, from_idx), then append vroot edges
+//
+// This turns O(E · log N) random DRAM latency into O(E) streaming I/O
+// plus two external sorts per CSR.
 
-/// Build both forward (successor) and reverse (predecessor) CSR adjacency
-/// lists by streaming the pre-sorted edge files from pass 2.
-///
-/// Each file is read twice: once to count degrees (building the offset array),
-/// once to fill the neighbor array. This avoids materialising O(edges) pairs
-/// in RAM and eliminates the in-memory sort of the reverse edges.
-///
-/// The virtual root (node N) is inserted as a predecessor of each GC root
-/// in the reverse CSR so the algorithm has a well-defined entry point.
 fn build_csrs(
     edges_path: &Path,
     rev_edges_path: &Path,
-    ids: &[u64],
+    ids: Vec<u64>,
     root_nodes: &[u32],
+    output_dir: &Path,
 ) -> Result<(Csr, Csr)> {
     let n = ids.len();
     let vroot = n as u32;
 
-    let forward = build_forward_csr(edges_path, ids, n)?;
-    let reverse = build_reverse_csr(rev_edges_path, ids, n, root_nodes, vroot)?;
+    // Produce the indexed (sorted by node-index) files for both CSRs.
+    // These run sequentially to bound peak RAM to ids[] + one sort buffer.
+    let fwd_indexed = resolve_forward_indexed(edges_path, &ids, output_dir)?;
+    let rev_indexed = resolve_reverse_indexed(rev_edges_path, &ids, root_nodes, vroot, output_dir)?;
+
+    // ids[] no longer needed — free 4 GB before allocating the CSRs.
+    drop(ids);
+
+    let forward = build_csr_from_indexed(&fwd_indexed, n, /*extra_nodes=*/ 0)?;
+    let _ = std::fs::remove_file(&fwd_indexed);
+
+    let reverse = build_csr_from_indexed(&rev_indexed, n + 1, /*extra_nodes=*/ 0)?;
+    let _ = std::fs::remove_file(&rev_indexed);
 
     Ok((forward, reverse))
 }
 
-/// Stream `edges.bin` (sorted by from_id) in two passes to build the forward
-/// CSR without storing all edge pairs in memory.
-fn build_forward_csr(edges_path: &Path, ids: &[u64], n: usize) -> Result<Csr> {
-    let mut offsets = vec![0u64; n + 1];
+// ── 3a: produce fwd_indexed.bin sorted by (from_idx, to_idx) ─────────────────
 
-    // Pass 1: count out-degree per source node.
-    {
-        let mut reader = BufReader::with_capacity(
-            IO_BUF_SIZE,
-            File::open(edges_path).context("open edges file (forward pass 1)")?,
-        );
-        let mut buf = [0u8; EDGE_SIZE];
-        while reader.read_exact(&mut buf).is_ok() {
-            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            if let (Some(from_idx), Some(_)) =
-                (lookup_node(ids, from_id), lookup_node(ids, to_id))
-            {
-                offsets[from_idx as usize + 1] += 1;
-            }
-        }
-    }
-    // Prefix sum → offsets[i..i+1] is the range of neighbors for node i.
-    for i in 1..=n {
-        offsets[i] += offsets[i - 1];
-    }
-
-    let edge_count = offsets[n] as usize;
-    let mut neighbors = vec![0u32; edge_count];
-    // cursor[i] tracks how many neighbors of node i have been written so far.
-    let mut cursor = vec![0u32; n];
-
-    // Pass 2: fill neighbor arrays.
-    {
-        let mut reader = BufReader::with_capacity(
-            IO_BUF_SIZE,
-            File::open(edges_path).context("open edges file (forward pass 2)")?,
-        );
-        let mut buf = [0u8; EDGE_SIZE];
-        while reader.read_exact(&mut buf).is_ok() {
-            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            let (Some(from_idx), Some(to_idx)) =
-                (lookup_node(ids, from_id), lookup_node(ids, to_id))
-            else {
-                continue;
-            };
-            let fi = from_idx as usize;
-            let pos = offsets[fi] as usize + cursor[fi] as usize;
-            neighbors[pos] = to_idx;
-            cursor[fi] += 1;
-        }
-    }
-
-    Ok(Csr { offsets, neighbors })
+fn key_partial(rec: &[u8; PARTIAL_SIZE]) -> (u64, u64) {
+    let key = u64::from_le_bytes(rec[0..8].try_into().unwrap());
+    let idx = u32::from_le_bytes(rec[8..12].try_into().unwrap()) as u64;
+    (key, idx)
 }
 
-/// Stream `reverse_edges.bin` (sorted by to_id, i.e. original destination)
-/// in two passes to build the reverse CSR. Virtual-root predecessor edges for
-/// GC roots are injected without re-sorting.
+fn key_indexed(rec: &[u8; INDEXED_SIZE]) -> (u64, u64) {
+    let a = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as u64;
+    let b = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as u64;
+    (a, b)
+}
+
+/// edges.bin (sorted by from_id) → fwd_indexed.bin (sorted by from_idx, to_idx).
 ///
-/// `reverse_edges.bin` stores `(to_id, from_id)` pairs — in the reverse
-/// graph, `to_id` is the source and `from_id` is the neighbour (predecessor).
-fn build_reverse_csr(
+/// Two sort passes:
+///   1. Resolve from_id via merge-scan → write (to_id, from_idx), sort by to_id.
+///   2. Resolve to_id via merge-scan → write (from_idx, to_idx), sort by from_idx.
+fn resolve_forward_indexed(edges_path: &Path, ids: &[u64], output_dir: &Path) -> Result<PathBuf> {
+    // ── Pass A: merge-scan from_id → from_idx; collect (to_id, from_idx) ─────
+    let partial_path = output_dir.join("fwd_partial_sorted.bin");
+    {
+        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
+            output_dir.to_path_buf(),
+            "fwd_partial",
+            key_partial,
+        );
+        let mut reader =
+            BufReader::with_capacity(IO_BUF_SIZE, File::open(edges_path).context("open edges")?);
+        let mut buf = [0u8; EDGE_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            while scan < ids.len() && ids[scan] < from_id {
+                scan += 1;
+            }
+            if scan >= ids.len() || ids[scan] != from_id {
+                continue;
+            }
+            let from_idx = scan as u32;
+            let mut rec = [0u8; PARTIAL_SIZE];
+            rec[0..8].copy_from_slice(&to_id.to_le_bytes());
+            rec[8..12].copy_from_slice(&from_idx.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        sorter.finish(&partial_path)?;
+    }
+    eprintln!("  [fwd] partial resolve done");
+
+    // ── Pass B: merge-scan to_id → to_idx; collect (from_idx, to_idx) ───────
+    let indexed_path = output_dir.join("fwd_indexed_sorted.bin");
+    {
+        let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
+            output_dir.to_path_buf(),
+            "fwd_indexed",
+            key_indexed,
+        );
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(&partial_path).context("open fwd partial")?,
+        );
+        let mut buf = [0u8; PARTIAL_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let from_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            while scan < ids.len() && ids[scan] < to_id {
+                scan += 1;
+            }
+            if scan >= ids.len() || ids[scan] != to_id {
+                continue;
+            }
+            let to_idx = scan as u32;
+            let mut rec = [0u8; INDEXED_SIZE];
+            rec[0..4].copy_from_slice(&from_idx.to_le_bytes());
+            rec[4..8].copy_from_slice(&to_idx.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        sorter.finish(&indexed_path)?;
+    }
+    let _ = std::fs::remove_file(&partial_path);
+    eprintln!("  [fwd] indexed resolve done");
+
+    Ok(indexed_path)
+}
+
+// ── 3b: produce rev_indexed.bin sorted by (to_idx, from_idx) ─────────────────
+
+/// reverse_edges.bin (sorted by to_id) → rev_indexed.bin (sorted by to_idx, from_idx).
+/// Also appends virtual-root edges: for each GC root r, predecessor = vroot.
+///
+/// Two sort passes:
+///   1. Resolve to_id via merge-scan → write (from_id, to_idx), sort by from_id.
+///   2. Resolve from_id via merge-scan → write (to_idx, from_idx), sort by to_idx.
+///   3. Append virtual-root entries (r, vroot) for each root_node r.
+fn resolve_reverse_indexed(
     rev_edges_path: &Path,
     ids: &[u64],
-    n: usize,
     root_nodes: &[u32],
     vroot: u32,
-) -> Result<Csr> {
-    let total_nodes = n + 1; // 0..n actual nodes + virtual root at index n
+    output_dir: &Path,
+) -> Result<PathBuf> {
+    // ── Pass A: merge-scan to_id → to_idx; collect (from_id, to_idx) ────────
+    let partial_path = output_dir.join("rev_partial_sorted.bin");
+    {
+        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
+            output_dir.to_path_buf(),
+            "rev_partial",
+            key_partial,
+        );
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(rev_edges_path).context("open rev edges")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            // reverse_edges.bin layout: (to_id, from_id)
+            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            while scan < ids.len() && ids[scan] < to_id {
+                scan += 1;
+            }
+            if scan >= ids.len() || ids[scan] != to_id {
+                continue;
+            }
+            let to_idx = scan as u32;
+            let mut rec = [0u8; PARTIAL_SIZE];
+            rec[0..8].copy_from_slice(&from_id.to_le_bytes());
+            rec[8..12].copy_from_slice(&to_idx.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        sorter.finish(&partial_path)?;
+    }
+    eprintln!("  [rev] partial resolve done");
+
+    // ── Pass B: merge-scan from_id → from_idx; collect (to_idx, from_idx) ───
+    let indexed_path = output_dir.join("rev_indexed_sorted.bin");
+    {
+        let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
+            output_dir.to_path_buf(),
+            "rev_indexed",
+            key_indexed,
+        );
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(&partial_path).context("open rev partial")?,
+        );
+        let mut buf = [0u8; PARTIAL_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let to_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            while scan < ids.len() && ids[scan] < from_id {
+                scan += 1;
+            }
+            if scan >= ids.len() || ids[scan] != from_id {
+                continue;
+            }
+            let from_idx = scan as u32;
+            let mut rec = [0u8; INDEXED_SIZE];
+            rec[0..4].copy_from_slice(&to_idx.to_le_bytes());
+            rec[4..8].copy_from_slice(&from_idx.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        // Append virtual-root edges: for each GC root r, its predecessor is vroot.
+        // These are (to_idx=r, from_idx=vroot) entries.
+        for &r in root_nodes {
+            let mut rec = [0u8; INDEXED_SIZE];
+            rec[0..4].copy_from_slice(&r.to_le_bytes());
+            rec[4..8].copy_from_slice(&vroot.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        sorter.finish(&indexed_path)?;
+    }
+    let _ = std::fs::remove_file(&partial_path);
+    eprintln!("  [rev] indexed resolve done");
+
+    Ok(indexed_path)
+}
+
+// ── 3c: build a CSR from a sorted (node_a: u32, node_b: u32) file ────────────
+
+/// Build a CSR from a file of `(node_a: u32, node_b: u32)` pairs sorted by
+/// `node_a`. `total_nodes` is the number of distinct source nodes (= size of
+/// the `offsets` array minus one).
+///
+/// Because the input is sorted, the fill pass writes `neighbors` purely
+/// sequentially — no cursor array, no random writes.
+fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize, _extra_nodes: usize) -> Result<Csr> {
     let mut offsets = vec![0u64; total_nodes + 1];
 
-    // Pass 1: count in-degree per destination node from the file.
+    // Count pass: tally out-degree per source node.
     {
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
-            File::open(rev_edges_path).context("open reverse edges file (pass 1)")?,
+            File::open(indexed_path).context("open indexed file (count)")?,
         );
-        let mut buf = [0u8; EDGE_SIZE];
+        let mut buf = [0u8; INDEXED_SIZE];
         while reader.read_exact(&mut buf).is_ok() {
-            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            if let (Some(to_idx), Some(_)) =
-                (lookup_node(ids, to_id), lookup_node(ids, from_id))
-            {
-                offsets[to_idx as usize + 1] += 1;
+            let node_a = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+            if node_a < total_nodes {
+                offsets[node_a + 1] += 1;
             }
         }
     }
-    // Each GC root gets one extra predecessor: the virtual root.
-    for &r in root_nodes {
-        offsets[r as usize + 1] += 1;
-    }
-    // Prefix sum.
     for i in 1..=total_nodes {
         offsets[i] += offsets[i - 1];
     }
 
     let edge_count = offsets[total_nodes] as usize;
     let mut neighbors = vec![0u32; edge_count];
-    let mut cursor = vec![0u32; total_nodes];
 
-    // Pass 2: fill neighbor arrays from file.
+    // Fill pass: data is sorted by node_a → writes to neighbors are sequential.
     {
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
-            File::open(rev_edges_path).context("open reverse edges file (pass 2)")?,
+            File::open(indexed_path).context("open indexed file (fill)")?,
         );
-        let mut buf = [0u8; EDGE_SIZE];
+        let mut buf = [0u8; INDEXED_SIZE];
+        let mut write_pos = 0usize;
         while reader.read_exact(&mut buf).is_ok() {
-            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            let (Some(to_idx), Some(from_idx)) =
-                (lookup_node(ids, to_id), lookup_node(ids, from_id))
-            else {
-                continue;
-            };
-            let ti = to_idx as usize;
-            let pos = offsets[ti] as usize + cursor[ti] as usize;
-            neighbors[pos] = from_idx;
-            cursor[ti] += 1;
+            let node_a = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+            if node_a < total_nodes {
+                let node_b = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+                neighbors[write_pos] = node_b;
+                write_pos += 1;
+            }
         }
-    }
-
-    // Inject virtual-root as a predecessor for each GC root.
-    for &r in root_nodes {
-        let ri = r as usize;
-        let pos = offsets[ri] as usize + cursor[ri] as usize;
-        neighbors[pos] = vroot;
-        cursor[ri] += 1;
     }
 
     Ok(Csr { offsets, neighbors })
 }
-
 
 // ── Step 4: iterative DFS for RPO numbering ───────────────────────────────────
 
@@ -274,34 +387,62 @@ fn build_reverse_csr(
 fn compute_rpo(n: u32, vroot: u32, root_nodes: &[u32], forward: &Csr) -> (Vec<u32>, Vec<u32>) {
     let total = (n + 1) as usize; // actual nodes + virtual root
     let mut node_to_rpo = vec![UNDEFINED; total];
-    let mut visited = vec![false; total];
+
+    // Packed-bit visited set: 8× smaller than Vec<bool> → 8× more nodes per
+    // cache line → dramatically fewer DRAM misses for random successor checks.
+    // 500 M nodes → 62.5 MB (vs 500 MB for Vec<bool>).
+    let mut visited: Vec<u64> = vec![0u64; (total + 63) / 64];
     let mut post_order: Vec<u32> = Vec::with_capacity(total);
 
-    // Iterative DFS stack: (node_idx, successor_cursor).
-    let mut stack: Vec<(u32, usize)> = Vec::new();
+    // Stack stores (node, abs_cur, abs_end) where abs_cur/abs_end are absolute
+    // indices into forward.neighbors (pre-computed on node push).  This avoids
+    // re-reading offsets[node] on every edge visit — only one lookup per node.
+    //
+    // vroot's successors are root_nodes, not the forward CSR, so we keep a
+    // separate cursor for it (abs_cur/abs_end encode a root_nodes index when
+    // node == vroot, identified by the sentinel abs_end == u32::MAX).
+    let mut stack: Vec<(u32, u32, u32)> = Vec::new();
 
-    visited[vroot as usize] = true;
-    stack.push((vroot, 0));
+    macro_rules! visit_set {
+        ($i:expr) => { visited[$i / 64] |= 1u64 << ($i % 64) };
+    }
+    macro_rules! visit_get {
+        ($i:expr) => { (visited[$i / 64] >> ($i % 64)) & 1 != 0 };
+    }
 
-    while !stack.is_empty() {
-        let top_idx = stack.len() - 1;
-        let (node, cursor) = stack[top_idx];
+    visit_set!(vroot as usize);
+    // Sentinel: abs_end = u32::MAX means "use root_nodes[abs_cur]".
+    stack.push((vroot, 0, u32::MAX));
 
-        // Successors of vroot are the GC root nodes; others use the forward CSR.
-        let next = if node == vroot {
-            root_nodes.get(cursor).copied()
-        } else {
-            forward.neighbors(node).get(cursor).copied()
-        };
-
-        if let Some(succ) = next {
-            stack[top_idx].1 += 1; // advance cursor before potential push
-            if !visited[succ as usize] {
-                visited[succ as usize] = true;
-                stack.push((succ, 0));
+    while let Some(&mut (node, ref mut abs_cur, abs_end)) = stack.last_mut() {
+        let succ = if abs_end == u32::MAX {
+            // vroot frame: iterate root_nodes
+            let idx = *abs_cur as usize;
+            if idx < root_nodes.len() {
+                *abs_cur += 1;
+                Some(root_nodes[idx])
+            } else {
+                None
             }
         } else {
-            // All successors explored — record post-order finish.
+            // Normal frame: iterate forward.neighbors[abs_cur..abs_end]
+            if *abs_cur < abs_end {
+                let s = forward.neighbors[*abs_cur as usize];
+                *abs_cur += 1;
+                Some(s)
+            } else {
+                None
+            }
+        };
+
+        if let Some(s) = succ {
+            if !visit_get!(s as usize) {
+                visit_set!(s as usize);
+                let start = forward.offsets[s as usize] as u32;
+                let end = forward.offsets[s as usize + 1] as u32;
+                stack.push((s, start, end));
+            }
+        } else {
             post_order.push(node);
             stack.pop();
         }
@@ -418,8 +559,13 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
 
     let t = std::time::Instant::now();
     eprintln!("  building adjacency lists…");
-    let (forward, reverse) =
-        build_csrs(&pass2.edges_path, &pass2.reverse_edges_path, &ids, &root_nodes)?;
+    let (forward, reverse) = build_csrs(
+        &pass2.edges_path,
+        &pass2.reverse_edges_path,
+        ids,
+        &root_nodes,
+        output_dir,
+    )?;
     eprintln!(
         "    {} forward edges, {} reverse edges  [{:.1}s]",
         forward.neighbors.len(),

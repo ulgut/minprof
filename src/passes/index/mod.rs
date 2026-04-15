@@ -750,6 +750,23 @@ pub fn load_class_index(path: &Path) -> Result<ClassDescriptorMap> {
     Ok(map)
 }
 
+/// Load sorted object IDs from `object_index.bin`.
+/// Position `i` in the returned Vec is the node index for that object ID.
+pub fn load_object_ids(index_path: &Path) -> Result<Vec<u64>> {
+    let file_len = std::fs::metadata(index_path)?.len() as usize;
+    let n = file_len / ENTRY_SIZE;
+    let mut ids = Vec::with_capacity(n);
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(index_path).context("open object index")?,
+    );
+    let mut buf = [0u8; ENTRY_SIZE];
+    while reader.read_exact(&mut buf).is_ok() {
+        ids.push(u64::from_le_bytes(buf[0..8].try_into().unwrap()));
+    }
+    Ok(ids)
+}
+
 /// Load GC root IDs from `roots.bin`.
 pub fn load_roots(path: &Path) -> Result<Vec<u64>> {
     let len = std::fs::metadata(path)?.len() as usize;

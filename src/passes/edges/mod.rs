@@ -685,8 +685,8 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
             path,
             move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize { extractor.extract(buf, edges) },
             &mut |batch: &mut Vec<RawEdge>| {
-                for &edge in batch.iter() {
-                    sorter.push(edge).expect("edge sort write failed");
+                for edge in batch.iter() {
+                    sorter.push(*edge).expect("edge sort write failed");
                 }
             },
         )

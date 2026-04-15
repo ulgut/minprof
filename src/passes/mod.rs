@@ -2,6 +2,7 @@ pub mod dominators;
 pub mod edges;
 pub mod index;
 pub mod retained;
+pub mod sort;
 
 /// Buffer size for sequential reads/writes of multi-GB files (chunk flushes,
 /// merge readers/writers, index loads).
