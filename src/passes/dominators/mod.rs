@@ -101,90 +101,168 @@ fn load_root_nodes(roots: &[u64], ids: &[u64]) -> Vec<u32> {
     root_nodes
 }
 
-// ── Step 3: build forward and reverse CSR from edge file ─────────────────────
+// ── Step 3: build forward and reverse CSR from edge files ────────────────────
 
-/// Read the edge file and build both forward (successor) and reverse
-/// (predecessor) CSR adjacency lists in one pass.
+/// Build both forward (successor) and reverse (predecessor) CSR adjacency
+/// lists by streaming the pre-sorted edge files from pass 2.
+///
+/// Each file is read twice: once to count degrees (building the offset array),
+/// once to fill the neighbor array. This avoids materialising O(edges) pairs
+/// in RAM and eliminates the in-memory sort of the reverse edges.
 ///
 /// The virtual root (node N) is inserted as a predecessor of each GC root
 /// in the reverse CSR so the algorithm has a well-defined entry point.
-fn build_csrs(edges_path: &Path, ids: &[u64], root_nodes: &[u32]) -> Result<(Csr, Csr)> {
-    let n = ids.len() as u32;
-    let vroot = n; // virtual root index
+fn build_csrs(
+    edges_path: &Path,
+    rev_edges_path: &Path,
+    ids: &[u64],
+    root_nodes: &[u32],
+) -> Result<(Csr, Csr)> {
+    let n = ids.len();
+    let vroot = n as u32;
 
-    // -- Collect all edges as (from_idx, to_idx) pairs ----------------------
-    let edge_file_len = std::fs::metadata(edges_path)?.len() as usize;
-    let edge_count = edge_file_len / EDGE_SIZE;
-
-    let mut raw_forward: Vec<(u32, u32)> = Vec::with_capacity(edge_count);
-    let mut reader = BufReader::with_capacity(
-        IO_BUF_SIZE,
-        File::open(edges_path).context("open edges file")?,
-    );
-    let mut buf = [0u8; EDGE_SIZE];
-
-    while reader.read_exact(&mut buf).is_ok() {
-        let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-        let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-
-        let (Some(from_idx), Some(to_idx)) = (lookup_node(ids, from_id), lookup_node(ids, to_id))
-        else {
-            continue; // skip edges to objects not in the index
-        };
-        raw_forward.push((from_idx, to_idx));
-    }
-
-    // -- Add virtual root → GC root edges -----------------------------------
-    // These appear only in the reverse CSR as (gc_root, vroot) pairs.
-    let vroot_edges: Vec<(u32, u32)> = root_nodes.iter().map(|&r| (vroot, r)).collect();
-
-    // -- Build forward CSR (actual object edges only) ----------------------
-    // raw_forward is already sorted by from_idx (inherited from edges.bin
-    // which is sorted by from_id, and lookup preserves order).
-    let forward = build_csr_from_sorted(n, &raw_forward);
-
-    // -- Build reverse CSR (predecessors) -----------------------------------
-    // Collect all backward edges + virtual-root predecessor edges.
-    let mut raw_reverse: Vec<(u32, u32)> = raw_forward
-        .iter()
-        .map(|&(from, to)| (to, from))
-        .chain(vroot_edges.into_iter().map(|(from, to)| (to, from)))
-        .collect();
-    raw_reverse.sort_unstable_by_key(|&(to, _)| to);
-
-    // Reverse CSR has N+1 nodes (0..N actual + vroot N).
-    let reverse = build_csr_from_sorted(n + 1, &raw_reverse);
+    let forward = build_forward_csr(edges_path, ids, n)?;
+    let reverse = build_reverse_csr(rev_edges_path, ids, n, root_nodes, vroot)?;
 
     Ok((forward, reverse))
 }
 
-/// Build a CSR from a list of `(source, target)` pairs **sorted by source**.
-fn build_csr_from_sorted(node_count: u32, sorted_edges: &[(u32, u32)]) -> Csr {
-    let n = node_count as usize;
-    // u64 offsets: total edge count can exceed u32::MAX on large heap dumps
-    // (e.g. 13.3 B edges >> u32::MAX = 4.29 B).
+/// Stream `edges.bin` (sorted by from_id) in two passes to build the forward
+/// CSR without storing all edge pairs in memory.
+fn build_forward_csr(edges_path: &Path, ids: &[u64], n: usize) -> Result<Csr> {
     let mut offsets = vec![0u64; n + 1];
 
-    // Count out-degree per node.
-    for &(src, _) in sorted_edges {
-        offsets[src as usize + 1] += 1;
+    // Pass 1: count out-degree per source node.
+    {
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(edges_path).context("open edges file (forward pass 1)")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        while reader.read_exact(&mut buf).is_ok() {
+            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if let (Some(from_idx), Some(_)) =
+                (lookup_node(ids, from_id), lookup_node(ids, to_id))
+            {
+                offsets[from_idx as usize + 1] += 1;
+            }
+        }
     }
-    // Prefix sum.
+    // Prefix sum → offsets[i..i+1] is the range of neighbors for node i.
     for i in 1..=n {
         offsets[i] += offsets[i - 1];
     }
 
-    // Fill neighbor list.
-    let mut neighbors = vec![0u32; sorted_edges.len()];
-    let mut cursor = offsets.clone();
-    for &(src, dst) in sorted_edges {
-        let pos = cursor[src as usize] as usize;
-        neighbors[pos] = dst;
-        cursor[src as usize] += 1;
+    let edge_count = offsets[n] as usize;
+    let mut neighbors = vec![0u32; edge_count];
+    // cursor[i] tracks how many neighbors of node i have been written so far.
+    let mut cursor = vec![0u32; n];
+
+    // Pass 2: fill neighbor arrays.
+    {
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(edges_path).context("open edges file (forward pass 2)")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        while reader.read_exact(&mut buf).is_ok() {
+            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            let (Some(from_idx), Some(to_idx)) =
+                (lookup_node(ids, from_id), lookup_node(ids, to_id))
+            else {
+                continue;
+            };
+            let fi = from_idx as usize;
+            let pos = offsets[fi] as usize + cursor[fi] as usize;
+            neighbors[pos] = to_idx;
+            cursor[fi] += 1;
+        }
     }
 
-    Csr { offsets, neighbors }
+    Ok(Csr { offsets, neighbors })
 }
+
+/// Stream `reverse_edges.bin` (sorted by to_id, i.e. original destination)
+/// in two passes to build the reverse CSR. Virtual-root predecessor edges for
+/// GC roots are injected without re-sorting.
+///
+/// `reverse_edges.bin` stores `(to_id, from_id)` pairs — in the reverse
+/// graph, `to_id` is the source and `from_id` is the neighbour (predecessor).
+fn build_reverse_csr(
+    rev_edges_path: &Path,
+    ids: &[u64],
+    n: usize,
+    root_nodes: &[u32],
+    vroot: u32,
+) -> Result<Csr> {
+    let total_nodes = n + 1; // 0..n actual nodes + virtual root at index n
+    let mut offsets = vec![0u64; total_nodes + 1];
+
+    // Pass 1: count in-degree per destination node from the file.
+    {
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(rev_edges_path).context("open reverse edges file (pass 1)")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        while reader.read_exact(&mut buf).is_ok() {
+            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            if let (Some(to_idx), Some(_)) =
+                (lookup_node(ids, to_id), lookup_node(ids, from_id))
+            {
+                offsets[to_idx as usize + 1] += 1;
+            }
+        }
+    }
+    // Each GC root gets one extra predecessor: the virtual root.
+    for &r in root_nodes {
+        offsets[r as usize + 1] += 1;
+    }
+    // Prefix sum.
+    for i in 1..=total_nodes {
+        offsets[i] += offsets[i - 1];
+    }
+
+    let edge_count = offsets[total_nodes] as usize;
+    let mut neighbors = vec![0u32; edge_count];
+    let mut cursor = vec![0u32; total_nodes];
+
+    // Pass 2: fill neighbor arrays from file.
+    {
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(rev_edges_path).context("open reverse edges file (pass 2)")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        while reader.read_exact(&mut buf).is_ok() {
+            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            let (Some(to_idx), Some(from_idx)) =
+                (lookup_node(ids, to_id), lookup_node(ids, from_id))
+            else {
+                continue;
+            };
+            let ti = to_idx as usize;
+            let pos = offsets[ti] as usize + cursor[ti] as usize;
+            neighbors[pos] = from_idx;
+            cursor[ti] += 1;
+        }
+    }
+
+    // Inject virtual-root as a predecessor for each GC root.
+    for &r in root_nodes {
+        let ri = r as usize;
+        let pos = offsets[ri] as usize + cursor[ri] as usize;
+        neighbors[pos] = vroot;
+        cursor[ri] += 1;
+    }
+
+    Ok(Csr { offsets, neighbors })
+}
+
 
 // ── Step 4: iterative DFS for RPO numbering ───────────────────────────────────
 
@@ -340,7 +418,8 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
 
     let t = std::time::Instant::now();
     eprintln!("  building adjacency lists…");
-    let (forward, reverse) = build_csrs(&pass2.edges_path, &ids, &root_nodes)?;
+    let (forward, reverse) =
+        build_csrs(&pass2.edges_path, &pass2.reverse_edges_path, &ids, &root_nodes)?;
     eprintln!(
         "    {} forward edges, {} reverse edges  [{:.1}s]",
         forward.neighbors.len(),
