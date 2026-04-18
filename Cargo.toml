@@ -10,3 +10,10 @@ crossbeam-channel = "0.5"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "passes"
+harness = false

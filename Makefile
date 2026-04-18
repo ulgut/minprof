@@ -1,10 +1,16 @@
 BINARY := minprof
 INSTALL_DIR := $(HOME)/.local/bin
 
-.PHONY: build clean install
+.PHONY: build bench test clean install
 
 build:
 	cargo build --release
+
+bench:
+	cargo bench $(ARGS)
+
+test:
+	cargo test $(ARGS)
 
 clean:
 	cargo clean

@@ -2,3 +2,5 @@
 .idea/
 PLAN.md
 test/.test/
+*.hprof
+*.minprof/

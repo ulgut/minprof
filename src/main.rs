@@ -1,16 +1,13 @@
-mod index;
-mod parser;
-mod passes;
-mod query;
-
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::{Path, PathBuf};
 
-use passes::edges::{EDGE_SIZE, Pass2Output};
-use passes::index::{ENTRY_SIZE, Pass1Output, load_class_index, load_roots};
-use passes::retained::Pass4Output;
-use query::ReportConfig;
+use minprof::passes;
+use minprof::passes::edges::{EDGE_SIZE, Pass2Output};
+use minprof::passes::index::{ENTRY_SIZE, Pass1Output, load_class_index, load_roots};
+use minprof::passes::retained::Pass4Output;
+use minprof::query;
+use minprof::query::ReportConfig;
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
 enum Format {
