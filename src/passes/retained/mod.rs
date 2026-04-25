@@ -6,10 +6,16 @@
 //!
 //! # Algorithm
 //!
-//! For each node j processed in reverse RPO order (deepest → shallowest):
-//!   `retained[idom[j]] += retained[j]`
+//! The computation works entirely in RPO space to minimize random memory
+//! accesses.  `retained_rpo[rpo]` holds the retained size for the node at
+//! that RPO position.  The main loop:
 //!
-//! This is O(N) — a single pass over the RPO array.
+//!   `retained_rpo[idom[rpo]] += retained_rpo[rpo]`
+//!
+//! has only **one** random access (the write to `retained_rpo[idom[rpo]]`).
+//! Both `idom[rpo]` and `retained_rpo[rpo]` are read sequentially as `rpo`
+//! decreases.  This is 3x fewer random accesses than working in node-index
+//! space where every iteration requires `rpo_to_node` lookups.
 //!
 //! # Output
 //!
@@ -18,13 +24,13 @@
 //! The virtual root is excluded — only actual objects (indices 0..N-1) are written.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::passes::dominators::Pass3Output;
-use crate::passes::index::{ENTRY_SIZE, Pass1Output};
+use crate::passes::index::Pass1Output;
 
 const UNDEFINED: u32 = u32::MAX;
 
@@ -34,8 +40,6 @@ use crate::passes::IO_BUF_SIZE;
 
 pub struct Pass4Output {
     /// Retained size array on disk: `u64` values indexed by node_idx.
-    /// `retained_path[i]` = retained bytes of the object at position i
-    /// in `object_index.bin`.
     pub retained_path: PathBuf,
     /// Sum of all retained sizes (should equal total heap bytes).
     pub total_heap_bytes: u64,
@@ -48,23 +52,30 @@ pub struct Pass4Output {
 
 // ── Step 1: load shallow sizes ────────────────────────────────────────────────
 
-/// Read the `shallow_size` field from every entry in `object_index.bin`.
-/// Returns a Vec indexed by node_idx (same order as the file).
-fn load_shallow_sizes(index_path: &Path) -> Result<Vec<u32>> {
-    let file_len = std::fs::metadata(index_path)?.len() as usize;
-    let n = file_len / ENTRY_SIZE;
+/// Read `shallow_sizes.bin`: a compact array of `u32`, one per object.
+/// Written by pass 1 during the merge step
+fn load_shallow_sizes(path: &Path) -> Result<Vec<u32>> {
+    let file_len = std::fs::metadata(path)?.len() as usize;
+    let n = file_len / 4;
     let mut sizes = Vec::with_capacity(n);
 
     let mut reader = BufReader::with_capacity(
         IO_BUF_SIZE,
-        File::open(index_path).context("open object index")?,
+        File::open(path).context("open shallow_sizes.bin")?,
     );
-    let mut buf = [0u8; ENTRY_SIZE];
-
-    while reader.read_exact(&mut buf).is_ok() {
-        // object_index entry: object_id(8) + class_id(8) + shallow_size(4)
-        let shallow = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        sizes.push(shallow);
+    loop {
+        let consumed = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let records = buf.len() / 4;
+            for chunk in buf[..records * 4].chunks_exact(4) {
+                sizes.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            records * 4
+        };
+        reader.consume(consumed);
     }
 
     Ok(sizes)
@@ -81,87 +92,119 @@ fn load_idom(idom_path: &Path) -> Result<Vec<u32>> {
         IO_BUF_SIZE,
         File::open(idom_path).context("open idom file")?,
     );
-    let mut buf = [0u8; 4];
-    while reader.read_exact(&mut buf).is_ok() {
-        idom.push(u32::from_le_bytes(buf));
+    loop {
+        let consumed = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let records = buf.len() / 4;
+            for chunk in buf[..records * 4].chunks_exact(4) {
+                idom.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            records * 4
+        };
+        reader.consume(consumed);
     }
     Ok(idom)
 }
 
-// ── Step 3: compute retained sizes ───────────────────────────────────────────
+// ── Step 3: compute retained sizes in RPO space ─────────────────────────────
 
-/// Compute retained sizes by walking the dominator tree bottom-up.
+/// Compute retained sizes working entirely in RPO space.
 ///
-/// `retained` is indexed by node_idx (0..N for actual objects, N for vroot).
-/// Returns `(retained, unreachable_count, unreachable_shallow)`.
-fn compute_retained(
+/// Returns `(retained_rpo, total_shallow, unreachable_count, unreachable_shallow)`.
+/// `retained_rpo[rpo]` = retained size for the node at that RPO position.
+fn compute_retained_rpo(
     shallow: &[u32],     // indexed by node_idx, length N
-    idom: &[u32],        // indexed by RPO number, length = reachable node count
-    rpo_to_node: &[u32], // RPO number → node_idx (includes vroot at RPO 0)
-    node_count: u32,     // N: number of actual objects
-) -> (Vec<u64>, u64, u64) {
+    idom: &[u32],        // indexed by RPO number
+    rpo_to_node: &[u32], // RPO number → node_idx (RPO 0 = vroot)
+    node_count: u32,
+) -> (Vec<u64>, u64, u64, u64) {
     let n = node_count as usize;
+    let reachable = rpo_to_node.len();
 
-    // Initialise retained[i] = shallow_size[i] for actual objects.
-    // retained[n] (index past the last real object) is the virtual root slot.
-    let mut retained: Vec<u64> = shallow.iter().map(|&s| s as u64).collect();
-    retained.push(0u64); // slot for the virtual root
+    // Total shallow sum (all objects, including unreachable).
+    let mut total_shallow = 0u64;
+    for &s in shallow {
+        total_shallow += s as u64;
+    }
 
-    // Track which nodes were reached during the RPO traversal.
-    // Nodes not in rpo_to_node are unreachable (no idom entry).
-    let mut reachable = vec![false; n];
+    // Initialize retained_rpo from shallow sizes.
+    // RPO 0 = vroot (shallow = 0).
+    let mut retained_rpo: Vec<u64> = Vec::with_capacity(reachable);
+    retained_rpo.push(0u64);
     for &node in &rpo_to_node[1..] {
-        // rpo_to_node[0] is the virtual root; skip it (index N, not a real object)
-        let idx = node as usize;
-        if idx < n {
-            reachable[idx] = true;
-        }
+        retained_rpo.push(shallow[node as usize] as u64);
     }
 
-    // Walk RPO from the deepest node up to (but not including) the virtual root.
-    // rpo_to_node[0] = vroot; rpo_to_node[1..] = actual nodes in RPO order.
-    // Processing in reverse (highest RPO first) guarantees that when we
-    // propagate node j's retained size into idom[j], node j is fully
-    // accumulated (all nodes it dominates have already been folded in).
-    for rpo in (1..rpo_to_node.len()).rev() {
-        let node = rpo_to_node[rpo] as usize;
+    // Walk RPO in reverse (deepest → shallowest).
+    // Sequential reads: idom[rpo], retained_rpo[rpo].
+    // Single random write: retained_rpo[dom_rpo].
+    for rpo in (1..reachable).rev() {
         let dom_rpo = idom[rpo];
-
         if dom_rpo == UNDEFINED {
-            continue; // unreachable node — no dominator
+            continue;
         }
-
-        let dom_node = rpo_to_node[dom_rpo as usize] as usize;
-
-        // Safety: dom_node is either a real object (0..N-1) or the vroot (N).
-        // All are valid indices in `retained`.
-        let node_retained = retained[node];
-        retained[dom_node] += node_retained;
+        retained_rpo[dom_rpo as usize] += retained_rpo[rpo];
     }
 
-    // Count unreachable objects and sum their shallow sizes.
-    let mut unreachable_count = 0u64;
-    let mut unreachable_shallow = 0u64;
-    for i in 0..n {
-        if !reachable[i] {
-            unreachable_count += 1;
-            unreachable_shallow += shallow[i] as u64;
-        }
-    }
+    // Unreachable stats (avoids a bitmap — just subtract).
+    let reachable_count = (reachable - 1) as u64;
+    let unreachable_count = n as u64 - reachable_count;
+    let reachable_shallow: u64 = rpo_to_node[1..]
+        .iter()
+        .map(|&node| shallow[node as usize] as u64)
+        .sum();
+    let unreachable_shallow = total_shallow - reachable_shallow;
 
-    (retained, unreachable_count, unreachable_shallow)
+    (retained_rpo, total_shallow, unreachable_count, unreachable_shallow)
 }
 
-// ── Step 4: write retained sizes ─────────────────────────────────────────────
+// ── Step 4: write retained.bin (node-indexed) ────────────────────────────────
 
-fn write_retained(retained: &[u64], node_count: usize, path: &Path) -> Result<()> {
+/// Write retained.bin indexed by node_idx.
+///
+/// Builds `node_to_rpo` for the lookup.  Reachable nodes get their computed
+/// retained size; unreachable nodes get their shallow size.
+fn write_retained(
+    retained_rpo: &[u64],
+    shallow: &[u32],
+    rpo_to_node: &[u32],
+    node_count: usize,
+    path: &Path,
+) -> Result<()> {
+    let total = node_count + 1; // +1 for vroot
+    let mut node_to_rpo = vec![UNDEFINED; total];
+    for (rpo, &node) in rpo_to_node.iter().enumerate() {
+        node_to_rpo[node as usize] = rpo as u32;
+    }
+
     let mut w = BufWriter::with_capacity(
         IO_BUF_SIZE,
         File::create(path).context("create retained file")?,
     );
-    // Write only actual objects (0..N), exclude the virtual root slot at N.
-    for &r in &retained[..node_count] {
-        w.write_all(&r.to_le_bytes())?;
+
+    // Write in batches to reduce per-entry overhead.
+    // 8192 entries × 8 bytes = 64 KiB batch — fits in L1.
+    const BATCH: usize = 8192;
+    let mut buf = [0u8; BATCH * 8];
+    let mut i = 0usize;
+    while i < node_count {
+        let end = (i + BATCH).min(node_count);
+        let count = end - i;
+        for j in 0..count {
+            let node = i + j;
+            let rpo = node_to_rpo[node];
+            let r = if rpo != UNDEFINED {
+                retained_rpo[rpo as usize]
+            } else {
+                shallow[node] as u64
+            };
+            buf[j * 8..(j + 1) * 8].copy_from_slice(&r.to_le_bytes());
+        }
+        w.write_all(&buf[..count * 8])?;
+        i = end;
     }
     w.flush()?;
     Ok(())
@@ -170,28 +213,42 @@ fn write_retained(retained: &[u64], node_count: usize, path: &Path) -> Result<()
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(pass1: &Pass1Output, pass3: &Pass3Output, output_dir: &Path) -> Result<Pass4Output> {
+    let t = std::time::Instant::now();
     let n = pass3.node_count as usize;
 
-    let shallow = load_shallow_sizes(&pass1.object_index_path)?;
+    eprintln!("  loading shallow sizes...");
+    let shallow = load_shallow_sizes(&pass1.shallow_sizes_path)?;
     assert_eq!(shallow.len(), n, "shallow size count mismatch");
 
+    eprintln!("  loading idom...");
     let idom = load_idom(&pass3.idom_path)?;
 
-    let (retained, unreachable_count, unreachable_shallow) =
-        compute_retained(&shallow, &idom, &pass3.rpo_to_node, pass3.node_count);
+    eprintln!("  computing retained sizes...");
+    let (retained_rpo, _total_shallow, unreachable_count, unreachable_shallow) =
+        compute_retained_rpo(&shallow, &idom, &pass3.rpo_to_node, pass3.node_count);
 
-    // retained[N] = virtual root's retained size = total heap bytes.
-    let total_heap_bytes = retained[n];
+    let total_heap_bytes = retained_rpo[0]; // vroot retained = total reachable heap
+    drop(idom);
 
+    eprintln!("  writing retained.bin...");
     let retained_path = output_dir.join("retained.bin");
-    write_retained(&retained, n, &retained_path)?;
+    write_retained(
+        &retained_rpo,
+        &shallow,
+        &pass3.rpo_to_node,
+        n,
+        &retained_path,
+    )?;
+    drop(retained_rpo);
+    drop(shallow);
 
     eprintln!(
-        "  total heap {:.1} MiB across {} objects ({} unreachable, {:.1} MiB garbage)",
+        "  total heap {:.1} MiB across {} objects ({} unreachable, {:.1} MiB garbage)  [{:.1}s]",
         total_heap_bytes as f64 / 1_048_576.0,
         n,
         unreachable_count,
         unreachable_shallow as f64 / 1_048_576.0,
+        t.elapsed().as_secs_f64(),
     );
 
     Ok(Pass4Output {

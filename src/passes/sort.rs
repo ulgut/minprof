@@ -69,9 +69,14 @@ impl<const N: usize> RecordSorter<N> {
             IO_BUF_SIZE,
             File::create(&path).context("create sort chunk")?,
         );
-        for rec in &self.current {
-            w.write_all(rec)?;
-        }
+        // Write the entire sort buffer as one contiguous byte slice.
+        // Safety: [u8; N] is a plain byte array with alignment 1 and no interior
+        // padding.  Vec<[u8; N]> stores records back-to-back, so the backing
+        // allocation is a valid &[u8] of exactly len * N bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.current.as_ptr().cast::<u8>(), self.current.len() * N)
+        };
+        w.write_all(bytes)?;
         self.current.clear();
         w.flush()?;
         self.chunk_paths.push(path);
@@ -98,9 +103,13 @@ impl<const N: usize> RecordSorter<N> {
                 IO_BUF_SIZE,
                 File::create(output_path).context("create sort output")?,
             );
-            for rec in &self.current {
-                w.write_all(rec)?;
-            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.current.as_ptr().cast::<u8>(),
+                    self.current.len() * N,
+                )
+            };
+            w.write_all(bytes)?;
             w.flush()?;
             return Ok(count);
         }

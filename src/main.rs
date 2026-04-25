@@ -169,6 +169,7 @@ fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
         roots: load_roots(&dir.join("roots.bin"))?,
         object_count,
         object_index_path,
+        shallow_sizes_path: dir.join("shallow_sizes.bin"),
     };
 
     let edges_path = dir.join("edges.bin");

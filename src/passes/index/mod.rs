@@ -107,6 +107,9 @@ pub struct Pass1Output {
     pub object_count: u64,
     /// Path to the sorted object index file on disk.
     pub object_index_path: PathBuf,
+    /// Path to compact shallow sizes file: one `u32` per object, same order
+    /// as `object_index.bin`.
+    pub shallow_sizes_path: PathBuf,
 }
 
 // ── External sorter ──────────────────────────────────────────────────────────
@@ -197,9 +200,12 @@ impl ExternalSorter {
                     IO_BUF_SIZE,
                     File::create(&path_clone).context("create sort chunk")?,
                 );
-                for entry in &buf {
-                    w.write_all(entry)?;
-                }
+                // Bulk write: one write_all for the whole buffer.
+                // Safety: RawEntry = [u8; ENTRY_SIZE] — plain bytes, alignment 1, no padding.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * ENTRY_SIZE)
+                };
+                w.write_all(bytes)?;
                 w.flush()?;
                 eprintln!("  chunk {} written", chunk_idx + 1);
                 Ok(path_clone)
@@ -213,9 +219,9 @@ impl ExternalSorter {
     /// `fixup` to every entry as it is written.
     ///
     /// Returns the total number of entries written.
-    fn finish<F>(mut self, output_path: &Path, fixup: F) -> Result<u64>
+    fn finish<F>(mut self, output_path: &Path, mut fixup: F) -> Result<u64>
     where
-        F: Fn(&mut RawEntry),
+        F: FnMut(&mut RawEntry),
     {
         // Collect any in-flight background flush first.
         self.collect_pending()?;
@@ -256,7 +262,7 @@ impl ExternalSorter {
             }
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  merging {} chunks…", n);
-                merge_chunks_with_fixup(&chunks, output_path, &fixup)?;
+                merge_chunks_with_fixup(&chunks, output_path, fixup)?;
                 for p in &chunks {
                     let _ = std::fs::remove_file(p);
                 }
@@ -288,7 +294,7 @@ impl ExternalSorter {
                     "  final merge of {} intermediate files…",
                     intermediates.len()
                 );
-                merge_chunks_with_fixup(&intermediates, output_path, &fixup)?;
+                merge_chunks_with_fixup(&intermediates, output_path, fixup)?;
                 for p in &intermediates {
                     let _ = std::fs::remove_file(p);
                 }
@@ -317,9 +323,9 @@ impl Drop for ExternalSorter {
 
 /// K-way merge of sorted chunk files into a single sorted output file.
 /// `fixup` is called on each entry immediately before it is written.
-fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, fixup: F) -> Result<()>
+fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, mut fixup: F) -> Result<()>
 where
-    F: Fn(&mut RawEntry),
+    F: FnMut(&mut RawEntry),
 {
     let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
     let mut readers: Vec<BufReader<File>> = chunk_paths
@@ -855,12 +861,19 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
         }
     }
 
-    // Write sorted object index.
+    // Write sorted object index + compact shallow_sizes.bin.
     //
     // The fixup closure patches shallow_size for InstanceDump entries:
     // `data_size` (raw field bytes, no header) is corrected to
     // `ClassDump.instance_size` (which includes the JVM object header).
+    // It also writes each entry's shallow_size to a compact sidecar file,
+    // saving pass 4 from re-reading the object index.
     let index_path = output_dir.join("object_index.bin");
+    let shallow_sizes_path = output_dir.join("shallow_sizes.bin");
+    let mut shallow_w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&shallow_sizes_path).context("create shallow_sizes.bin")?,
+    );
     let object_count = sorter.finish(&index_path, |entry| {
         let (_, class_id, _) = decode_entry(entry);
         if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
@@ -868,7 +881,10 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
                 entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
             }
         }
+        // Write the (possibly patched) shallow size to the sidecar file.
+        shallow_w.write_all(&entry[16..20]).expect("write shallow_sizes.bin");
     })?;
+    shallow_w.flush().context("flush shallow_sizes.bin")?;
 
     // Write roots (de-duplicated).
     let roots_path = output_dir.join("roots.bin");
@@ -899,5 +915,6 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
         roots,
         object_count,
         object_index_path: index_path,
+        shallow_sizes_path,
     })
 }

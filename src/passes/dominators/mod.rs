@@ -1,8 +1,15 @@
 //! Pass 3 — dominator tree computation.
 //!
-//! Uses the Lengauer-Tarjan (LT) algorithm, which computes dominators in a
-//! single DFS pass plus amortised-near-linear work via LINK-EVAL path
-//! compression — O(E α(E,V)) vs the iterative CHK alternative.
+//! Uses the Semi-NCA algorithm (Georgiadis, 2005) to compute immediate
+//! dominators in O(E · α(N)) time.
+//!
+//! # Phases
+//!
+//!   Phase 1 — Semidominator computation via EVAL/LINK with iterative path
+//!   compression.  Streams predecessor edges from `pred_sorted.bin`.
+//!
+//!   Phase 2 — Immediate dominator computation via a single forward NCA walk
+//!   in DFS preorder.
 //!
 //! # Node numbering
 //!
@@ -10,17 +17,13 @@
 //! position in the sorted `object_index.bin`. A virtual root gets index N;
 //! it has edges to all GC roots and dominates every node.
 //!
-//! # RPO indexing
-//!
-//! LT uses DFS pre-numbering; the DFS spanning tree is identical to what a
-//! post-order DFS reversed (RPO) would produce.  Lower RPO number = higher
-//! in the dominator tree (virtual root = RPO 0).
+//! # Output indexing
 //!
 //! `idom[j]` is indexed by RPO number and stores the RPO number of `j`'s
 //! immediate dominator. Unreachable nodes get `UNDEFINED`.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -34,47 +37,29 @@ use crate::passes::IO_BUF_SIZE;
 
 const UNDEFINED: u32 = u32::MAX;
 
-// Intermediate record sizes:
-//   PARTIAL_SIZE: (key_id: u64, idx: u32)  — first sort pass result
-//   INDEXED_SIZE: (idx_a: u32, idx_b: u32) — second sort pass result / CSR input
 const PARTIAL_SIZE: usize = 12;
 const INDEXED_SIZE: usize = 8;
+const PRED_EDGE_SIZE: usize = 8;
 
 // ── Output ────────────────────────────────────────────────────────────────────
 
 pub struct Pass3Output {
-    /// Path to idom file: `u32` array indexed by RPO number, each value is
-    /// the RPO number of the immediate dominator. `UNDEFINED` for unreachable.
     pub idom_path: PathBuf,
-    /// RPO number → node index (position in object_index.bin).
     pub rpo_to_node: Vec<u32>,
-    /// N: number of actual object nodes.
     pub node_count: u32,
 }
 
 // ── CSR (Compressed Sparse Row) adjacency list ────────────────────────────────
 
 struct Csr {
-    /// offsets[i]..offsets[i+1] is the range of `neighbors` for node i.
-    /// u32 suffices because practical heap dumps have far fewer than u32::MAX edges.
     offsets: Vec<u32>,
     neighbors: Vec<u32>,
-}
-
-impl Csr {
-    fn neighbors(&self, node: u32) -> &[u32] {
-        let start = self.offsets[node as usize] as usize;
-        let end = self.offsets[node as usize + 1] as usize;
-        &self.neighbors[start..end]
-    }
 }
 
 // ── Step 1: load object IDs ───────────────────────────────────────────────────
 
 use crate::passes::index::load_object_ids;
 
-/// Binary search: object_id → node index (position in sorted `ids`).
-/// Returns `None` if the object_id is not in the index (malformed dump).
 fn lookup_node(ids: &[u64], object_id: u64) -> Option<u32> {
     ids.binary_search(&object_id).ok().map(|i| i as u32)
 }
@@ -91,33 +76,8 @@ fn load_root_nodes(roots: &[u64], ids: &[u64]) -> Vec<u32> {
     root_nodes
 }
 
-// ── Step 3: build forward and reverse CSR from edge files ────────────────────
-//
-// Strategy: eliminate all binary searches by resolving object IDs to node
-// indices via merge-scan (possible because each edge file is sorted by its
-// first field).  Since a single scan can only handle one sorted field at a
-// time, we use a two-sort pipeline for each CSR:
-//
-//   Forward CSR  (edges.bin sorted by from_id):
-//     A. Scan edges.bin, merge-scan from_id → from_idx,
-//        write (to_id: u64, from_idx: u32) → sort by to_id
-//     B. Scan sorted partial, merge-scan to_id → to_idx,
-//        write (from_idx: u32, to_idx: u32) → sort by from_idx
-//     C. Build CSR from sorted (from_idx, to_idx) — pure streaming, no lookup
-//
-//   Reverse CSR  (reverse_edges.bin sorted by to_id):
-//     A. Scan reverse_edges.bin, merge-scan to_id → to_idx,
-//        write (from_id: u64, to_idx: u32) → sort by from_id
-//     B. Scan sorted partial, merge-scan from_id → from_idx,
-//        write (to_idx: u32, from_idx: u32) → sort by to_idx
-//     C. Build CSR from sorted (to_idx, from_idx), then append vroot edges
-//
-// This turns O(E · log N) random DRAM latency into O(E) streaming I/O
-// plus two external sorts per CSR.
+// ── Step 3: build forward CSR from edge files ────────────────────────────────
 
-/// Produce the on-disk indexed files for both CSRs while `ids` is loaded,
-/// then drop `ids` before the caller materialises any CSR.
-/// Returns paths to the two indexed files (sorted by node index).
 fn prepare_indexed_files(
     edges_path: &Path,
     rev_edges_path: &Path,
@@ -129,11 +89,9 @@ fn prepare_indexed_files(
     let fwd_indexed = resolve_forward_indexed(edges_path, &ids, output_dir)?;
     let rev_indexed =
         resolve_reverse_indexed(rev_edges_path, &ids, root_nodes, vroot, output_dir)?;
-    drop(ids); // free object index before any CSR is allocated
+    drop(ids);
     Ok((fwd_indexed, rev_indexed))
 }
-
-// ── 3a: produce fwd_indexed.bin sorted by (from_idx, to_idx) ─────────────────
 
 fn key_partial(rec: &[u8; PARTIAL_SIZE]) -> (u64, u64) {
     let key = u64::from_le_bytes(rec[0..8].try_into().unwrap());
@@ -147,13 +105,7 @@ fn key_indexed(rec: &[u8; INDEXED_SIZE]) -> (u64, u64) {
     (a, b)
 }
 
-/// edges.bin (sorted by from_id) → fwd_indexed.bin (sorted by from_idx, to_idx).
-///
-/// Two sort passes:
-///   1. Resolve from_id via merge-scan → write (to_id, from_idx), sort by to_id.
-///   2. Resolve to_id via merge-scan → write (from_idx, to_idx), sort by from_idx.
 fn resolve_forward_indexed(edges_path: &Path, ids: &[u64], output_dir: &Path) -> Result<PathBuf> {
-    // ── Pass A: merge-scan from_id → from_idx; collect (to_id, from_idx) ─────
     let partial_path = output_dir.join("fwd_partial_sorted.bin");
     {
         let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
@@ -184,7 +136,6 @@ fn resolve_forward_indexed(edges_path: &Path, ids: &[u64], output_dir: &Path) ->
     }
     eprintln!("  [fwd] partial resolve done");
 
-    // ── Pass B: merge-scan to_id → to_idx; collect (from_idx, to_idx) ───────
     let indexed_path = output_dir.join("fwd_indexed_sorted.bin");
     {
         let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
@@ -221,15 +172,6 @@ fn resolve_forward_indexed(edges_path: &Path, ids: &[u64], output_dir: &Path) ->
     Ok(indexed_path)
 }
 
-// ── 3b: produce rev_indexed.bin sorted by (to_idx, from_idx) ─────────────────
-
-/// reverse_edges.bin (sorted by to_id) → rev_indexed.bin (sorted by to_idx, from_idx).
-/// Also appends virtual-root edges: for each GC root r, predecessor = vroot.
-///
-/// Two sort passes:
-///   1. Resolve to_id via merge-scan → write (from_id, to_idx), sort by from_id.
-///   2. Resolve from_id via merge-scan → write (to_idx, from_idx), sort by to_idx.
-///   3. Append virtual-root entries (r, vroot) for each root_node r.
 fn resolve_reverse_indexed(
     rev_edges_path: &Path,
     ids: &[u64],
@@ -237,7 +179,6 @@ fn resolve_reverse_indexed(
     vroot: u32,
     output_dir: &Path,
 ) -> Result<PathBuf> {
-    // ── Pass A: merge-scan to_id → to_idx; collect (from_id, to_idx) ────────
     let partial_path = output_dir.join("rev_partial_sorted.bin");
     {
         let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
@@ -252,7 +193,6 @@ fn resolve_reverse_indexed(
         let mut buf = [0u8; EDGE_SIZE];
         let mut scan = 0usize;
         while reader.read_exact(&mut buf).is_ok() {
-            // reverse_edges.bin layout: (to_id, from_id)
             let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
             let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
             while scan < ids.len() && ids[scan] < to_id {
@@ -271,7 +211,6 @@ fn resolve_reverse_indexed(
     }
     eprintln!("  [rev] partial resolve done");
 
-    // ── Pass B: merge-scan from_id → from_idx; collect (to_idx, from_idx) ───
     let indexed_path = output_dir.join("rev_indexed_sorted.bin");
     {
         let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
@@ -300,8 +239,6 @@ fn resolve_reverse_indexed(
             rec[4..8].copy_from_slice(&from_idx.to_le_bytes());
             sorter.push(rec)?;
         }
-        // Append virtual-root edges: for each GC root r, its predecessor is vroot.
-        // These are (to_idx=r, from_idx=vroot) entries.
         for &r in root_nodes {
             let mut rec = [0u8; INDEXED_SIZE];
             rec[0..4].copy_from_slice(&r.to_le_bytes());
@@ -316,18 +253,9 @@ fn resolve_reverse_indexed(
     Ok(indexed_path)
 }
 
-// ── 3c: build a CSR from a sorted (node_a: u32, node_b: u32) file ────────────
-
-/// Build a CSR from a file of `(node_a: u32, node_b: u32)` pairs sorted by
-/// `node_a`. `total_nodes` is the number of distinct source nodes (= size of
-/// the `offsets` array minus one).
-///
-/// Because the input is sorted, the fill pass writes `neighbors` purely
-/// sequentially — no cursor array, no random writes.
-fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize, _extra_nodes: usize) -> Result<Csr> {
+fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr> {
     let mut offsets = vec![0u32; total_nodes + 1];
 
-    // Count pass: tally out-degree per source node.
     {
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
@@ -342,14 +270,14 @@ fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize, _extra_nodes:
         }
     }
     for i in 1..=total_nodes {
-        offsets[i] = offsets[i].checked_add(offsets[i - 1])
-            .expect("edge count overflows u32; file has more than u32::MAX edges");
+        offsets[i] = offsets[i]
+            .checked_add(offsets[i - 1])
+            .expect("edge count overflows u32");
     }
 
     let edge_count = offsets[total_nodes] as usize;
     let mut neighbors = vec![0u32; edge_count];
 
-    // Fill pass: data is sorted by node_a → writes to neighbors are sequential.
     {
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
@@ -370,324 +298,347 @@ fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize, _extra_nodes:
     Ok(Csr { offsets, neighbors })
 }
 
-// ── Step 4: DFS for RPO numbering + DFS-tree parent recording ────────────────
+// ── Step 4: DFS — output written to disk ─────────────────────────────────────
 
-/// Compute reverse post-order (RPO) via iterative DFS from the virtual root,
-/// and simultaneously record the DFS-tree parent and DFS preorder (discovery
-/// order) of every reachable node.
-///
-/// Returns `(node_to_rpo, rpo_to_node, parent_node, node_to_pre, pre_to_node)`:
-/// - `node_to_rpo[i]`  = RPO number of node i (`UNDEFINED` if unreachable)
-/// - `rpo_to_node[j]`  = node index at RPO position j
-/// - `parent_node[i]`  = node index of i's parent in the DFS spanning tree
-///                       (`UNDEFINED` for the virtual root and unreachable nodes)
-/// - `node_to_pre[i]`  = DFS preorder (discovery order) number of node i
-/// - `pre_to_node[p]`  = node index at preorder position p
-///
-/// RPO and preorder are both topological orderings of the DFS spanning tree
-/// (parent always has lower number than children), but they differ for nodes
-/// in different subtrees.  The LT algorithm's ancestor check (`dfnum(v) <
-/// dfnum(w)`) requires preorder numbers, not RPO.  RPO is used for the
-/// external interface (`idom.bin` is RPO-indexed) and for ordering the main
-/// LT loop (reverse RPO ensures all descendants are processed before a node).
-///
-/// The explicit DFS stack stores `(node: u32, cursor: u32)` — 8 bytes per
-/// frame.  Stack depth equals the longest DFS path (typically thousands of
-/// entries for real Java heaps), keeping peak RSS well below the forward-CSR
-/// footprint that dominates during this phase.
-fn compute_dfs(
+/// DFS output paths + reachable count.
+struct DfsDiskOutput {
+    pre_to_node_path: PathBuf,
+    post_order_path: PathBuf,
+    parent_pre_path: PathBuf, // parent_pre[child_pre] = parent's preorder number
+    reachable: usize,         // includes vroot
+}
+
+/// Run DFS, writing all output to disk via BufWriter.
+fn compute_dfs_to_disk(
     n: u32,
     vroot: u32,
     root_nodes: &[u32],
     forward: &Csr,
-) -> (Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>) {
-    let total = (n + 1) as usize; // actual nodes + virtual root
+    output_dir: &Path,
+) -> Result<DfsDiskOutput> {
+    let total = (n + 1) as usize;
 
-    // Packed-bit visited set: 8× smaller than Vec<bool>.
+    let pre_path = output_dir.join("dfs_pre_to_node.bin");
+    let post_path = output_dir.join("dfs_post_order.bin");
+    let parent_path = output_dir.join("dfs_parent_pre.bin");
+
+    let mut pre_w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&pre_path).context("create pre_to_node")?,
+    );
+    let mut post_w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&post_path).context("create post_order")?,
+    );
+    let mut parent_w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&parent_path).context("create parent_pre")?,
+    );
+
+    // Packed-bit visited set: 62 MB for 500M nodes — fits in L3 cache.
     let mut visited: Vec<u64> = vec![0u64; (total + 63) / 64];
-    let mut stack: Vec<(u32, u32)> = Vec::new();
-    let mut post_order: Vec<u32> = Vec::with_capacity(total);
-    // parent_node[v] = DFS-tree parent of v (UNDEFINED for vroot / unreachable).
-    let mut parent_node = vec![UNDEFINED; total];
-    // Preorder (discovery order): assigned when a node is first pushed.
-    let mut node_to_pre = vec![UNDEFINED; total];
-    let mut pre_to_node: Vec<u32> = Vec::with_capacity(total);
+
+    // Stack frame: (node, edge_pos, edge_end, preorder_number).
+    // 16 bytes per frame.  Max depth ≈ graph diameter.
+    let mut stack: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut pre_counter: u32 = 0;
 
     macro_rules! visit_set {
-        ($i:expr) => { visited[$i / 64] |= 1u64 << ($i % 64) };
+        ($i:expr) => {
+            visited[$i / 64] |= 1u64 << ($i % 64)
+        };
     }
     macro_rules! visit_get {
-        ($i:expr) => { (visited[$i / 64] >> ($i % 64)) & 1 != 0 };
+        ($i:expr) => {
+            (visited[$i / 64] >> ($i % 64)) & 1 != 0
+        };
     }
 
-    // Assign preorder on first discovery (push).
-    let assign_pre = |node: u32, node_to_pre: &mut Vec<u32>, pre_to_node: &mut Vec<u32>| {
-        node_to_pre[node as usize] = pre_to_node.len() as u32;
-        pre_to_node.push(node);
-    };
-
+    // Push vroot.
     visit_set!(vroot as usize);
-    assign_pre(vroot, &mut node_to_pre, &mut pre_to_node);
-    stack.push((vroot, 0));
+    pre_w.write_all(&vroot.to_le_bytes())?;
+    parent_w.write_all(&UNDEFINED.to_le_bytes())?; // vroot has no parent
+    let vroot_pre = pre_counter;
+    pre_counter += 1;
+    stack.push((vroot, 0, root_nodes.len() as u32, vroot_pre));
 
-    while !stack.is_empty() {
-        let &(node, cursor) = stack.last().unwrap();
-        let neighbors: &[u32] = if node == vroot {
-            root_nodes
-        } else {
-            forward.neighbors(node)
-        };
+    let mut nodes_visited = 0u64;
+    while let Some(&(node, pos, end, _pre)) = stack.last() {
+        if pos < end {
+            let child = if node == vroot {
+                root_nodes[pos as usize]
+            } else {
+                forward.neighbors[pos as usize]
+            };
+            stack.last_mut().unwrap().1 = pos + 1;
 
-        if (cursor as usize) < neighbors.len() {
-            let child = neighbors[cursor as usize];
-            stack.last_mut().unwrap().1 += 1;
             if !visit_get!(child as usize) {
                 visit_set!(child as usize);
-                parent_node[child as usize] = node; // record DFS-tree parent
-                assign_pre(child, &mut node_to_pre, &mut pre_to_node);
-                stack.push((child, 0));
+
+                // Record preorder: write child node + parent's preorder.
+                pre_w.write_all(&child.to_le_bytes())?;
+                let parent_pre_num = stack.last().unwrap().3;
+                parent_w.write_all(&parent_pre_num.to_le_bytes())?;
+
+                let child_pre = pre_counter;
+                pre_counter += 1;
+
+                let child_start = forward.offsets[child as usize];
+                let child_end = forward.offsets[child as usize + 1];
+                stack.push((child, child_start, child_end, child_pre));
+
+                nodes_visited += 1;
+                if nodes_visited % 10_000_000 == 0 {
+                    eprint!("\r    {nodes_visited} nodes visited...");
+                }
             }
         } else {
-            stack.pop();
-            post_order.push(node);
+            let (popped_node, _, _, _) = stack.pop().unwrap();
+            post_w.write_all(&popped_node.to_le_bytes())?;
         }
     }
-
-    post_order.reverse(); // RPO = reversed post-order
-
-    drop(visited);
-    drop(stack);
-
-    let mut node_to_rpo = vec![UNDEFINED; total];
-    for (rpo, &node) in post_order.iter().enumerate() {
-        node_to_rpo[node as usize] = rpo as u32;
+    if nodes_visited >= 10_000_000 {
+        eprint!("\r                                        \r");
     }
 
-    (node_to_rpo, post_order, parent_node, node_to_pre, pre_to_node)
+    pre_w.flush()?;
+    post_w.flush()?;
+    parent_w.flush()?;
+
+    let reachable = pre_counter as usize;
+
+    Ok(DfsDiskOutput {
+        pre_to_node_path: pre_path,
+        post_order_path: post_path,
+        parent_pre_path: parent_path,
+        reachable,
+    })
 }
 
-// ── Step 5: Lengauer-Tarjan dominator algorithm ────────────────────────────────
-//
-// Reference: Lengauer & Tarjan, "A fast algorithm for finding dominators in a
-// flowgraph", TOPLAS 1979.  This is the "simple" (path-compressed) variant:
-// O(E log V) worst-case, O(E α(E,V)) in practice.
-//
-// Key structures (all indexed by node index, size = n+1):
-//   semi[v]      – DFS number of v's semidominator (initialised to dfnum[v])
-//   idom_node[v] – immediate dominator of v, stored as a node index
-//   ancestor[v]  – LINK-EVAL forest link (UNDEFINED = forest root)
-//   label[v]     – node with min semi[] on the compressed path from v upward
-//   bucket[v]    – nodes whose semidominator resolves to v
+// ── Step 5: disk array helpers ───────────────────────────────────────────────
 
-/// EVAL: return the non-root vertex with minimum `semi` on the path from `v`
-/// to the root of its tree in the LINK-EVAL forest.  Returns `v` itself when
-/// `v` is a forest root.
-fn lt_eval(ancestor: &mut [u32], label: &mut [u32], semi: &[u32], v: u32) -> u32 {
-    if ancestor[v as usize] == UNDEFINED {
-        return v;
-    }
-    lt_compress(ancestor, label, semi, v);
-    label[v as usize]
+fn write_u32_vec(data: &[u32], path: &Path) -> Result<()> {
+    let mut w = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(path).context("create array file")?,
+    );
+    let bytes =
+        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+    w.write_all(bytes)?;
+    w.flush()?;
+    Ok(())
 }
 
-/// COMPRESS: iterative path compression for the LINK-EVAL forest.
-///
-/// Collect the path from `v` upward until we reach a node whose parent is a
-/// forest root (i.e. `ancestor[ancestor[cur]] == UNDEFINED`).  Then process
-/// the path from the top downward, updating `label` and collapsing `ancestor`
-/// pointers so that future EVAL calls skip intermediate nodes in O(α) time.
-fn lt_compress(ancestor: &mut [u32], label: &mut [u32], semi: &[u32], v: u32) {
-    // Collect path: stop when cur's grandparent is a forest root.
-    let mut path = vec![v];
-    let mut cur = v;
+fn read_u32_vec(path: &Path) -> Result<Vec<u32>> {
+    let file_len = std::fs::metadata(path)?.len() as usize;
+    let count = file_len / 4;
+    let mut data = Vec::with_capacity(count);
+    let mut reader =
+        BufReader::with_capacity(IO_BUF_SIZE, File::open(path).context("open array file")?);
     loop {
-        let a = ancestor[cur as usize];
-        if a == UNDEFINED {
-            break; // cur is itself a root (safety guard; shouldn't occur in practice)
-        }
-        if ancestor[a as usize] == UNDEFINED {
-            break; // cur's parent is a root — the recursive base case is a no-op here
-        }
-        cur = a;
-        path.push(cur);
+        let consumed = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let records = buf.len() / 4;
+            for chunk in buf[..records * 4].chunks_exact(4) {
+                data.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            records * 4
+        };
+        reader.consume(consumed);
     }
-    // Process from the second-to-last element down to path[0] = v.
-    // (The last element's compress is a no-op per the recursive definition.)
-    for i in (0..path.len().saturating_sub(1)).rev() {
-        let w = path[i];
+    Ok(data)
+}
+
+// ── Step 6: sort predecessor edges by target DFS preorder (descending) ──────
+
+fn key_pred_desc(rec: &[u8; PRED_EDGE_SIZE]) -> (u64, u64) {
+    let to_pre = u32::from_le_bytes(rec[0..4].try_into().unwrap());
+    let from_pre = u32::from_le_bytes(rec[4..8].try_into().unwrap());
+    ((!to_pre) as u64, from_pre as u64)
+}
+
+fn sort_pred_edges(
+    rev_indexed_path: &Path,
+    node_to_pre: &[u32],
+    output_dir: &Path,
+) -> Result<PathBuf> {
+    let pred_path = output_dir.join("pred_sorted.bin");
+    let mut sorter = RecordSorter::<PRED_EDGE_SIZE>::new(
+        output_dir.to_path_buf(),
+        "pred",
+        key_pred_desc,
+    );
+
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(rev_indexed_path).context("open rev indexed for pred sort")?,
+    );
+    let mut buf = [0u8; INDEXED_SIZE];
+    let mut edge_count = 0u64;
+    while reader.read_exact(&mut buf).is_ok() {
+        let to_node = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let from_node = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let to_pre = node_to_pre[to_node as usize];
+        let from_pre = node_to_pre[from_node as usize];
+        if to_pre == UNDEFINED || from_pre == UNDEFINED {
+            continue;
+        }
+        let mut rec = [0u8; PRED_EDGE_SIZE];
+        rec[0..4].copy_from_slice(&to_pre.to_le_bytes());
+        rec[4..8].copy_from_slice(&from_pre.to_le_bytes());
+        sorter.push(rec)?;
+        edge_count += 1;
+    }
+    sorter.finish(&pred_path)?;
+    eprintln!("    {} predecessor edges sorted", edge_count);
+    Ok(pred_path)
+}
+
+// ── Step 7: Semi-NCA Phase 1 — semidominator via EVAL/LINK ──────────────────
+
+fn snca_compress(
+    semi: &[u32],
+    ancestor: &mut [u32],
+    label: &mut [u32],
+    stack: &mut Vec<u32>,
+    v: u32,
+) {
+    stack.clear();
+    let mut u = v;
+    while ancestor[u as usize] != UNDEFINED
+        && ancestor[ancestor[u as usize] as usize] != UNDEFINED
+    {
+        stack.push(u);
+        u = ancestor[u as usize];
+    }
+
+    while let Some(w) = stack.pop() {
         let anc = ancestor[w as usize];
         if semi[label[anc as usize] as usize] < semi[label[w as usize] as usize] {
             label[w as usize] = label[anc as usize];
         }
-        // Path compression: point w directly to anc's (already-updated) parent.
         ancestor[w as usize] = ancestor[anc as usize];
     }
 }
 
-/// Compute the immediate dominator for every reachable node using
-/// Lengauer-Tarjan.  One forward pass (step 2) in reverse DFS order plus one
-/// correction pass (step 3) in forward DFS order — no iteration to convergence.
-///
-/// **Preorder vs RPO**: The LT ancestor check `dfnum(v) < dfnum(w)` is only
-/// sound with DFS *preorder* (discovery-order) numbers.  RPO (post-order
-/// reversed) can rank a sibling subtree explored later as "lower" than nodes
-/// in an earlier subtree, incorrectly treating it as an ancestor.  We use
-/// preorder for `semi[]` and the ancestor test, but keep reverse-RPO as the
-/// main loop ordering (reverse-RPO still ensures all descendants are processed
-/// before ancestors).  RPO is used only for the external output (`idom.bin`).
-///
-/// Returns `idom_rpo` indexed by RPO number; each value is the RPO number of
-/// the immediate dominator. Virtual root (RPO 0) maps to itself.
-fn compute_dominators_lt(
-    rpo_to_node: &[u32],
-    node_to_rpo: &[u32],
-    parent_node: &[u32],
-    node_to_pre: &[u32],   // DFS preorder number per node
-    pre_to_node: &[u32],   // node at preorder position p
-    reverse: &Csr,
-    n: u32,
-) -> Vec<u32> {
-    let rpo_count = rpo_to_node.len();
-    let total = (n + 1) as usize;
-
-    // semi[v] = DFS *preorder* number of v's semidominator; initialised to pre[v].
-    // Using preorder ensures that `pre[v] < pre[w]` iff v is a proper DFS ancestor of w,
-    // which is required by the LT semidominator computation in step 2a.
-    let mut semi = node_to_pre.to_vec();
-
-    // idom_node[v] = immediate dominator of v as a node index.
-    let mut idom_node = vec![UNDEFINED; total];
-
-    // LINK-EVAL forest.
-    let mut ancestor = vec![UNDEFINED; total];
-    let mut label: Vec<u32> = (0..total as u32).collect(); // label[v] = v initially
-
-    // Bucket implemented as two intrusive linked lists sharing the same node-index
-    // space.  Using `Vec<Vec<u32>>` would allocate O(N) heap objects (24 bytes each
-    // even when empty), which is prohibitive at hundreds of millions of nodes.
-    //
-    // `bucket_head[v]`  = head of the singly-linked list for bucket(v), or UNDEFINED.
-    // `bucket_next[v]`  = next node in the same bucket list as v, or UNDEFINED.
-    //
-    // Total overhead: 2 × u32 per node = 8 bytes/node instead of 24 bytes/node.
-    let mut bucket_head = vec![UNDEFINED; total];
-    let mut bucket_next = vec![UNDEFINED; total];
-
-    let pre_count = pre_to_node.len(); // number of reachable nodes (including vroot)
-
-    // ── Step 2: reverse DFS *preorder* (skip vroot at preorder 0) ────────────
-    //
-    // The loop must process vertices in reverse preorder (not reverse RPO).
-    // The key invariant: when processing w (preorder p_w), all vertices v with
-    // preorder(v) > p_w have already been LINKed into the LINK-EVAL forest.
-    // This ensures EVAL(v) correctly reflects v's minimum-semi ancestor for
-    // non-ancestor predecessors of w.
-    //
-    // Reverse RPO violates this: a non-ancestor v in a "later-explored" sibling
-    // subtree has preorder(v) > preorder(w) but can have RPO(v) < RPO(w),
-    // causing it to be LINKed AFTER w is processed and making EVAL(v) stale.
-    for pre_w_idx in (1..pre_count).rev() {
-        let w = pre_to_node[pre_w_idx] as usize;
-        let p_w = parent_node[w];
-        let pre_w = pre_w_idx as u32; // = node_to_pre[w]
-
-        // Step 2a: semidominator of w.
-        for &v in reverse.neighbors(w as u32) {
-            let pre_v = node_to_pre[v as usize];
-            if pre_v == UNDEFINED {
-                continue; // unreachable predecessor — ignore
-            }
-            // Ancestor check uses DFS *preorder*: if pre(v) < pre(w), v was
-            // discovered before w in the DFS, making v a proper DFS ancestor of w
-            // (in directed DFS, discovering v before w via the edge v→w implies
-            // ancestry).  For non-ancestors (pre_v > pre_w), the semidominator
-            // candidate comes from EVAL — the min-semi vertex on the path above v
-            // in the LINK-EVAL forest.
-            //
-            // Note: we deliberately do NOT use RPO here.  Lower RPO only means
-            // "finishes later", and a node in a sibling subtree explored after w
-            // can have lower RPO than w yet still not be a DFS ancestor.
-            let u = if pre_v < pre_w {
-                v
-            } else {
-                lt_eval(&mut ancestor, &mut label, &semi, v)
-            };
-            if semi[u as usize] < semi[w] {
-                semi[w] = semi[u as usize];
-            }
-        }
-
-        // Step 2b: w's semidominator resolves at pre_to_node[semi[w]]; enqueue w.
-        // semi[w] is now a preorder number; pre_to_node maps it back to a node index.
-        let semi_node = pre_to_node[semi[w] as usize] as usize;
-        bucket_next[w] = bucket_head[semi_node];
-        bucket_head[semi_node] = w as u32;
-
-        // Step 2c: LINK(parent[w], w) — add w to the forest under its parent.
-        if p_w != UNDEFINED {
-            ancestor[w] = p_w;
-        }
-
-        // Step 2d: process all nodes in bucket[parent[w]] and clear it.
-        if p_w != UNDEFINED {
-            let p = p_w as usize;
-            let mut cur = bucket_head[p];
-            bucket_head[p] = UNDEFINED;
-            while cur != UNDEFINED {
-                let v = cur as usize;
-                cur = bucket_next[v];
-                bucket_next[v] = UNDEFINED;
-                let u = lt_eval(&mut ancestor, &mut label, &semi, v as u32) as usize;
-                // If semi[u] < semi[v], idom[v] will be refined in step 3.
-                idom_node[v] = if semi[u] < semi[v] { u as u32 } else { p as u32 };
-            }
-        }
+#[inline(always)]
+fn snca_eval(
+    semi: &[u32],
+    ancestor: &mut [u32],
+    label: &mut [u32],
+    stack: &mut Vec<u32>,
+    v: u32,
+) -> u32 {
+    if ancestor[v as usize] == UNDEFINED {
+        v
+    } else {
+        snca_compress(semi, ancestor, label, stack, v);
+        label[v as usize]
     }
-
-    // ── Step 3: correction pass in forward DFS order ─────────────────────────
-    //
-    // The virtual root (index n) is the DFS tree root.  Its idom_node was
-    // never set in step 2 (the main loop skips RPO 0).  Seed it with itself
-    // so that any chain reaching vroot in step 3 terminates correctly instead
-    // of propagating UNDEFINED.
-    idom_node[n as usize] = n;
-
-    // Forward preorder ensures parents are processed before children, so that
-    // when we follow idom[d] for the tentative idom d, idom[d] is already final.
-    for pre_w_idx in 1..pre_count {
-        let w = pre_to_node[pre_w_idx] as usize;
-        // semi[w] is a preorder number; use pre_to_node to get the semidominator node.
-        let semi_node = pre_to_node[semi[w] as usize] as usize;
-        let d = idom_node[w];
-        if d != UNDEFINED && d as usize != semi_node {
-            // idom[w] was set tentatively; resolve it one hop further.
-            idom_node[w] = idom_node[d as usize];
-        }
-    }
-
-    // ── Convert: node-indexed idom → RPO-indexed idom ────────────────────────
-    let mut idom_rpo = vec![UNDEFINED; rpo_count];
-    idom_rpo[0] = 0; // virtual root dominates itself
-
-    for rpo_w in 1..rpo_count {
-        let w = rpo_to_node[rpo_w] as usize;
-        let d = idom_node[w];
-        if d != UNDEFINED {
-            idom_rpo[rpo_w] = node_to_rpo[d as usize];
-        }
-    }
-
-    idom_rpo
 }
 
-// ── Step 6: write idom to disk ────────────────────────────────────────────────
+fn compute_semidominators(
+    pred_sorted_path: &Path,
+    parent_pre: &[u32],
+    reachable: usize,
+) -> Result<Vec<u32>> {
+    let mut semi: Vec<u32> = (0..reachable as u32).collect();
+    let mut ancestor: Vec<u32> = vec![UNDEFINED; reachable];
+    let mut label: Vec<u32> = (0..reachable as u32).collect();
+    let mut compress_stack: Vec<u32> = Vec::new();
+
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(pred_sorted_path).context("open pred sorted")?,
+    );
+    let mut buf = [0u8; PRED_EDGE_SIZE];
+    let mut have_edge = reader.read_exact(&mut buf).is_ok();
+    let mut edge_to_pre = if have_edge {
+        u32::from_le_bytes(buf[0..4].try_into().unwrap())
+    } else {
+        0
+    };
+    let mut edge_from_pre = if have_edge {
+        u32::from_le_bytes(buf[4..8].try_into().unwrap())
+    } else {
+        0
+    };
+
+    for w_pre in (1..reachable as u32).rev() {
+        while have_edge && edge_to_pre == w_pre {
+            let v_pre = edge_from_pre;
+            let u_pre =
+                snca_eval(&semi, &mut ancestor, &mut label, &mut compress_stack, v_pre);
+            if semi[u_pre as usize] < semi[w_pre as usize] {
+                semi[w_pre as usize] = semi[u_pre as usize];
+            }
+
+            have_edge = reader.read_exact(&mut buf).is_ok();
+            if have_edge {
+                edge_to_pre = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                edge_from_pre = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+            }
+        }
+
+        ancestor[w_pre as usize] = parent_pre[w_pre as usize];
+
+        if w_pre % 10_000_000 == 0 {
+            eprint!(
+                "\r    phase 1: {} / {} nodes...",
+                reachable as u32 - w_pre,
+                reachable
+            );
+        }
+    }
+    if reachable > 10_000_000 {
+        eprint!("\r                                              \r");
+    }
+
+    drop(ancestor);
+    drop(label);
+
+    Ok(semi)
+}
+
+// ── Step 8: Semi-NCA Phase 2 — NCA idom walk ────────────────────────────────
+
+fn compute_idom_nca(
+    semi_pre: &[u32],
+    parent_pre: &[u32],
+    reachable: usize,
+) -> Vec<u32> {
+    let mut idom_pre: Vec<u32> = vec![UNDEFINED; reachable];
+    idom_pre[0] = 0;
+
+    for w_pre in 1..reachable as u32 {
+        let mut x = parent_pre[w_pre as usize];
+        while x > semi_pre[w_pre as usize] {
+            x = idom_pre[x as usize];
+        }
+        idom_pre[w_pre as usize] = x;
+
+        if w_pre % 10_000_000 == 0 {
+            eprint!("\r    phase 2: {} / {} nodes...", w_pre, reachable);
+        }
+    }
+    if reachable > 10_000_000 {
+        eprint!("\r                                              \r");
+    }
+
+    idom_pre
+}
+
+// ── Step 9: write idom to disk ───────────────────────────────────────────────
 
 fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
     let mut w =
         BufWriter::with_capacity(IO_BUF_SIZE, File::create(path).context("create idom file")?);
-    for &v in idom {
-        w.write_all(&v.to_le_bytes())?;
-    }
+    let bytes =
+        unsafe { std::slice::from_raw_parts(idom.as_ptr().cast::<u8>(), idom.len() * 4) };
+    w.write_all(bytes)?;
     w.flush()?;
     Ok(())
 }
@@ -695,16 +646,16 @@ fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Result<Pass3Output> {
-    // ── Load IDs and roots ────────────────────────────────────────────────────
+    // ── Load IDs and roots ───────────────────────────────────────────────────
     let t = std::time::Instant::now();
-    eprintln!("  loading object index…");
+    eprintln!("  loading object index...");
     let ids = load_object_ids(&pass1.object_index_path)?;
     let n = ids.len() as u32;
     let vroot = n;
     eprintln!("    {} nodes  [{:.1}s]", n, t.elapsed().as_secs_f64());
 
     let t = std::time::Instant::now();
-    eprintln!("  resolving GC root node indices…");
+    eprintln!("  resolving GC root node indices...");
     let root_nodes = load_root_nodes(&pass1.roots, &ids);
     eprintln!(
         "    {} roots  [{:.1}s]",
@@ -712,62 +663,127 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         t.elapsed().as_secs_f64()
     );
 
-    // ── Produce indexed files for both CSRs while ids is in memory ───────────
+    // ── Produce indexed files while ids is in memory ─────────────────────────
     let t = std::time::Instant::now();
-    eprintln!("  building adjacency lists…");
+    eprintln!("  building adjacency lists...");
     let (fwd_indexed, rev_indexed) = prepare_indexed_files(
         &pass2.edges_path,
         &pass2.reverse_edges_path,
-        ids, // consumed here; dropped inside before any CSR is allocated
+        ids,
         &root_nodes,
         output_dir,
     )?;
 
-    // ── Phase 1: forward CSR + RPO ────────────────────────────────────────────
-    // Reverse CSR is not allocated yet, keeping peak RSS well under total RAM.
-    let forward = build_csr_from_indexed(&fwd_indexed, n as usize, 0)?;
+    // ── Build forward CSR for DFS ────────────────────────────────────────────
+    let forward = build_csr_from_indexed(&fwd_indexed, n as usize)?;
     let _ = std::fs::remove_file(&fwd_indexed);
+    let fwd_edge_count = forward.neighbors.len();
     eprintln!(
         "    {} forward edges  [{:.1}s]",
-        forward.neighbors.len(),
+        fwd_edge_count,
         t.elapsed().as_secs_f64()
     );
 
+    // ── DFS — output written to disk ─────────────────────────────────────────
     let t = std::time::Instant::now();
-    eprintln!("  computing DFS spanning tree…");
-    let (node_to_rpo, rpo_to_node, parent_node, node_to_pre, pre_to_node) =
-        compute_dfs(n, vroot, &root_nodes, &forward);
+    eprintln!("  computing DFS spanning tree...");
+    let dfs = compute_dfs_to_disk(n, vroot, &root_nodes, &forward, output_dir)?;
+    let reachable = dfs.reachable;
+    drop(forward);
     eprintln!(
         "    {} reachable nodes  [{:.1}s]",
-        rpo_to_node.len().saturating_sub(1),
-        t.elapsed().as_secs_f64()
-    );
-    drop(forward); // forward CSR no longer needed; free before reverse CSR is allocated
-
-    // ── Phase 2: reverse CSR + Lengauer-Tarjan ────────────────────────────────
-    let t = std::time::Instant::now();
-    eprintln!("  building reverse adjacency list…");
-    let reverse = build_csr_from_indexed(&rev_indexed, n as usize + 1, 0)?;
-    let _ = std::fs::remove_file(&rev_indexed);
-    eprintln!(
-        "    {} reverse edges  [{:.1}s]",
-        reverse.neighbors.len(),
+        reachable.saturating_sub(1),
         t.elapsed().as_secs_f64()
     );
 
+    // ── Build node_to_pre from pre_to_node on disk ───────────────────────────
+    // parent_pre is already on disk in the right format (indexed by preorder).
     let t = std::time::Instant::now();
-    eprintln!("  running Lengauer-Tarjan dominator algorithm…");
-    let idom = compute_dominators_lt(
-        &rpo_to_node, &node_to_rpo, &parent_node, &node_to_pre, &pre_to_node, &reverse, n,
-    );
-    eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
+    eprintln!("  building node_to_pre...");
+    let total = (n + 1) as usize;
+    {
+        // Read pre_to_node from disk, build node_to_pre in memory.
+        let pre_to_node = read_u32_vec(&dfs.pre_to_node_path)?;
+        let mut node_to_pre = vec![UNDEFINED; total];
+        for (pre, &node) in pre_to_node.iter().enumerate() {
+            node_to_pre[node as usize] = pre as u32;
+        }
+        // pre_to_node is on disk already; drop the in-memory copy.
+        drop(pre_to_node);
 
-    let idom_path = output_dir.join("idom.bin");
-    write_idom(&idom, &idom_path)?;
+        // Build rpo_to_node from post_order on disk.
+        let mut post_order = read_u32_vec(&dfs.post_order_path)?;
+        let _ = std::fs::remove_file(&dfs.post_order_path);
+        post_order.reverse();
+        let rpo_to_node = post_order;
+        let rpo_to_node_path = output_dir.join("rpo_to_node.bin");
+        write_u32_vec(&rpo_to_node, &rpo_to_node_path)?;
+        drop(rpo_to_node);
 
-    Ok(Pass3Output {
-        idom_path,
-        rpo_to_node,
-        node_count: n,
-    })
+        eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
+
+        // ── Sort predecessor edges by target preorder (descending) ───────────
+        let t = std::time::Instant::now();
+        eprintln!("  sorting predecessor edges by DFS preorder...");
+        let pred_sorted_path = sort_pred_edges(&rev_indexed, &node_to_pre, output_dir)?;
+        let _ = std::fs::remove_file(&rev_indexed);
+        drop(node_to_pre);
+        eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
+
+        // ── Phase 1: compute semidominators ──────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("  computing dominators (Semi-NCA)...");
+        let parent_pre = read_u32_vec(&dfs.parent_pre_path)?;
+        let _ = std::fs::remove_file(&dfs.parent_pre_path);
+
+        eprintln!("    phase 1: computing semidominators...");
+        let semi_pre = compute_semidominators(&pred_sorted_path, &parent_pre, reachable)?;
+        let _ = std::fs::remove_file(&pred_sorted_path);
+
+        // ── Phase 2: compute idom via NCA walk ───────────────────────────────
+        eprintln!("    phase 2: computing immediate dominators...");
+        let idom_pre = compute_idom_nca(&semi_pre, &parent_pre, reachable);
+        drop(semi_pre);
+        drop(parent_pre);
+        eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
+
+        // ── Convert idom from preorder to RPO ────────────────────────────────
+        let t = std::time::Instant::now();
+        eprintln!("  converting idom to RPO...");
+        let pre_to_node = read_u32_vec(&dfs.pre_to_node_path)?;
+        let _ = std::fs::remove_file(&dfs.pre_to_node_path);
+        let rpo_to_node = read_u32_vec(&rpo_to_node_path)?;
+
+        let mut node_to_rpo = vec![UNDEFINED; total];
+        for (rpo, &node) in rpo_to_node.iter().enumerate() {
+            node_to_rpo[node as usize] = rpo as u32;
+        }
+
+        let rpo_count = rpo_to_node.len();
+        let mut idom_rpo = vec![UNDEFINED; rpo_count];
+        idom_rpo[0] = 0;
+        for w_pre in 1..reachable as u32 {
+            let w_node = pre_to_node[w_pre as usize];
+            let w_rpo = node_to_rpo[w_node as usize];
+            let dom_pre = idom_pre[w_pre as usize];
+            let dom_node = pre_to_node[dom_pre as usize];
+            let dom_rpo = node_to_rpo[dom_node as usize];
+            idom_rpo[w_rpo as usize] = dom_rpo;
+        }
+        drop(idom_pre);
+        drop(pre_to_node);
+        drop(node_to_rpo);
+        eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
+
+        // ── Write idom to disk ───────────────────────────────────────────────
+        let idom_path = output_dir.join("idom.bin");
+        write_idom(&idom_rpo, &idom_path)?;
+        let _ = std::fs::remove_file(&rpo_to_node_path);
+
+        Ok(Pass3Output {
+            idom_path,
+            rpo_to_node,
+            node_count: n,
+        })
+    }
 }

@@ -125,6 +125,7 @@ fn load_pass1(f: &Fixture) -> Pass1Output {
         roots: load_roots(&f.dir.join("roots.bin")).unwrap(),
         object_count: f.object_count,
         object_index_path: f.dir.join("object_index.bin"),
+        shallow_sizes_path: f.dir.join("shallow_sizes.bin"),
     }
 }
 

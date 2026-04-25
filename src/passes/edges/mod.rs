@@ -9,14 +9,18 @@
 //! Edges are accumulated in sorted chunks and merged into a single
 //! `edges.bin` file sorted by `from_id`, forming a disk-backed forward
 //! adjacency list for the dominator pass.
+//!
+//! Reverse edges (`reverse_edges.bin`) are built by reading the sorted forward
+//! file after the forward merge completes, swapping (from, to) → (to, from),
+//! and sorting again. This avoids per-edge channel overhead (~200-500 ns/edge
+//! for `sync_channel` × 1B edges = 200-500 s of pure overhead).
 
 use anyhow::{Context, Result};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::thread;
 
 use crate::parser::gc_record::FieldType;
@@ -48,20 +52,23 @@ fn edge_to(e: &RawEdge) -> u64 {
     u64::from_le_bytes(e[8..16].try_into().unwrap())
 }
 
-// ── External sorter ──────────────────────────────────────────────────────────
+// ── External sorter with async flush ────────────────────────────────────────
 
 /// Above this many chunks, perform a two-level merge to cap the final fan-in.
 const MAX_MERGE_FAN_IN: usize = 64;
 
 struct EdgeSorter {
     output_dir: PathBuf,
-    /// Filename prefix used for temporary chunk and intermediate files.
-    /// Different sorters in the same directory must use different prefixes to
-    /// avoid clobbering each other when both are active simultaneously.
     prefix: String,
     chunk_paths: Vec<PathBuf>,
     current: Vec<RawEdge>,
     edges_per_chunk: usize,
+    chunk_count: usize,
+    /// Background sort+write thread.  At most one in-flight; collected before
+    /// the next flush or in finish().  The old sort buffer lives in this thread
+    /// until the write completes — physical pages are freed on join.  A new
+    /// demand-paged buffer is allocated immediately so extraction can continue.
+    pending_flush: Option<thread::JoinHandle<Result<PathBuf>>>,
 }
 
 impl EdgeSorter {
@@ -79,6 +86,8 @@ impl EdgeSorter {
             chunk_paths: Vec::new(),
             current: Vec::with_capacity(edges_per_chunk),
             edges_per_chunk,
+            chunk_count: 0,
+            pending_flush: None,
         }
     }
 
@@ -90,65 +99,78 @@ impl EdgeSorter {
         Ok(())
     }
 
+    /// Join the in-flight sort+write thread (if any) and record its output path.
+    fn collect_pending(&mut self) -> Result<()> {
+        if let Some(handle) = self.pending_flush.take() {
+            let path = handle.join().expect("sort-flush thread panicked")?;
+            self.chunk_paths.push(path);
+        }
+        Ok(())
+    }
+
+    /// Sort the current buffer and write it to disk on a background thread.
+    ///
+    /// Memory: the old buffer is moved into the thread.  A fresh buffer is
+    /// allocated (demand-paged: virtual only until touched).  collect_pending()
+    /// is called first, guaranteeing at most one old buffer is live.  Peak
+    /// physical RSS = one full buffer + the fraction of the new buffer filled
+    /// so far.
     fn flush_chunk(&mut self) -> Result<()> {
         if self.current.is_empty() {
             return Ok(());
         }
-        // Parallel sort + dedup within chunk.
-        use rayon::slice::ParallelSliceMut;
-        self.current
-            .par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
-        self.current.dedup();
+        self.collect_pending()?;
 
-        let path = self.output_dir.join(format!(
-            "{}_chunk_{}.bin",
-            self.prefix,
-            self.chunk_paths.len()
-        ));
-        let mut w = BufWriter::with_capacity(
-            IO_BUF_SIZE,
-            File::create(&path).context("create edge chunk")?,
+        let chunk_idx = self.chunk_count;
+        self.chunk_count += 1;
+        let path = self
+            .output_dir
+            .join(format!("{}_chunk_{chunk_idx}.bin", self.prefix));
+        let prefix = self.prefix.clone();
+
+        let to_sort = std::mem::replace(
+            &mut self.current,
+            Vec::with_capacity(self.edges_per_chunk),
         );
-        // Iterate by reference so the backing allocation is reused for the next
-        // chunk — no malloc round-trip, and the next push overwrites already-hot
-        // physical pages without faulting in new ones.  The allocation is released
-        // explicitly in finish() before the merge, where holding it would add to
-        // peak RSS alongside the rev-sorter buffer.
-        for edge in &self.current {
-            w.write_all(edge)?;
-        }
-        self.current.clear(); // len → 0, capacity and physical pages retained
-        w.flush()?;
-        self.chunk_paths.push(path);
-        eprintln!(
-            "  [{}] flushed chunk {} ({} total)",
-            self.prefix,
-            self.chunk_paths.len(),
-            self.chunk_paths.len()
-        );
+
+        let handle = thread::Builder::new()
+            .name(format!("{prefix}-flush-{chunk_idx}"))
+            .spawn(move || -> Result<PathBuf> {
+                use rayon::slice::ParallelSliceMut;
+                let mut buf = to_sort;
+                buf.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
+                buf.dedup();
+                let mut w = BufWriter::with_capacity(
+                    IO_BUF_SIZE,
+                    File::create(&path).context("create edge chunk")?,
+                );
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr().cast::<u8>(),
+                        buf.len() * EDGE_SIZE,
+                    )
+                };
+                w.write_all(bytes)?;
+                w.flush()?;
+                eprintln!("  [{prefix}] flushed chunk {}", chunk_idx + 1);
+                Ok(path)
+            })?;
+
+        self.pending_flush = Some(handle);
         Ok(())
     }
 
-    /// Finish sorting, writing the final merged output to `output_path`.
-    ///
-    /// `on_edge` is called for every deduplicated edge **in the final output
-    /// write** (in sorted order). The caller can use this to feed a second
-    /// sorter (e.g. for reverse edges) without an extra read pass over the
-    /// output file.
-    ///
-    /// For intermediate merge passes (two-level merge), `on_edge` is NOT called
-    /// — only the final pass that produces `output_path` triggers it.
-    fn finish(mut self, output_path: &Path, on_edge: &mut dyn FnMut(RawEdge)) -> Result<u64> {
-        // Fast path: no chunks have been flushed to disk — sort in-memory and
-        // write directly. Avoids one temporary file write + read cycle.
-        if self.chunk_paths.is_empty() {
+    /// Finish sorting: flush remaining buffer, merge all chunks into `output_path`.
+    fn finish(mut self, output_path: &Path) -> Result<u64> {
+        // Fast path: no chunks on disk and none pending — sort in-memory.
+        if self.chunk_paths.is_empty() && self.pending_flush.is_none() {
             if self.current.is_empty() {
                 File::create(output_path).context("create empty edge file")?;
                 return Ok(0);
             }
             use rayon::slice::ParallelSliceMut;
             eprintln!(
-                "  [{}] sorting {} edges in-memory (no chunk files needed)…",
+                "  [{}] sorting {} edges in-memory…",
                 self.prefix,
                 self.current.len()
             );
@@ -160,33 +182,36 @@ impl EdgeSorter {
                 IO_BUF_SIZE,
                 File::create(output_path).context("create edge file")?,
             );
-            let edges = std::mem::take(&mut self.current);
-            for edge in edges {
-                w.write_all(&edge)?;
-                on_edge(edge);
-            }
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    self.current.as_ptr().cast::<u8>(),
+                    self.current.len() * EDGE_SIZE,
+                )
+            };
+            w.write_all(bytes)?;
             w.flush()?;
             return Ok(count);
         }
 
         self.flush_chunk()?;
-        // flush_chunk replaced self.current with a fresh Vec::with_capacity(edges_per_chunk).
-        // Free that virtual reservation now so the merge runs with zero sort-buffer overhead.
-        self.current = Vec::new();
+        self.collect_pending()?;
+        self.current = Vec::new(); // free sort buffer before merge
 
         let chunks = std::mem::take(&mut self.chunk_paths);
 
         match chunks.len() {
             0 => {
                 File::create(output_path).context("create empty edge file")?;
-                return Ok(0);
+                Ok(0)
             }
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  [{}] merging {} edge chunks…", self.prefix, n);
-                merge_chunks(&chunks, output_path, on_edge)?;
+                merge_chunks(&chunks, output_path)?;
                 for p in &chunks {
                     let _ = std::fs::remove_file(p);
                 }
+                let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
+                Ok(count)
             }
             n => {
                 let group_size = MAX_MERGE_FAN_IN;
@@ -207,7 +232,7 @@ impl EdgeSorter {
                         num_groups,
                         group.len()
                     );
-                    merge_chunks(group, &inter, &mut |_| {})?;
+                    merge_chunks(group, &inter)?;
                     for p in group {
                         let _ = std::fs::remove_file(p);
                     }
@@ -215,38 +240,37 @@ impl EdgeSorter {
                 }
 
                 eprintln!(
-                    "  [{}] final merge of {} intermediate files…",
+                    "  [{}] final merge of {} groups…",
                     self.prefix,
                     intermediates.len()
                 );
-                merge_chunks(&intermediates, output_path, on_edge)?;
+                merge_chunks(&intermediates, output_path)?;
                 for p in &intermediates {
                     let _ = std::fs::remove_file(p);
                 }
+
+                let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
+                Ok(count)
             }
         }
-
-        let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
-        Ok(count)
     }
 }
 
 /// Clean up chunk files if the sorter is dropped before `finish()` (e.g. on panic).
 impl Drop for EdgeSorter {
     fn drop(&mut self) {
+        if let Some(handle) = self.pending_flush.take() {
+            if let Ok(Ok(path)) = handle.join() {
+                self.chunk_paths.push(path);
+            }
+        }
         for p in &self.chunk_paths {
             let _ = std::fs::remove_file(p);
         }
     }
 }
 
-fn merge_chunks(
-    chunk_paths: &[PathBuf],
-    output_path: &Path,
-    on_edge: &mut dyn FnMut(RawEdge),
-) -> Result<()> {
-    // Divide IO_BUF_SIZE across all readers so total buffer memory stays at
-    // ~IO_BUF_SIZE regardless of fan-in (64 chunks × 64 MiB = 4 GiB otherwise).
+fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
     let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
     let mut readers: Vec<BufReader<File>> = chunk_paths
         .iter()
@@ -258,8 +282,6 @@ fn merge_chunks(
         })
         .collect::<Result<_>>()?;
 
-    // Sort by (from, to, chunk_index) so identical edges from different chunks
-    // are adjacent and can be deduplicated by the last_edge check below.
     let mut heap: BinaryHeap<Reverse<(u64, u64, usize)>> = BinaryHeap::new();
     let mut peek: Vec<Option<RawEdge>> = vec![None; readers.len()];
 
@@ -277,10 +299,8 @@ fn merge_chunks(
     let mut last_edge: Option<RawEdge> = None;
     while let Some(Reverse((_, _, idx))) = heap.pop() {
         let edge = peek[idx].take().unwrap();
-        // Skip duplicate (from, to) pairs that appear across chunk boundaries.
         if last_edge.as_ref() != Some(&edge) {
             w.write_all(&edge)?;
-            on_edge(edge); // RawEdge is Copy — no move occurs here
             last_edge = Some(edge);
         }
         if let Some(next) = read_edge(&mut readers[idx])? {
@@ -301,17 +321,12 @@ fn read_edge(r: &mut impl Read) -> Result<Option<RawEdge>> {
     }
 }
 
-// ── Reverse edge index ────────────────────────────────────────────────────────
-// reverse_edges.bin is now built simultaneously with edges.bin during the
-// final merge pass of the forward sorter. See `run()` for details.
-
 // ── Pass 2 output ─────────────────────────────────────────────────────────────
 
 pub struct Pass2Output {
     /// Sorted forward edge file: (from_id, to_id) pairs sorted by from_id.
     pub edges_path: PathBuf,
     /// Sorted reverse edge file: (to_id, from_id) pairs sorted by to_id.
-    /// Binary-search by to_id to find all referrers of an object.
     pub reverse_edges_path: PathBuf,
     pub edge_count: u64,
 }
@@ -323,15 +338,8 @@ pub struct Pass2Output {
 struct EdgeStreamExtractor {
     id_size: usize,
     /// Precomputed per-class flat list of byte offsets (within the InstanceDump
-    /// raw-data block) at which an Object-typed field lives. Covers the class's
-    /// own fields AND all inherited fields from the full superclass chain, in
-    /// HPROF layout order. Built once at construction time.
-    ///
-    /// Per-object extraction becomes: one HashMap lookup + a flat u32 scan.
-    /// No superclass-chain walking or per-field FieldType comparison at runtime.
+    /// raw-data block) at which an Object-typed field lives.
     field_offsets: HashMap<u64, Vec<u32>>,
-    /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
-    /// Zero means we are parsing outer (top-level) HPROF records.
     heap_dump_remaining: usize,
 }
 
@@ -375,7 +383,6 @@ impl EdgeStreamExtractor {
     }
 
     /// Walk `buf`, append edges to `out`, return bytes consumed from `buf`.
-    /// Returns 0 if there is not enough data for even one complete record.
     fn extract(&mut self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
         let mut pos = 0;
 
@@ -386,7 +393,6 @@ impl EdgeStreamExtractor {
             }
 
             if self.heap_dump_remaining == 0 {
-                // Outer record: tag(1) + time_offset(4) + length(4) = 9 bytes min.
                 if rem.len() < 9 {
                     break;
                 }
@@ -394,16 +400,13 @@ impl EdgeStreamExtractor {
                 let length = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
                 match tag {
                     0x0C | 0x1C => {
-                        // HEAP_DUMP | HEAP_DUMP_SEGMENT — enter GC sub-record mode.
                         self.heap_dump_remaining = length;
                         pos += 9;
                     }
                     0x2C => {
-                        // HEAP_DUMP_END
                         pos += 9;
                     }
                     _ => {
-                        // Skip tag(1) + time_offset(4) + len(4) + body(length).
                         let total = 9 + length;
                         if rem.len() < total {
                             break;
@@ -412,10 +415,9 @@ impl EdgeStreamExtractor {
                     }
                 }
             } else {
-                // GC sub-record mode.
                 let n = self.extract_gc(rem, out);
                 if n == 0 {
-                    break; // Incomplete — need more data.
+                    break;
                 }
                 self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(n);
                 pos += n;
@@ -425,8 +427,6 @@ impl EdgeStreamExtractor {
         pos
     }
 
-    /// Parse one GC sub-record from `buf`, emit edges into `out`, and return
-    /// bytes consumed. Returns 0 if `buf` does not hold a complete record.
     fn extract_gc(&self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
         if buf.is_empty() {
             return 0;
@@ -438,7 +438,6 @@ impl EdgeStreamExtractor {
         match tag {
             0x21 => {
                 // TAG_GC_INSTANCE_DUMP
-                // object_id(is) | stack_serial(4) | class_id(is) | data_size(4) | raw[data_size]
                 let hdr = 2 * is + 8;
                 if data.len() < hdr {
                     return 0;
@@ -457,7 +456,6 @@ impl EdgeStreamExtractor {
             }
             0x22 => {
                 // TAG_GC_OBJ_ARRAY_DUMP
-                // object_id(is) | stack_serial(4) | num_elements(4) | element_class_id(is) | ids[num*is]
                 let hdr = 2 * is + 8;
                 if data.len() < hdr {
                     return 0;
@@ -481,7 +479,6 @@ impl EdgeStreamExtractor {
             }
             0x23 => {
                 // TAG_GC_PRIM_ARRAY_DUMP
-                // object_id(is) | stack_serial(4) | num_elements(4) | element_type(1) | data[...]
                 let hdr = is + 9;
                 if data.len() < hdr {
                     return 0;
@@ -493,53 +490,46 @@ impl EdgeStreamExtractor {
                 if buf.len() < total {
                     return 0;
                 }
-                total // no object references in primitive arrays
+                total
             }
             0x20 => {
-                // TAG_GC_CLASS_DUMP — parse to find static Object-field edges.
+                // TAG_GC_CLASS_DUMP
                 match class_dump_size_and_edges(is, data, out) {
                     Some(body_size) => 1 + body_size,
-                    None => 0, // Incomplete
+                    None => 0,
                 }
             }
-            // Root records — no outgoing object references; just skip.
             0xFF => {
-                // ROOT_UNKNOWN: object_id(is)
                 if data.len() < is {
                     return 0;
                 }
                 1 + is
             }
             0x01 => {
-                // ROOT_JNI_GLOBAL: object_id(is) + jni_ref(is)
                 if data.len() < 2 * is {
                     return 0;
                 }
                 1 + 2 * is
             }
             0x02 | 0x03 => {
-                // ROOT_JNI_LOCAL | ROOT_JAVA_FRAME: object_id(is) + thread_serial(4) + frame_num(4)
                 if data.len() < is + 8 {
                     return 0;
                 }
                 1 + is + 8
             }
             0x04 | 0x06 => {
-                // ROOT_NATIVE_STACK | ROOT_THREAD_BLOCK: object_id(is) + thread_serial(4)
                 if data.len() < is + 4 {
                     return 0;
                 }
                 1 + is + 4
             }
             0x05 | 0x07 => {
-                // ROOT_STICKY_CLASS | ROOT_MONITOR_USED: object_id(is)
                 if data.len() < is {
                     return 0;
                 }
                 1 + is
             }
             0x08 => {
-                // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
                 if data.len() < is + 8 {
                     return 0;
                 }
@@ -549,8 +539,6 @@ impl EdgeStreamExtractor {
         }
     }
 
-    /// Extract all Object-typed field references from an InstanceDump's raw bytes.
-    /// Uses the precomputed flat offset list — one HashMap lookup, no chain walking.
     #[inline]
     fn extract_instance_edges(&self, from: u64, class_id: u64, raw: &[u8], out: &mut Vec<RawEdge>) {
         let is = self.id_size;
@@ -561,7 +549,7 @@ impl EdgeStreamExtractor {
             let off = off as usize;
             if off + is > raw.len() {
                 break;
-            } // offsets are ascending; safe to stop
+            }
             let to = read_id_raw(is, &raw[off..]);
             if to != 0 {
                 out.push(encode_edge(from, to));
@@ -572,7 +560,6 @@ impl EdgeStreamExtractor {
 
 // ── Inline parser helpers ─────────────────────────────────────────────────────
 
-/// Read a big-endian object ID from the start of `buf`. `is` must be 4 or 8.
 #[inline(always)]
 fn read_id_raw(is: usize, buf: &[u8]) -> u64 {
     if is == 8 {
@@ -582,32 +569,22 @@ fn read_id_raw(is: usize, buf: &[u8]) -> u64 {
     }
 }
 
-/// Byte size of a field value given its type byte and the heap's id_size.
-/// Matches `FieldType::byte_size` in `gc_record.rs`.
 fn field_type_size(ty: u8, is: usize) -> usize {
     match ty {
-        2 => is,     // Object
-        4 | 8 => 1,  // Bool, Byte
-        5 | 9 => 2,  // Char, Short
-        6 | 10 => 4, // Float, Int
-        7 | 11 => 8, // Double, Long
+        2 => is,
+        4 | 8 => 1,
+        5 | 9 => 2,
+        6 | 10 => 4,
+        7 | 11 => 8,
         _ => panic!("unknown field type byte: {ty}"),
     }
 }
 
-/// Parse a ClassDump body (starting AFTER the tag byte), emit edges for
-/// Object-typed static fields, and return the number of bytes consumed.
-/// Returns `None` if `buf` does not contain a complete ClassDump.
 fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> Option<usize> {
-    // Fixed header layout (after tag):
-    //   class_object_id(is) + stack_serial(4) + super_class_id(is)
-    //   + class_loader_id(is) + signers_id(is) + protection_domain_id(is)
-    //   + reserved_1(is) + reserved_2(is) + instance_size(4)
-    // = 7 * is + 8 bytes
     let fixed = 7 * is + 8;
     if buf.len() < fixed + 2 {
         return None;
-    } // +2 for cp_count
+    }
 
     let class_object_id = read_id_raw(is, buf);
     let mut pos = fixed;
@@ -618,8 +595,8 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
     for _ in 0..cp_count {
         if buf.len() < pos + 3 {
             return None;
-        } // cp_index(2) + type(1)
-        pos += 2; // cp_index (discarded)
+        }
+        pos += 2;
         let ty = buf[pos];
         pos += 1;
         let sz = field_type_size(ty, is);
@@ -638,14 +615,13 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
     for _ in 0..static_count {
         if buf.len() < pos + is + 1 {
             return None;
-        } // name_id(is) + type(1)
+        }
         let ty = buf[pos + is];
         let sz = field_type_size(ty, is);
         if buf.len() < pos + is + 1 + sz {
             return None;
         }
         if ty == 2 {
-            // Object
             let to = read_id_raw(is, &buf[pos + is + 1..]);
             if to != 0 {
                 out.push(encode_edge(class_object_id, to));
@@ -654,7 +630,7 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
         pos += is + 1 + sz;
     }
 
-    // Instance field descriptors — name_id(is) + type(1), no value.
+    // Instance fields — skip (name_id + type, no value)
     if buf.len() < pos + 2 {
         return None;
     }
@@ -669,6 +645,45 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
     Some(pos)
 }
 
+// ── Build reverse edges from sorted forward file ─────────────────────────────
+
+/// Read `edges.bin` (sorted by from_id), swap each (from, to) → (to, from),
+/// and sort into `reverse_edges.bin`.
+///
+/// Called AFTER the forward EdgeSorter is finished and its sort buffer freed,
+/// so this gets the full sort buffer (40% RAM) without exceeding peak RSS.
+fn build_reverse_edges(
+    edges_path: &Path,
+    reverse_path: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    let mut rev_sorter = EdgeSorter::new(output_dir.to_path_buf(), "rev_edge");
+
+    let mut reader = BufReader::with_capacity(
+        IO_BUF_SIZE,
+        File::open(edges_path).context("open edges.bin for reverse build")?,
+    );
+    loop {
+        let consumed = {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break;
+            }
+            let records = buf.len() / EDGE_SIZE;
+            for chunk in buf[..records * EDGE_SIZE].chunks_exact(EDGE_SIZE) {
+                let from = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+                let to = u64::from_le_bytes(chunk[8..16].try_into().unwrap());
+                rev_sorter.push(encode_edge(to, from))?;
+            }
+            records * EDGE_SIZE
+        };
+        reader.consume(consumed);
+    }
+
+    rev_sorter.finish(reverse_path)?;
+    Ok(())
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2Output> {
@@ -678,8 +693,6 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     let mut sorter = EdgeSorter::new(output_dir.to_path_buf(), "edge");
 
     {
-        // Precompute flat Object-field offsets from the class index (cheap: ~MBs).
-        // The extractor owns this table and is moved into the parser thread.
         let mut extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
         process_with_extractor(
             path,
@@ -693,41 +706,16 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
         .context("pass 2 streaming")?;
     }
 
-    // The reverse sorter runs in a background thread, fed via a bounded channel.
-    // This decouples the forward merge from reverse sort/flush: when rev_sorter's
-    // buffer fills and flush_chunk() fires (par_sort of 40%-of-RAM worth of edges
-    // + disk write), the forward merge keeps running instead of stalling. The
-    // channel provides backpressure if the rev thread falls behind.
     let edges_path = output_dir.join("edges.bin");
     let reverse_edges_path = output_dir.join("reverse_edges.bin");
 
-    // 64 Ki edges = 1 MiB of channel buffering — enough to absorb minor jitter
-    // without letting the forward merge race arbitrarily far ahead.
-    let (rev_tx, rev_rx) = mpsc::sync_channel::<RawEdge>(64 * 1024);
-    let rev_output_dir = output_dir.to_path_buf();
-    let rev_path = reverse_edges_path.clone();
-    let rev_thread = thread::Builder::new()
-        .name("rev-edge-sorter".into())
-        .spawn(move || -> Result<()> {
-            let mut rev_sorter = EdgeSorter::new(rev_output_dir, "rev_edge");
-            for edge in rev_rx {
-                rev_sorter
-                    .push(encode_edge(edge_to(&edge), edge_from(&edge)))
-                    .context("rev_sorter push")?;
-            }
-            rev_sorter.finish(&rev_path, &mut |_| {})?;
-            Ok(())
-        })
-        .context("spawn rev-edge-sorter thread")?;
+    // Forward merge — sort buffer is freed inside finish().
+    let edge_count = sorter.finish(&edges_path)?;
 
-    let edge_count = sorter.finish(&edges_path, &mut |edge: RawEdge| {
-        rev_tx.send(edge).expect("rev-edge-sorter thread died");
-    })?;
-    drop(rev_tx); // close channel → rev thread drains and finishes
-    rev_thread
-        .join()
-        .expect("rev-edge-sorter thread panicked")
-        .context("rev-edge-sorter thread error")?;
+    // Build reverse edges from the sorted forward file.
+    // The forward sort buffer has been freed, so this gets the full buffer.
+    eprintln!("  building reverse edges from sorted forward file…");
+    build_reverse_edges(&edges_path, &reverse_edges_path, output_dir)?;
 
     Ok(Pass2Output {
         edges_path,
