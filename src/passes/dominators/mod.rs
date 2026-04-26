@@ -80,17 +80,114 @@ fn load_root_nodes(roots: &[u64], ids: &[u64]) -> Vec<u32> {
 
 fn prepare_indexed_files(
     edges_path: &Path,
-    rev_edges_path: &Path,
     ids: Vec<u64>,
     root_nodes: &[u32],
     output_dir: &Path,
 ) -> Result<(PathBuf, PathBuf)> {
-    let vroot = ids.len() as u32;
-    let fwd_indexed = resolve_forward_indexed(edges_path, &ids, output_dir)?;
-    let rev_indexed =
-        resolve_reverse_indexed(rev_edges_path, &ids, root_nodes, vroot, output_dir)?;
-    drop(ids);
-    Ok((fwd_indexed, rev_indexed))
+    let n = ids.len();
+    let vroot = n as u32;
+
+    // ── Sort 1/2: resolve from_id → from_idx, sort by to_id ────────────
+    //
+    // Read edges.bin (sorted by from_id). Co-scan with sorted IDs to resolve
+    // from_id → from_idx.  Output 12-byte records (to_id, from_idx) sorted
+    // by (to_id, from_idx).
+    let partial_path = output_dir.join("partial_sorted.bin");
+    {
+        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
+            output_dir.to_path_buf(),
+            "partial",
+            key_partial,
+        );
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(edges_path).context("open edges.bin")?,
+        );
+        let mut buf = [0u8; EDGE_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            while scan < n && ids[scan] < from_id {
+                scan += 1;
+            }
+            if scan >= n || ids[scan] != from_id {
+                continue;
+            }
+            let from_idx = scan as u32;
+            let mut rec = [0u8; PARTIAL_SIZE];
+            rec[0..8].copy_from_slice(&to_id.to_le_bytes());
+            rec[8..12].copy_from_slice(&from_idx.to_le_bytes());
+            sorter.push(rec)?;
+        }
+        sorter.finish(&partial_path)?;
+    }
+    eprintln!("  [adj] partial resolve done (sort 1/2)");
+
+    // ── Sort 2/2: resolve to_id → to_idx, produce fwd + rev indexed ────
+    //
+    // Read partial_sorted (to_id, from_idx) sorted by to_id.  Co-scan IDs
+    // to resolve to_id → to_idx.  Simultaneously:
+    //   • Push (from_idx, to_idx) into fwd_indexed RecordSorter
+    //   • Write (to_idx, from_idx) to rev_indexed.bin — already ordered by
+    //     to_idx since we scan sorted to_ids.
+    //
+    // Also inject vroot→root predecessor edges into rev_indexed.
+    let fwd_indexed_path = output_dir.join("fwd_indexed_sorted.bin");
+    let rev_indexed_path = output_dir.join("rev_indexed.bin");
+    {
+        let mut fwd_sorter = RecordSorter::<INDEXED_SIZE>::new(
+            output_dir.to_path_buf(),
+            "fwd_indexed",
+            key_indexed,
+        );
+        let mut rev_w = BufWriter::with_capacity(
+            IO_BUF_SIZE,
+            File::create(&rev_indexed_path).context("create rev_indexed")?,
+        );
+
+        let mut reader = BufReader::with_capacity(
+            IO_BUF_SIZE,
+            File::open(&partial_path).context("open partial sorted")?,
+        );
+        let mut buf = [0u8; PARTIAL_SIZE];
+        let mut scan = 0usize;
+        while reader.read_exact(&mut buf).is_ok() {
+            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let from_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
+            while scan < n && ids[scan] < to_id {
+                scan += 1;
+            }
+            if scan >= n || ids[scan] != to_id {
+                continue;
+            }
+            let to_idx = scan as u32;
+
+            let mut fwd_rec = [0u8; INDEXED_SIZE];
+            fwd_rec[0..4].copy_from_slice(&from_idx.to_le_bytes());
+            fwd_rec[4..8].copy_from_slice(&to_idx.to_le_bytes());
+            fwd_sorter.push(fwd_rec)?;
+
+            rev_w.write_all(&to_idx.to_le_bytes())?;
+            rev_w.write_all(&from_idx.to_le_bytes())?;
+        }
+
+        // Inject vroot → root predecessor edges into reverse indexed.
+        for &r in root_nodes {
+            rev_w.write_all(&r.to_le_bytes())?;
+            rev_w.write_all(&vroot.to_le_bytes())?;
+        }
+
+        rev_w.flush()?;
+        drop(reader);
+        let _ = std::fs::remove_file(&partial_path);
+        drop(ids); // free 4 GB before forward merge
+
+        fwd_sorter.finish(&fwd_indexed_path)?;
+    }
+    eprintln!("  [adj] indexed resolve done (sort 2/2)");
+
+    Ok((fwd_indexed_path, rev_indexed_path))
 }
 
 fn key_partial(rec: &[u8; PARTIAL_SIZE]) -> (u64, u64) {
@@ -105,153 +202,6 @@ fn key_indexed(rec: &[u8; INDEXED_SIZE]) -> (u64, u64) {
     (a, b)
 }
 
-fn resolve_forward_indexed(edges_path: &Path, ids: &[u64], output_dir: &Path) -> Result<PathBuf> {
-    let partial_path = output_dir.join("fwd_partial_sorted.bin");
-    {
-        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
-            output_dir.to_path_buf(),
-            "fwd_partial",
-            key_partial,
-        );
-        let mut reader =
-            BufReader::with_capacity(IO_BUF_SIZE, File::open(edges_path).context("open edges")?);
-        let mut buf = [0u8; EDGE_SIZE];
-        let mut scan = 0usize;
-        while reader.read_exact(&mut buf).is_ok() {
-            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let to_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            while scan < ids.len() && ids[scan] < from_id {
-                scan += 1;
-            }
-            if scan >= ids.len() || ids[scan] != from_id {
-                continue;
-            }
-            let from_idx = scan as u32;
-            let mut rec = [0u8; PARTIAL_SIZE];
-            rec[0..8].copy_from_slice(&to_id.to_le_bytes());
-            rec[8..12].copy_from_slice(&from_idx.to_le_bytes());
-            sorter.push(rec)?;
-        }
-        sorter.finish(&partial_path)?;
-    }
-    eprintln!("  [fwd] partial resolve done");
-
-    let indexed_path = output_dir.join("fwd_indexed_sorted.bin");
-    {
-        let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
-            output_dir.to_path_buf(),
-            "fwd_indexed",
-            key_indexed,
-        );
-        let mut reader = BufReader::with_capacity(
-            IO_BUF_SIZE,
-            File::open(&partial_path).context("open fwd partial")?,
-        );
-        let mut buf = [0u8; PARTIAL_SIZE];
-        let mut scan = 0usize;
-        while reader.read_exact(&mut buf).is_ok() {
-            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let from_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-            while scan < ids.len() && ids[scan] < to_id {
-                scan += 1;
-            }
-            if scan >= ids.len() || ids[scan] != to_id {
-                continue;
-            }
-            let to_idx = scan as u32;
-            let mut rec = [0u8; INDEXED_SIZE];
-            rec[0..4].copy_from_slice(&from_idx.to_le_bytes());
-            rec[4..8].copy_from_slice(&to_idx.to_le_bytes());
-            sorter.push(rec)?;
-        }
-        sorter.finish(&indexed_path)?;
-    }
-    let _ = std::fs::remove_file(&partial_path);
-    eprintln!("  [fwd] indexed resolve done");
-
-    Ok(indexed_path)
-}
-
-fn resolve_reverse_indexed(
-    rev_edges_path: &Path,
-    ids: &[u64],
-    root_nodes: &[u32],
-    vroot: u32,
-    output_dir: &Path,
-) -> Result<PathBuf> {
-    let partial_path = output_dir.join("rev_partial_sorted.bin");
-    {
-        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
-            output_dir.to_path_buf(),
-            "rev_partial",
-            key_partial,
-        );
-        let mut reader = BufReader::with_capacity(
-            IO_BUF_SIZE,
-            File::open(rev_edges_path).context("open rev edges")?,
-        );
-        let mut buf = [0u8; EDGE_SIZE];
-        let mut scan = 0usize;
-        while reader.read_exact(&mut buf).is_ok() {
-            let to_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let from_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-            while scan < ids.len() && ids[scan] < to_id {
-                scan += 1;
-            }
-            if scan >= ids.len() || ids[scan] != to_id {
-                continue;
-            }
-            let to_idx = scan as u32;
-            let mut rec = [0u8; PARTIAL_SIZE];
-            rec[0..8].copy_from_slice(&from_id.to_le_bytes());
-            rec[8..12].copy_from_slice(&to_idx.to_le_bytes());
-            sorter.push(rec)?;
-        }
-        sorter.finish(&partial_path)?;
-    }
-    eprintln!("  [rev] partial resolve done");
-
-    let indexed_path = output_dir.join("rev_indexed_sorted.bin");
-    {
-        let mut sorter = RecordSorter::<INDEXED_SIZE>::new(
-            output_dir.to_path_buf(),
-            "rev_indexed",
-            key_indexed,
-        );
-        let mut reader = BufReader::with_capacity(
-            IO_BUF_SIZE,
-            File::open(&partial_path).context("open rev partial")?,
-        );
-        let mut buf = [0u8; PARTIAL_SIZE];
-        let mut scan = 0usize;
-        while reader.read_exact(&mut buf).is_ok() {
-            let from_id = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-            let to_idx = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-            while scan < ids.len() && ids[scan] < from_id {
-                scan += 1;
-            }
-            if scan >= ids.len() || ids[scan] != from_id {
-                continue;
-            }
-            let from_idx = scan as u32;
-            let mut rec = [0u8; INDEXED_SIZE];
-            rec[0..4].copy_from_slice(&to_idx.to_le_bytes());
-            rec[4..8].copy_from_slice(&from_idx.to_le_bytes());
-            sorter.push(rec)?;
-        }
-        for &r in root_nodes {
-            let mut rec = [0u8; INDEXED_SIZE];
-            rec[0..4].copy_from_slice(&r.to_le_bytes());
-            rec[4..8].copy_from_slice(&vroot.to_le_bytes());
-            sorter.push(rec)?;
-        }
-        sorter.finish(&indexed_path)?;
-    }
-    let _ = std::fs::remove_file(&partial_path);
-    eprintln!("  [rev] indexed resolve done");
-
-    Ok(indexed_path)
-}
 
 fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr> {
     let mut offsets = vec![0u32; total_nodes + 1];
@@ -498,45 +448,57 @@ fn sort_pred_edges(
 }
 
 // ── Step 7: Semi-NCA Phase 1 — semidominator via EVAL/LINK ──────────────────
+//
+// The three eval arrays (semi, ancestor, label) are packed into a single
+// struct so that accessing all fields of the same node hits one cache line
+// (12 bytes vs 3 separate 4-byte accesses at different memory locations).
+// This cuts cache misses by ~2x during path compression.
+
+/// Packed EVAL/LINK node — 12 bytes, fits 5 per cache line.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct EvalNode {
+    semi: u32,
+    ancestor: u32,
+    label: u32,
+}
 
 fn snca_compress(
-    semi: &[u32],
-    ancestor: &mut [u32],
-    label: &mut [u32],
+    nodes: &mut [EvalNode],
     stack: &mut Vec<u32>,
     v: u32,
 ) {
     stack.clear();
     let mut u = v;
-    while ancestor[u as usize] != UNDEFINED
-        && ancestor[ancestor[u as usize] as usize] != UNDEFINED
+    while nodes[u as usize].ancestor != UNDEFINED
+        && nodes[nodes[u as usize].ancestor as usize].ancestor != UNDEFINED
     {
         stack.push(u);
-        u = ancestor[u as usize];
+        u = nodes[u as usize].ancestor;
     }
 
     while let Some(w) = stack.pop() {
-        let anc = ancestor[w as usize];
-        if semi[label[anc as usize] as usize] < semi[label[w as usize] as usize] {
-            label[w as usize] = label[anc as usize];
+        let wi = w as usize;
+        let anc = nodes[wi].ancestor;
+        let ai = anc as usize;
+        if nodes[nodes[ai].label as usize].semi < nodes[nodes[wi].label as usize].semi {
+            nodes[wi].label = nodes[ai].label;
         }
-        ancestor[w as usize] = ancestor[anc as usize];
+        nodes[wi].ancestor = nodes[ai].ancestor;
     }
 }
 
 #[inline(always)]
 fn snca_eval(
-    semi: &[u32],
-    ancestor: &mut [u32],
-    label: &mut [u32],
+    nodes: &mut [EvalNode],
     stack: &mut Vec<u32>,
     v: u32,
 ) -> u32 {
-    if ancestor[v as usize] == UNDEFINED {
+    if nodes[v as usize].ancestor == UNDEFINED {
         v
     } else {
-        snca_compress(semi, ancestor, label, stack, v);
-        label[v as usize]
+        snca_compress(nodes, stack, v);
+        nodes[v as usize].label
     }
 }
 
@@ -544,10 +506,14 @@ fn compute_semidominators(
     pred_sorted_path: &Path,
     parent_pre: &[u32],
     reachable: usize,
-) -> Result<Vec<u32>> {
-    let mut semi: Vec<u32> = (0..reachable as u32).collect();
-    let mut ancestor: Vec<u32> = vec![UNDEFINED; reachable];
-    let mut label: Vec<u32> = (0..reachable as u32).collect();
+) -> Result<Vec<EvalNode>> {
+    let mut nodes: Vec<EvalNode> = (0..reachable as u32)
+        .map(|i| EvalNode {
+            semi: i,
+            ancestor: UNDEFINED,
+            label: i,
+        })
+        .collect();
     let mut compress_stack: Vec<u32> = Vec::new();
 
     let mut reader = BufReader::with_capacity(
@@ -570,10 +536,9 @@ fn compute_semidominators(
     for w_pre in (1..reachable as u32).rev() {
         while have_edge && edge_to_pre == w_pre {
             let v_pre = edge_from_pre;
-            let u_pre =
-                snca_eval(&semi, &mut ancestor, &mut label, &mut compress_stack, v_pre);
-            if semi[u_pre as usize] < semi[w_pre as usize] {
-                semi[w_pre as usize] = semi[u_pre as usize];
+            let u_pre = snca_eval(&mut nodes, &mut compress_stack, v_pre);
+            if nodes[u_pre as usize].semi < nodes[w_pre as usize].semi {
+                nodes[w_pre as usize].semi = nodes[u_pre as usize].semi;
             }
 
             have_edge = reader.read_exact(&mut buf).is_ok();
@@ -583,7 +548,7 @@ fn compute_semidominators(
             }
         }
 
-        ancestor[w_pre as usize] = parent_pre[w_pre as usize];
+        nodes[w_pre as usize].ancestor = parent_pre[w_pre as usize];
 
         if w_pre % 10_000_000 == 0 {
             eprint!(
@@ -597,16 +562,13 @@ fn compute_semidominators(
         eprint!("\r                                              \r");
     }
 
-    drop(ancestor);
-    drop(label);
-
-    Ok(semi)
+    Ok(nodes)
 }
 
 // ── Step 8: Semi-NCA Phase 2 — NCA idom walk ────────────────────────────────
 
 fn compute_idom_nca(
-    semi_pre: &[u32],
+    nodes: &[EvalNode],
     parent_pre: &[u32],
     reachable: usize,
 ) -> Vec<u32> {
@@ -615,7 +577,7 @@ fn compute_idom_nca(
 
     for w_pre in 1..reachable as u32 {
         let mut x = parent_pre[w_pre as usize];
-        while x > semi_pre[w_pre as usize] {
+        while x > nodes[w_pre as usize].semi {
             x = idom_pre[x as usize];
         }
         idom_pre[w_pre as usize] = x;
@@ -668,7 +630,6 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
     eprintln!("  building adjacency lists...");
     let (fwd_indexed, rev_indexed) = prepare_indexed_files(
         &pass2.edges_path,
-        &pass2.reverse_edges_path,
         ids,
         &root_nodes,
         output_dir,
@@ -737,13 +698,13 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         let _ = std::fs::remove_file(&dfs.parent_pre_path);
 
         eprintln!("    phase 1: computing semidominators...");
-        let semi_pre = compute_semidominators(&pred_sorted_path, &parent_pre, reachable)?;
+        let eval_nodes = compute_semidominators(&pred_sorted_path, &parent_pre, reachable)?;
         let _ = std::fs::remove_file(&pred_sorted_path);
 
         // ── Phase 2: compute idom via NCA walk ───────────────────────────────
         eprintln!("    phase 2: computing immediate dominators...");
-        let idom_pre = compute_idom_nca(&semi_pre, &parent_pre, reachable);
-        drop(semi_pre);
+        let idom_pre = compute_idom_nca(&eval_nodes, &parent_pre, reachable);
+        drop(eval_nodes);
         drop(parent_pre);
         eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());
 

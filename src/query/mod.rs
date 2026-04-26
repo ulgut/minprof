@@ -14,12 +14,12 @@ mod html;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use crate::index::{ObjectIndex, RetainedIndex, class_name};
+use crate::index::{ObjectIndex, class_name};
 use crate::passes::edges::{EDGE_SIZE, Pass2Output};
 use crate::passes::index::{ClassDescriptorMap, ENTRY_SIZE, Pass1Output};
 use crate::passes::retained::Pass4Output;
@@ -153,13 +153,6 @@ struct ClassStats {
     max_shallow: u32,
 }
 
-struct RawRetainedRow {
-    object_id: u64,
-    class_id: u64,
-    shallow: u32,
-    retained: u64,
-}
-
 // ── Size formatting ───────────────────────────────────────────────────────────
 
 fn fmt_size(bytes: u64) -> String {
@@ -237,25 +230,63 @@ const TOP_N: usize = 20;
 
 fn collect_output(
     obj_idx: &ObjectIndex,
-    ret_idx: &RetainedIndex,
+    retained_path: &Path,
     class_index: &ClassDescriptorMap,
     pass1: &Pass1Output,
     pass4: &Pass4Output,
 ) -> Result<AnalysisOutput> {
-    let mut histogram: HashMap<u64, ClassStats> = HashMap::new();
-    let mut raw_retained: Vec<RawRetainedRow> = Vec::with_capacity(obj_idx.entry_count);
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
 
-    for (node_idx, (oid, cid, shallow)) in obj_idx.iter()?.enumerate() {
+    // Single streaming pass over object_index.bin + retained.bin.
+    // Computes histogram, retained-by-class, and top-N objects simultaneously
+    // with O(classes) memory instead of O(objects).
+    let mut histogram: HashMap<u64, ClassStats> = HashMap::new();
+    let mut retained_by_class_map: HashMap<u64, (u64, u64, u64)> = HashMap::new(); // (retained, shallow, count)
+
+    // Min-heap of size TOP_N for top retained objects.  Reverse so the
+    // smallest retained value sits at the top and can be evicted cheaply.
+    let mut top_heap: BinaryHeap<Reverse<(u64, u64)>> = BinaryHeap::new(); // (retained, object_id)
+    let mut top_rows: HashMap<u64, (u64, u64, u32)> = HashMap::new(); // oid → (cid, retained, shallow)
+
+    // Stream retained.bin alongside object_index.bin — never load 4 GB.
+    let mut ret_reader = BufReader::with_capacity(
+        crate::passes::IO_BUF_SIZE,
+        File::open(retained_path).context("open retained.bin for query")?,
+    );
+    let mut ret_buf = [0u8; 8];
+
+    for (oid, cid, shallow) in obj_idx.iter()? {
+        let retained = if ret_reader.read_exact(&mut ret_buf).is_ok() {
+            u64::from_le_bytes(ret_buf)
+        } else {
+            shallow as u64
+        };
+
+        // Histogram
         let stats = histogram.entry(cid).or_default();
         stats.count += 1;
         stats.total_shallow += shallow as u64;
         stats.max_shallow = stats.max_shallow.max(shallow);
-        raw_retained.push(RawRetainedRow {
-            object_id: oid,
-            class_id: cid,
-            shallow,
-            retained: ret_idx.get(node_idx),
-        });
+
+        // Retained by class
+        let e = retained_by_class_map.entry(cid).or_default();
+        e.0 += retained;
+        e.1 += shallow as u64;
+        e.2 += 1;
+
+        // Top-N retained objects via bounded min-heap
+        if top_heap.len() < TOP_N {
+            top_heap.push(Reverse((retained, oid)));
+            top_rows.insert(oid, (cid, retained, shallow));
+        } else if let Some(&Reverse((min_ret, _))) = top_heap.peek() {
+            if retained > min_ret {
+                let Reverse((_, evicted_oid)) = top_heap.pop().unwrap();
+                top_rows.remove(&evicted_oid);
+                top_heap.push(Reverse((retained, oid)));
+                top_rows.insert(oid, (cid, retained, shallow));
+            }
+        }
     }
 
     let total_shallow_bytes: u64 = histogram.values().map(|s| s.total_shallow).sum();
@@ -297,31 +328,26 @@ fn collect_output(
         .collect();
 
     // ── Top individual objects by retained heap ───────────────────────────────
-    raw_retained.sort_unstable_by(|a, b| {
-        b.retained
-            .cmp(&a.retained)
-            .then_with(|| a.object_id.cmp(&b.object_id))
-    });
-    let top_retained_objects: Vec<RetainedObjectEntry> = raw_retained
-        .iter()
-        .take(TOP_N)
-        .map(|r| RetainedObjectEntry {
-            object_id: r.object_id,
-            class_name: class_name(r.class_id, class_index),
-            shallow_bytes: r.shallow,
-            retained_bytes: r.retained,
+    let mut top_retained_objects: Vec<RetainedObjectEntry> = top_heap
+        .into_sorted_vec()
+        .into_iter()
+        .map(|Reverse((_, oid))| {
+            let &(cid, retained, shallow) = top_rows.get(&oid).unwrap();
+            RetainedObjectEntry {
+                object_id: oid,
+                class_name: class_name(cid, class_index),
+                shallow_bytes: shallow,
+                retained_bytes: retained,
+            }
         })
         .collect();
+    top_retained_objects.sort_by(|a, b| {
+        b.retained_bytes
+            .cmp(&a.retained_bytes)
+            .then_with(|| a.object_id.cmp(&b.object_id))
+    });
 
     // ── Retained heap aggregated by class ─────────────────────────────────────
-    // Group all objects by class_id, summing retained and shallow.
-    let mut retained_by_class_map: HashMap<u64, (u64, u64, u64)> = HashMap::new(); // (retained, shallow, count)
-    for r in &raw_retained {
-        let e = retained_by_class_map.entry(r.class_id).or_default();
-        e.0 += r.retained;
-        e.1 += r.shallow as u64;
-        e.2 += 1;
-    }
     let mut retained_by_class_full: Vec<RetainedByClassEntry> = retained_by_class_map
         .iter()
         .map(|(cid, (total_ret, total_sh, count))| RetainedByClassEntry {
@@ -1121,8 +1147,7 @@ pub fn run(
     config: &ReportConfig,
 ) -> Result<()> {
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
-    let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;
+    let out = collect_output(&obj_idx, &pass4.retained_path, &pass1.class_index, pass1, pass4)?;
     if json {
         emit_json(&out, config);
     } else {
@@ -1134,8 +1159,7 @@ pub fn run(
 /// Generate a self-contained HTML report and write it to `html_path`.
 pub fn run_html(pass1: &Pass1Output, pass4: &Pass4Output, html_path: &Path) -> Result<()> {
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let ret_idx = RetainedIndex::load(&pass4.retained_path)?;
-    let out = collect_output(&obj_idx, &ret_idx, &pass1.class_index, pass1, pass4)?;
+    let out = collect_output(&obj_idx, &pass4.retained_path, &pass1.class_index, pass1, pass4)?;
     let html_str = html::render(&out);
     std::fs::write(html_path, html_str.as_bytes())
         .with_context(|| format!("write HTML report to {}", html_path.display()))?;
