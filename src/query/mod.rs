@@ -20,7 +20,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::index::{ObjectIndex, class_name};
-use crate::passes::edges::{EDGE_SIZE, Pass2Output};
+use crate::passes::edges::EDGE_SIZE;
 use crate::passes::index::{ClassDescriptorMap, ENTRY_SIZE, Pass1Output};
 use crate::passes::retained::Pass4Output;
 
@@ -1015,7 +1015,7 @@ fn find_referrers(file: &mut File, entry_count: u64, target_id: u64) -> Result<V
 pub fn path_to_root(
     target_id: u64,
     pass1: &Pass1Output,
-    pass2: &Pass2Output,
+    reverse_edges_path: &Path,
     json: bool,
 ) -> Result<()> {
     let roots: HashSet<u64> = pass1.roots.iter().copied().collect();
@@ -1023,9 +1023,9 @@ pub fn path_to_root(
     let obj_entry_count = std::fs::metadata(&pass1.object_index_path)?.len() / ENTRY_SIZE as u64;
     let mut obj_file =
         File::open(&pass1.object_index_path).context("open object index for path query")?;
-    let rev_entry_count = std::fs::metadata(&pass2.reverse_edges_path)?.len() / EDGE_SIZE as u64;
+    let rev_entry_count = std::fs::metadata(reverse_edges_path)?.len() / EDGE_SIZE as u64;
     let mut rev_file =
-        File::open(&pass2.reverse_edges_path).context("open reverse edges for path query")?;
+        File::open(reverse_edges_path).context("open reverse edges for path query")?;
 
     if lookup_object(&mut obj_file, obj_entry_count, target_id)?.is_none() {
         if json {

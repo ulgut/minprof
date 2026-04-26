@@ -147,7 +147,6 @@ fn index_is_complete(dir: &Path) -> bool {
         "retained.bin",
         "meta.bin",
         "edges.bin",
-        "reverse_edges.bin",
     ]
     .iter()
     .all(|f| dir.join(f).exists())
@@ -173,7 +172,6 @@ fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
     };
 
     let edges_path = dir.join("edges.bin");
-    let reverse_path = dir.join("reverse_edges.bin");
     let edge_count = std::fs::metadata(&edges_path)
         .context("stat edges.bin")?
         .len()
@@ -181,7 +179,6 @@ fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
 
     let pass2 = Pass2Output {
         edges_path,
-        reverse_edges_path: reverse_path,
         edge_count,
     };
 
@@ -221,7 +218,7 @@ fn main() -> Result<()> {
             pass1.class_index.len(),
             pass1.roots.len()
         );
-        run_query(&cli, &config, is_json, index_dir, &pass1, &pass2, &pass4)?;
+        run_query(&cli, &config, is_json, index_dir, &pass1, &pass2.edges_path, &pass4)?;
         return Ok(());
     }
 
@@ -289,7 +286,7 @@ fn main() -> Result<()> {
         total_start.elapsed().as_secs_f64()
     );
 
-    run_query(&cli, &config, is_json, &output_dir, &pass1, &pass2, &pass4)?;
+    run_query(&cli, &config, is_json, &output_dir, &pass1, &pass2.edges_path, &pass4)?;
     Ok(())
 }
 
@@ -299,7 +296,7 @@ fn run_query(
     is_json: bool,
     output_dir: &Path,
     pass1: &Pass1Output,
-    pass2: &Pass2Output,
+    edges_path: &Path,
     pass4: &Pass4Output,
 ) -> Result<()> {
     eprintln!("=== query ===");
@@ -329,7 +326,19 @@ fn run_query(
 
     if let Some(raw_id) = &cli.path {
         let target_id = parse_hex_id(raw_id)?;
-        query::path_to_root(target_id, pass1, pass2, is_json)?;
+        // Build reverse edges on demand — only needed for --path.
+        let reverse_path = edges_path.with_file_name("reverse_edges.bin");
+        if !reverse_path.exists() {
+            eprintln!("  building reverse edges (one-time)…");
+            let t2 = std::time::Instant::now();
+            passes::edges::build_reverse_edges(
+                edges_path,
+                &reverse_path,
+                output_dir,
+            )?;
+            eprintln!("    [{:.1}s]", t2.elapsed().as_secs_f64());
+        }
+        query::path_to_root(target_id, pass1, &reverse_path, is_json)?;
     }
 
     Ok(())

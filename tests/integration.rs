@@ -23,7 +23,6 @@ const COMPARED_FILES: &[&str] = &[
     "class_names.bin",
     "object_index.bin",
     "edges.bin",
-    "reverse_edges.bin",
     "roots.bin",
     "idom.bin",
     "retained.bin",

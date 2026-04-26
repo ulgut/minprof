@@ -326,8 +326,6 @@ fn read_edge(r: &mut impl Read) -> Result<Option<RawEdge>> {
 pub struct Pass2Output {
     /// Sorted forward edge file: (from_id, to_id) pairs sorted by from_id.
     pub edges_path: PathBuf,
-    /// Sorted reverse edge file: (to_id, from_id) pairs sorted by to_id.
-    pub reverse_edges_path: PathBuf,
     pub edge_count: u64,
 }
 
@@ -650,9 +648,9 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
 /// Read `edges.bin` (sorted by from_id), swap each (from, to) → (to, from),
 /// and sort into `reverse_edges.bin`.
 ///
-/// Called AFTER the forward EdgeSorter is finished and its sort buffer freed,
-/// so this gets the full sort buffer (40% RAM) without exceeding peak RSS.
-fn build_reverse_edges(
+/// Called on-demand (only when `--path` is used) so that normal runs skip
+/// the ~40 s reverse-edge sort entirely.
+pub fn build_reverse_edges(
     edges_path: &Path,
     reverse_path: &Path,
     output_dir: &Path,
@@ -707,19 +705,12 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     }
 
     let edges_path = output_dir.join("edges.bin");
-    let reverse_edges_path = output_dir.join("reverse_edges.bin");
 
     // Forward merge — sort buffer is freed inside finish().
     let edge_count = sorter.finish(&edges_path)?;
 
-    // Build reverse edges from the sorted forward file.
-    // The forward sort buffer has been freed, so this gets the full buffer.
-    eprintln!("  building reverse edges from sorted forward file…");
-    build_reverse_edges(&edges_path, &reverse_edges_path, output_dir)?;
-
     Ok(Pass2Output {
         edges_path,
-        reverse_edges_path,
         edge_count,
     })
 }

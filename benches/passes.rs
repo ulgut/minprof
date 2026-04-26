@@ -132,7 +132,6 @@ fn load_pass1(f: &Fixture) -> Pass1Output {
 fn load_pass2(f: &Fixture) -> Pass2Output {
     Pass2Output {
         edges_path: f.dir.join("edges.bin"),
-        reverse_edges_path: f.dir.join("reverse_edges.bin"),
         edge_count: f.edge_count,
     }
 }
