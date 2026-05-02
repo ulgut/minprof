@@ -28,10 +28,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::passes::IO_BUF_SIZE;
 use crate::passes::edges::{EDGE_SIZE, Pass2Output};
 use crate::passes::index::Pass1Output;
 use crate::passes::sort::RecordSorter;
-use crate::passes::IO_BUF_SIZE;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -94,11 +94,8 @@ fn prepare_indexed_files(
     // by (to_id, from_idx).
     let partial_path = output_dir.join("partial_sorted.bin");
     {
-        let mut sorter = RecordSorter::<PARTIAL_SIZE>::new(
-            output_dir.to_path_buf(),
-            "partial",
-            key_partial,
-        );
+        let mut sorter =
+            RecordSorter::<PARTIAL_SIZE>::new(output_dir.to_path_buf(), "partial", key_partial);
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
             File::open(edges_path).context("open edges.bin")?,
@@ -136,11 +133,8 @@ fn prepare_indexed_files(
     let fwd_indexed_path = output_dir.join("fwd_indexed_sorted.bin");
     let rev_indexed_path = output_dir.join("rev_indexed.bin");
     {
-        let mut fwd_sorter = RecordSorter::<INDEXED_SIZE>::new(
-            output_dir.to_path_buf(),
-            "fwd_indexed",
-            key_indexed,
-        );
+        let mut fwd_sorter =
+            RecordSorter::<INDEXED_SIZE>::new(output_dir.to_path_buf(), "fwd_indexed", key_indexed);
         let mut rev_w = BufWriter::with_capacity(
             IO_BUF_SIZE,
             File::create(&rev_indexed_path).context("create rev_indexed")?,
@@ -201,7 +195,6 @@ fn key_indexed(rec: &[u8; INDEXED_SIZE]) -> (u64, u64) {
     let b = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as u64;
     (a, b)
 }
-
 
 fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr> {
     let mut offsets = vec![0u32; total_nodes + 1];
@@ -372,8 +365,7 @@ fn write_u32_vec(data: &[u32], path: &Path) -> Result<()> {
         IO_BUF_SIZE,
         File::create(path).context("create array file")?,
     );
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * 4) };
     w.write_all(bytes)?;
     w.flush()?;
     Ok(())
@@ -393,11 +385,8 @@ fn sort_pred_edges(
     output_dir: &Path,
 ) -> Result<PathBuf> {
     let pred_path = output_dir.join("pred_sorted.bin");
-    let mut sorter = RecordSorter::<PRED_EDGE_SIZE>::new(
-        output_dir.to_path_buf(),
-        "pred",
-        key_pred_desc,
-    );
+    let mut sorter =
+        RecordSorter::<PRED_EDGE_SIZE>::new(output_dir.to_path_buf(), "pred", key_pred_desc);
 
     let mut reader = BufReader::with_capacity(
         IO_BUF_SIZE,
@@ -440,11 +429,7 @@ struct EvalNode {
     label: u32,
 }
 
-fn snca_compress(
-    nodes: &mut [EvalNode],
-    stack: &mut Vec<u32>,
-    v: u32,
-) {
+fn snca_compress(nodes: &mut [EvalNode], stack: &mut Vec<u32>, v: u32) {
     stack.clear();
     let mut u = v;
     while nodes[u as usize].ancestor != UNDEFINED
@@ -466,11 +451,7 @@ fn snca_compress(
 }
 
 #[inline(always)]
-fn snca_eval(
-    nodes: &mut [EvalNode],
-    stack: &mut Vec<u32>,
-    v: u32,
-) -> u32 {
+fn snca_eval(nodes: &mut [EvalNode], stack: &mut Vec<u32>, v: u32) -> u32 {
     if nodes[v as usize].ancestor == UNDEFINED {
         v
     } else {
@@ -544,11 +525,7 @@ fn compute_semidominators(
 
 // ── Step 8: Semi-NCA Phase 2 — NCA idom walk ────────────────────────────────
 
-fn compute_idom_nca(
-    nodes: &[EvalNode],
-    parent_pre: &[u32],
-    reachable: usize,
-) -> Vec<u32> {
+fn compute_idom_nca(nodes: &[EvalNode], parent_pre: &[u32], reachable: usize) -> Vec<u32> {
     let mut idom_pre: Vec<u32> = vec![UNDEFINED; reachable];
     idom_pre[0] = 0;
 
@@ -595,12 +572,8 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
     // ── Produce indexed files while ids is in memory ─────────────────────────
     let t = std::time::Instant::now();
     eprintln!("  building adjacency lists...");
-    let (fwd_indexed, rev_indexed) = prepare_indexed_files(
-        &pass2.edges_path,
-        ids,
-        &root_nodes,
-        output_dir,
-    )?;
+    let (fwd_indexed, rev_indexed) =
+        prepare_indexed_files(&pass2.edges_path, ids, &root_nodes, output_dir)?;
 
     // ── Build forward CSR for DFS ────────────────────────────────────────────
     let forward = build_csr_from_indexed(&fwd_indexed, n as usize)?;

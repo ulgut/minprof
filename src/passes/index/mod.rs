@@ -315,7 +315,11 @@ impl Drop for ExternalSorter {
 
 /// K-way merge of sorted chunk files into a single sorted output file.
 /// `fixup` is called on each entry immediately before it is written.
-fn merge_chunks_with_fixup<F>(chunk_paths: &[PathBuf], output_path: &Path, mut fixup: F) -> Result<()>
+fn merge_chunks_with_fixup<F>(
+    chunk_paths: &[PathBuf],
+    output_path: &Path,
+    mut fixup: F,
+) -> Result<()>
 where
     F: FnMut(&mut RawEntry),
 {
@@ -375,8 +379,14 @@ fn read_entry(reader: &mut impl Read) -> Result<Option<RawEntry>> {
 enum IndexItem {
     Entry(RawEntry),
     Root(u64),
-    Utf8String { id: u64, value: String },
-    LoadClass { class_object_id: u64, class_name_id: u64 },
+    Utf8String {
+        id: u64,
+        value: String,
+    },
+    LoadClass {
+        class_object_id: u64,
+        class_name_id: u64,
+    },
     ClassDump {
         class_object_id: u64,
         super_id: u64,
@@ -448,7 +458,10 @@ impl IndexStreamExtractor {
                 let body = &buf[*pos + 9..*pos + 9 + length];
                 let class_object_id = read_id_be(self.id_size, &body[4..]);
                 let class_name_id = read_id_be(self.id_size, &body[4 + self.id_size + 4..]);
-                batch.push(IndexItem::LoadClass { class_object_id, class_name_id });
+                batch.push(IndexItem::LoadClass {
+                    class_object_id,
+                    class_name_id,
+                });
                 *pos += 9 + length;
                 true
             }
@@ -485,57 +498,76 @@ impl IndexStreamExtractor {
         let consumed = match tag {
             0xFF => {
                 // ROOT_UNKNOWN: object_id(is)
-                if data_avail < is { return false; }
+                if data_avail < is {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + is
             }
             0x01 => {
                 // ROOT_JNI_GLOBAL: object_id(is) + jni_ref_id(is)
-                if data_avail < 2 * is { return false; }
+                if data_avail < 2 * is {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + 2 * is
             }
             0x02 | 0x03 => {
                 // ROOT_JNI_LOCAL / ROOT_JAVA_FRAME: object_id(is) + thread(4) + frame(4)
-                if data_avail < is + 8 { return false; }
+                if data_avail < is + 8 {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + is + 8
             }
             0x04 | 0x06 => {
                 // ROOT_NATIVE_STACK / ROOT_THREAD_BLOCK: object_id(is) + thread(4)
-                if data_avail < is + 4 { return false; }
+                if data_avail < is + 4 {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + is + 4
             }
             0x05 | 0x07 => {
                 // ROOT_STICKY_CLASS / ROOT_MONITOR_USED: object_id(is)
-                if data_avail < is { return false; }
+                if data_avail < is {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + is
             }
             0x08 => {
                 // ROOT_THREAD_OBJ: object_id(is) + thread_serial(4) + stack_serial(4)
-                if data_avail < is + 8 { return false; }
+                if data_avail < is + 8 {
+                    return false;
+                }
                 batch.push(IndexItem::Root(read_id_be(is, data)));
                 1 + is + 8
             }
             0x20 => {
                 // CLASS_DUMP — variable-length record
                 match try_parse_class_dump(is, data) {
-                    Some((n, item)) => { batch.push(item); 1 + n }
+                    Some((n, item)) => {
+                        batch.push(item);
+                        1 + n
+                    }
                     None => return false,
                 }
             }
             0x21 => {
                 // INSTANCE_DUMP: object_id(is) + stack(4) + class_id(is) + data_size(4) + data[data_size]
                 let hdr = 2 * is + 8;
-                if data_avail < hdr { return false; }
+                if data_avail < hdr {
+                    return false;
+                }
                 let oid = read_id_be(is, data);
                 let class_id = read_id_be(is, &data[is + 4..]);
                 let data_size =
                     u32::from_be_bytes(data[2 * is + 4..2 * is + 8].try_into().unwrap());
                 let total = hdr + data_size as usize;
-                if data_avail < total { return false; }
+                if data_avail < total {
+                    return false;
+                }
                 // Use data_size as placeholder; fixup corrects to instance_size in finish().
                 batch.push(IndexItem::Entry(encode_entry(oid, class_id, data_size)));
                 1 + total
@@ -543,31 +575,45 @@ impl IndexStreamExtractor {
             0x22 => {
                 // OBJ_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + class_id(is) + elems[num*is]
                 let hdr = 2 * is + 8;
-                if data_avail < hdr { return false; }
+                if data_avail < hdr {
+                    return false;
+                }
                 let oid = read_id_be(is, data);
                 let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
                 let class_id = read_id_be(is, &data[is + 8..]);
                 let total = hdr + num as usize * is;
-                if data_avail < total { return false; }
+                if data_avail < total {
+                    return false;
+                }
                 // JVM header (16) + array length field (4) + element references.
                 let shallow = 16u32 + 4 + num.saturating_mul(is as u32);
-                batch.push(IndexItem::Entry(
-                    encode_entry(oid, class_id | OBJECT_ARRAY_FLAG, shallow),
-                ));
+                batch.push(IndexItem::Entry(encode_entry(
+                    oid,
+                    class_id | OBJECT_ARRAY_FLAG,
+                    shallow,
+                )));
                 1 + total
             }
             0x23 => {
                 // PRIM_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + elem_type(1) + data
                 let hdr = is + 9;
-                if data_avail < hdr { return false; }
+                if data_avail < hdr {
+                    return false;
+                }
                 let oid = read_id_be(is, data);
                 let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
                 let elem_type = FieldType::from_value(data[is + 8]);
                 let elem_size = elem_type.byte_size(is as u32); // u32
                 let total = hdr + num as usize * elem_size as usize;
-                if data_avail < total { return false; }
+                if data_avail < total {
+                    return false;
+                }
                 let shallow = 16u32 + 4 + num.saturating_mul(elem_size);
-                batch.push(IndexItem::Entry(encode_entry(oid, elem_type as u64, shallow)));
+                batch.push(IndexItem::Entry(encode_entry(
+                    oid,
+                    elem_type as u64,
+                    shallow,
+                )));
                 1 + total
             }
             x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
@@ -660,7 +706,10 @@ fn try_parse_class_dump(is: usize, buf: &[u8]) -> Option<(usize, IndexItem)> {
         p += is;
         let ty = FieldType::from_value(buf[p]);
         p += 1;
-        instance_fields.push(FieldInfo { name_id, field_type: ty });
+        instance_fields.push(FieldInfo {
+            name_id,
+            field_type: ty,
+        });
     }
 
     Some((
@@ -786,7 +835,10 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     let mut roots: Vec<u64> = Vec::new();
     let mut sorter = ExternalSorter::new(output_dir.to_path_buf());
 
-    let mut extractor = IndexStreamExtractor { id_size, heap_dump_remaining: 0 };
+    let mut extractor = IndexStreamExtractor {
+        id_size,
+        heap_dump_remaining: 0,
+    };
 
     process_with_extractor(
         path,
@@ -797,7 +849,10 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
                     IndexItem::Utf8String { id, value } => {
                         string_table.insert(id, value);
                     }
-                    IndexItem::LoadClass { class_object_id, class_name_id } => {
+                    IndexItem::LoadClass {
+                        class_object_id,
+                        class_name_id,
+                    } => {
                         name_id_map.insert(class_object_id, class_name_id);
                     }
                     IndexItem::Root(oid) => {
@@ -838,7 +893,11 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     for (class_id, desc) in &mut class_index {
         if let Some(&name_sid) = name_id_map.get(class_id) {
             if let Some(raw) = string_table.get(&name_sid) {
-                desc.name = if raw.contains('/') { raw.replace('/', ".") } else { raw.clone() };
+                desc.name = if raw.contains('/') {
+                    raw.replace('/', ".")
+                } else {
+                    raw.clone()
+                };
             }
         }
     }
@@ -864,7 +923,9 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
             }
         }
         // Write the (possibly patched) shallow size to the sidecar file.
-        shallow_w.write_all(&entry[16..20]).expect("write shallow_sizes.bin");
+        shallow_w
+            .write_all(&entry[16..20])
+            .expect("write shallow_sizes.bin");
     })?;
     shallow_w.flush().context("flush shallow_sizes.bin")?;
 

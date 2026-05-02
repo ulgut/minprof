@@ -218,7 +218,15 @@ fn main() -> Result<()> {
             pass1.class_index.len(),
             pass1.roots.len()
         );
-        run_query(&cli, &config, is_json, index_dir, &pass1, &pass2.edges_path, &pass4)?;
+        run_query(
+            &cli,
+            &config,
+            is_json,
+            index_dir,
+            &pass1,
+            &pass2.edges_path,
+            &pass4,
+        )?;
         return Ok(());
     }
 
@@ -286,7 +294,15 @@ fn main() -> Result<()> {
         total_start.elapsed().as_secs_f64()
     );
 
-    run_query(&cli, &config, is_json, &output_dir, &pass1, &pass2.edges_path, &pass4)?;
+    run_query(
+        &cli,
+        &config,
+        is_json,
+        &output_dir,
+        &pass1,
+        &pass2.edges_path,
+        &pass4,
+    )?;
     Ok(())
 }
 
@@ -331,11 +347,7 @@ fn run_query(
         if !reverse_path.exists() {
             eprintln!("  building reverse edges (one-time)…");
             let t2 = std::time::Instant::now();
-            passes::edges::build_reverse_edges(
-                edges_path,
-                &reverse_path,
-                output_dir,
-            )?;
+            passes::edges::build_reverse_edges(edges_path, &reverse_path, output_dir)?;
             eprintln!("    [{:.1}s]", t2.elapsed().as_secs_f64());
         }
         query::path_to_root(target_id, pass1, &reverse_path, is_json)?;

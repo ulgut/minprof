@@ -78,7 +78,11 @@ impl<const N: usize> RecordSorter<N> {
         self.current.clear();
         w.flush()?;
         self.chunk_paths.push(path);
-        eprintln!("  [{}] flushed chunk {}", self.prefix, self.chunk_paths.len());
+        eprintln!(
+            "  [{}] flushed chunk {}",
+            self.prefix,
+            self.chunk_paths.len()
+        );
         Ok(())
     }
 

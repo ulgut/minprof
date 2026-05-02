@@ -134,7 +134,12 @@ fn generate(w: &mut impl Write, a: &Args) -> std::io::Result<()> {
 
     // ── LoadClass records ─────────────────────────────────────────────────────
     for ci in 0..c {
-        write_load_class(w, ci as u32 + 1, class_base + ci, class_name_ids[ci as usize])?;
+        write_load_class(
+            w,
+            ci as u32 + 1,
+            class_base + ci,
+            class_name_ids[ci as usize],
+        )?;
     }
 
     // ── ClassDump segment ─────────────────────────────────────────────────────
@@ -187,10 +192,14 @@ fn generate(w: &mut impl Write, a: &Args) -> std::io::Result<()> {
             let oid = inst_base + written + i;
             let class_id = class_base + (written + i) % c;
             write_instance_dump(
-                w, oid, class_id,
-                a.obj_fields, a.prim_fields,
+                w,
+                oid,
+                class_id,
+                a.obj_fields,
+                a.prim_fields,
                 a.null_pct,
-                inst_base, n,
+                inst_base,
+                n,
                 &mut rng,
             )?;
         }

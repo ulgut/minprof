@@ -50,7 +50,6 @@ pub struct Pass4Output {
     pub unreachable_shallow: u64,
 }
 
-
 // ── Step 3: compute retained sizes in RPO space ─────────────────────────────
 
 /// Compute retained sizes working entirely in RPO space.
@@ -100,7 +99,12 @@ fn compute_retained_rpo(
         .sum();
     let unreachable_shallow = total_shallow - reachable_shallow;
 
-    (retained_rpo, total_shallow, unreachable_count, unreachable_shallow)
+    (
+        retained_rpo,
+        total_shallow,
+        unreachable_count,
+        unreachable_shallow,
+    )
 }
 
 // ── Step 4: write retained.bin (node-indexed) ────────────────────────────────

@@ -126,10 +126,8 @@ impl EdgeSorter {
             .join(format!("{}_chunk_{chunk_idx}.bin", self.prefix));
         let prefix = self.prefix.clone();
 
-        let to_sort = std::mem::replace(
-            &mut self.current,
-            Vec::with_capacity(self.edges_per_chunk),
-        );
+        let to_sort =
+            std::mem::replace(&mut self.current, Vec::with_capacity(self.edges_per_chunk));
 
         let handle = thread::Builder::new()
             .name(format!("{prefix}-flush-{chunk_idx}"))
@@ -143,10 +141,7 @@ impl EdgeSorter {
                     File::create(&path).context("create edge chunk")?,
                 );
                 let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        buf.as_ptr().cast::<u8>(),
-                        buf.len() * EDGE_SIZE,
-                    )
+                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * EDGE_SIZE)
                 };
                 w.write_all(bytes)?;
                 w.flush()?;

@@ -1147,7 +1147,13 @@ pub fn run(
     config: &ReportConfig,
 ) -> Result<()> {
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let out = collect_output(&obj_idx, &pass4.retained_path, &pass1.class_index, pass1, pass4)?;
+    let out = collect_output(
+        &obj_idx,
+        &pass4.retained_path,
+        &pass1.class_index,
+        pass1,
+        pass4,
+    )?;
     if json {
         emit_json(&out, config);
     } else {
@@ -1159,7 +1165,13 @@ pub fn run(
 /// Generate a self-contained HTML report and write it to `html_path`.
 pub fn run_html(pass1: &Pass1Output, pass4: &Pass4Output, html_path: &Path) -> Result<()> {
     let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let out = collect_output(&obj_idx, &pass4.retained_path, &pass1.class_index, pass1, pass4)?;
+    let out = collect_output(
+        &obj_idx,
+        &pass4.retained_path,
+        &pass1.class_index,
+        pass1,
+        pass4,
+    )?;
     let html_str = html::render(&out);
     std::fs::write(html_path, html_str.as_bytes())
         .with_context(|| format!("write HTML report to {}", html_path.display()))?;

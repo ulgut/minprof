@@ -21,12 +21,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 use minprof::passes;
 use minprof::passes::dominators::Pass3Output;
 use minprof::passes::edges::Pass2Output;
-use minprof::passes::index::{load_class_index, load_roots, Pass1Output};
+use minprof::passes::index::{Pass1Output, load_class_index, load_roots};
 
 // ── Fixture parameters ────────────────────────────────────────────────────────
 
@@ -93,10 +93,7 @@ fn fixture() -> &'static Fixture {
             // Persist rpo_to_node so pass-4 benchmarks can reconstruct Pass3Output.
             write_u32_vec(&dir.join("rpo_to_node.bin"), &p3.rpo_to_node);
 
-            let counts = format!(
-                "{} {} {}",
-                p1.object_count, p2.edge_count, p3.node_count
-            );
+            let counts = format!("{} {} {}", p1.object_count, p2.edge_count, p3.node_count);
             fs::write(&sentinel, counts).unwrap();
 
             eprintln!("[bench] fixture ready.");
@@ -113,7 +110,13 @@ fn fixture() -> &'static Fixture {
             object_count, edge_count
         );
 
-        Fixture { hprof, dir, object_count, edge_count, node_count }
+        Fixture {
+            hprof,
+            dir,
+            object_count,
+            edge_count,
+            node_count,
+        }
     })
 }
 
@@ -153,7 +156,10 @@ fn write_u32_vec(path: &Path, v: &[u32]) {
 
 fn read_u32_vec(path: &Path) -> Vec<u32> {
     let mut bytes = Vec::new();
-    fs::File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
+    fs::File::open(path)
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
