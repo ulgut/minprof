@@ -7,7 +7,7 @@
 use crate::parser::gc_record::{ClassDumpFields, FieldInfo, FieldType, FieldValue, GcRecord};
 use crate::parser::primitive_parsers::{
     parse_f32, parse_f64, parse_i8, parse_i16, parse_i32, parse_i64, parse_u8, parse_u16,
-    parse_u32, parse_u64,
+    parse_u32, parse_u64, read_id_be,
 };
 use crate::parser::record::{LoadClassData, Record};
 use nom::combinator::map;
@@ -17,17 +17,6 @@ use nom::{IResult, Parser, bytes};
 // ---------------------------------------------------------------------------
 // Fast direct-read helpers (hot path — no nom overhead)
 // ---------------------------------------------------------------------------
-
-/// Read a big-endian object ID from the start of `buf`.
-/// `is` must be 4 or 8 (the HPROF id_size).
-#[inline(always)]
-fn read_id(is: usize, buf: &[u8]) -> u64 {
-    if is == 8 {
-        u64::from_be_bytes(buf[..8].try_into().unwrap())
-    } else {
-        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
-    }
-}
 
 #[inline(always)]
 fn read_u32_be(buf: &[u8]) -> u32 {
@@ -170,8 +159,8 @@ fn parse_gc_record(id_size: u32, buf: &[u8]) -> IResult<&[u8], GcRecord> {
             if data.len() < hdr {
                 return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
             }
-            let object_id = read_id(is, data);
-            let class_id = read_id(is, &data[is + 4..]);
+            let object_id = read_id_be(is, data);
+            let class_id = read_id_be(is, &data[is + 4..]);
             let data_size = read_u32_be(&data[2 * is + 4..]) as usize;
             let total = hdr + data_size;
             if data.len() < total {
@@ -194,9 +183,9 @@ fn parse_gc_record(id_size: u32, buf: &[u8]) -> IResult<&[u8], GcRecord> {
             if data.len() < hdr {
                 return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
             }
-            let object_id = read_id(is, data);
+            let object_id = read_id_be(is, data);
             let num_elements = read_u32_be(&data[is + 4..]);
-            let element_class_id = read_id(is, &data[is + 8..]);
+            let element_class_id = read_id_be(is, &data[is + 8..]);
             let payload = num_elements as usize * is;
             let total = hdr + payload;
             if data.len() < total {
@@ -219,7 +208,7 @@ fn parse_gc_record(id_size: u32, buf: &[u8]) -> IResult<&[u8], GcRecord> {
             if data.len() < hdr {
                 return Err(nom::Err::Incomplete(nom::Needed::new(hdr - data.len())));
             }
-            let object_id = read_id(is, data);
+            let object_id = read_id_be(is, data);
             let num_elements = read_u32_be(&data[is + 4..]);
             let element_type = FieldType::from_value(data[is + 8]);
             let total = hdr + num_elements as usize * element_type.byte_size(id_size) as usize;

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use crate::parser::gc_record::FieldType;
+use crate::parser::primitive_parsers::read_id_be;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
 use crate::passes::index::{ClassDescriptor, Pass1Output};
 
@@ -35,7 +36,7 @@ use crate::passes::index::{ClassDescriptor, Pass1Output};
 pub const EDGE_SIZE: usize = 16;
 pub type RawEdge = [u8; EDGE_SIZE];
 
-use crate::passes::IO_BUF_SIZE;
+use crate::passes::{IO_BUF_SIZE, MAX_MERGE_FAN_IN};
 
 fn encode_edge(from: u64, to: u64) -> RawEdge {
     let mut buf = [0u8; EDGE_SIZE];
@@ -53,9 +54,6 @@ fn edge_to(e: &RawEdge) -> u64 {
 }
 
 // ── External sorter with async flush ────────────────────────────────────────
-
-/// Above this many chunks, perform a two-level merge to cap the final fan-in.
-const MAX_MERGE_FAN_IN: usize = 64;
 
 struct EdgeSorter {
     output_dir: PathBuf,
@@ -200,10 +198,7 @@ impl EdgeSorter {
         let chunks = std::mem::take(&mut self.chunk_paths);
 
         match chunks.len() {
-            0 => {
-                File::create(output_path).context("create empty edge file")?;
-                Ok(0)
-            }
+            0 => unreachable!(),
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  [{}] merging {} edge chunks…", self.prefix, n);
                 merge_chunks(&chunks, output_path)?;
@@ -440,8 +435,8 @@ impl EdgeStreamExtractor {
                 if data.len() < hdr {
                     return 0;
                 }
-                let object_id = read_id_raw(is, data);
-                let class_id = read_id_raw(is, &data[is + 4..]);
+                let object_id = read_id_be(is, data);
+                let class_id = read_id_be(is, &data[is + 4..]);
                 let data_size =
                     u32::from_be_bytes(data[2 * is + 4..2 * is + 8].try_into().unwrap()) as usize;
                 let total = 1 + hdr + data_size;
@@ -458,7 +453,7 @@ impl EdgeStreamExtractor {
                 if data.len() < hdr {
                     return 0;
                 }
-                let object_id = read_id_raw(is, data);
+                let object_id = read_id_be(is, data);
                 let num_elements =
                     u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap()) as usize;
                 let payload = num_elements * is;
@@ -468,7 +463,7 @@ impl EdgeStreamExtractor {
                 }
                 let elem_data = &data[hdr..hdr + payload];
                 for chunk in elem_data.chunks_exact(is) {
-                    let to = read_id_raw(is, chunk);
+                    let to = read_id_be(is, chunk);
                     if to != 0 {
                         out.push(encode_edge(object_id, to));
                     }
@@ -548,7 +543,7 @@ impl EdgeStreamExtractor {
             if off + is > raw.len() {
                 break;
             }
-            let to = read_id_raw(is, &raw[off..]);
+            let to = read_id_be(is, &raw[off..]);
             if to != 0 {
                 out.push(encode_edge(from, to));
             }
@@ -557,15 +552,6 @@ impl EdgeStreamExtractor {
 }
 
 // ── Inline parser helpers ─────────────────────────────────────────────────────
-
-#[inline(always)]
-fn read_id_raw(is: usize, buf: &[u8]) -> u64 {
-    if is == 8 {
-        u64::from_be_bytes(buf[..8].try_into().unwrap())
-    } else {
-        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
-    }
-}
 
 fn field_type_size(ty: u8, is: usize) -> usize {
     match ty {
@@ -584,7 +570,7 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
         return None;
     }
 
-    let class_object_id = read_id_raw(is, buf);
+    let class_object_id = read_id_be(is, buf);
     let mut pos = fixed;
 
     // Constant pool
@@ -620,7 +606,7 @@ fn class_dump_size_and_edges(is: usize, buf: &[u8], out: &mut Vec<RawEdge>) -> O
             return None;
         }
         if ty == 2 {
-            let to = read_id_raw(is, &buf[pos + is + 1..]);
+            let to = read_id_be(is, &buf[pos + is + 1..]);
             if to != 0 {
                 out.push(encode_edge(class_object_id, to));
             }

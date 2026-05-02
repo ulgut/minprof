@@ -24,7 +24,7 @@
 //! The virtual root is excluded — only actual objects (indices 0..N-1) are written.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -50,64 +50,6 @@ pub struct Pass4Output {
     pub unreachable_shallow: u64,
 }
 
-// ── Step 1: load shallow sizes ────────────────────────────────────────────────
-
-/// Read `shallow_sizes.bin`: a compact array of `u32`, one per object.
-/// Written by pass 1 during the merge step
-fn load_shallow_sizes(path: &Path) -> Result<Vec<u32>> {
-    let file_len = std::fs::metadata(path)?.len() as usize;
-    let n = file_len / 4;
-    let mut sizes = Vec::with_capacity(n);
-
-    let mut reader = BufReader::with_capacity(
-        IO_BUF_SIZE,
-        File::open(path).context("open shallow_sizes.bin")?,
-    );
-    loop {
-        let consumed = {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            let records = buf.len() / 4;
-            for chunk in buf[..records * 4].chunks_exact(4) {
-                sizes.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            records * 4
-        };
-        reader.consume(consumed);
-    }
-
-    Ok(sizes)
-}
-
-// ── Step 2: read idom array ───────────────────────────────────────────────────
-
-fn load_idom(idom_path: &Path) -> Result<Vec<u32>> {
-    let file_len = std::fs::metadata(idom_path)?.len() as usize;
-    let count = file_len / 4;
-    let mut idom = Vec::with_capacity(count);
-
-    let mut reader = BufReader::with_capacity(
-        IO_BUF_SIZE,
-        File::open(idom_path).context("open idom file")?,
-    );
-    loop {
-        let consumed = {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            let records = buf.len() / 4;
-            for chunk in buf[..records * 4].chunks_exact(4) {
-                idom.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            records * 4
-        };
-        reader.consume(consumed);
-    }
-    Ok(idom)
-}
 
 // ── Step 3: compute retained sizes in RPO space ─────────────────────────────
 
@@ -185,26 +127,14 @@ fn write_retained(
         File::create(path).context("create retained file")?,
     );
 
-    // Write in batches to reduce per-entry overhead.
-    // 8192 entries × 8 bytes = 64 KiB batch — fits in L1.
-    const BATCH: usize = 8192;
-    let mut buf = [0u8; BATCH * 8];
-    let mut i = 0usize;
-    while i < node_count {
-        let end = (i + BATCH).min(node_count);
-        let count = end - i;
-        for j in 0..count {
-            let node = i + j;
-            let rpo = node_to_rpo[node];
-            let r = if rpo != UNDEFINED {
-                retained_rpo[rpo as usize]
-            } else {
-                shallow[node] as u64
-            };
-            buf[j * 8..(j + 1) * 8].copy_from_slice(&r.to_le_bytes());
-        }
-        w.write_all(&buf[..count * 8])?;
-        i = end;
+    for node in 0..node_count {
+        let rpo = node_to_rpo[node];
+        let r = if rpo != UNDEFINED {
+            retained_rpo[rpo as usize]
+        } else {
+            shallow[node] as u64
+        };
+        w.write_all(&r.to_le_bytes())?;
     }
     w.flush()?;
     Ok(())
@@ -217,11 +147,11 @@ pub fn run(pass1: &Pass1Output, pass3: &Pass3Output, output_dir: &Path) -> Resul
     let n = pass3.node_count as usize;
 
     eprintln!("  loading shallow sizes...");
-    let shallow = load_shallow_sizes(&pass1.shallow_sizes_path)?;
+    let shallow = crate::passes::read_u32s(&pass1.shallow_sizes_path)?;
     assert_eq!(shallow.len(), n, "shallow size count mismatch");
 
     eprintln!("  loading idom...");
-    let idom = load_idom(&pass3.idom_path)?;
+    let idom = crate::passes::read_u32s(&pass3.idom_path)?;
 
     eprintln!("  computing retained sizes...");
     let (retained_rpo, _total_shallow, unreachable_count, unreachable_shallow) =

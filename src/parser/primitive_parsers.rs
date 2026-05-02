@@ -55,3 +55,14 @@ pub fn parse_f32(i: &[u8]) -> IResult<&[u8], f32> {
 pub fn parse_f64(i: &[u8]) -> IResult<&[u8], f64> {
     number::streaming::be_f64(i)
 }
+
+/// Read a big-endian HPROF object ID from the start of `buf`.
+/// `is` must be 4 or 8 (the id_size from the file header).
+#[inline(always)]
+pub fn read_id_be(is: usize, buf: &[u8]) -> u64 {
+    if is == 8 {
+        u64::from_be_bytes(buf[..8].try_into().unwrap())
+    } else {
+        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
+    }
+}

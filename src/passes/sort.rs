@@ -14,9 +14,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rayon::slice::ParallelSliceMut;
 
-use crate::passes::IO_BUF_SIZE;
-
-const MAX_MERGE_FAN_IN: usize = 64;
+use crate::passes::{IO_BUF_SIZE, MAX_MERGE_FAN_IN};
 
 pub struct RecordSorter<const N: usize> {
     output_dir: PathBuf,
@@ -80,12 +78,7 @@ impl<const N: usize> RecordSorter<N> {
         self.current.clear();
         w.flush()?;
         self.chunk_paths.push(path);
-        eprintln!(
-            "  [{}] flushed chunk {} ({} total)",
-            self.prefix,
-            self.chunk_paths.len(),
-            self.chunk_paths.len(),
-        );
+        eprintln!("  [{}] flushed chunk {}", self.prefix, self.chunk_paths.len());
         Ok(())
     }
 

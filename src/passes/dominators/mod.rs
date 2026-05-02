@@ -23,7 +23,7 @@
 //! immediate dominator. Unreachable nodes get `UNDEFINED`.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -379,29 +379,6 @@ fn write_u32_vec(data: &[u32], path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_u32_vec(path: &Path) -> Result<Vec<u32>> {
-    let file_len = std::fs::metadata(path)?.len() as usize;
-    let count = file_len / 4;
-    let mut data = Vec::with_capacity(count);
-    let mut reader =
-        BufReader::with_capacity(IO_BUF_SIZE, File::open(path).context("open array file")?);
-    loop {
-        let consumed = {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                break;
-            }
-            let records = buf.len() / 4;
-            for chunk in buf[..records * 4].chunks_exact(4) {
-                data.push(u32::from_le_bytes(chunk.try_into().unwrap()));
-            }
-            records * 4
-        };
-        reader.consume(consumed);
-    }
-    Ok(data)
-}
-
 // ── Step 6: sort predecessor edges by target DFS preorder (descending) ──────
 
 fn key_pred_desc(rec: &[u8; PRED_EDGE_SIZE]) -> (u64, u64) {
@@ -595,16 +572,6 @@ fn compute_idom_nca(
 
 // ── Step 9: write idom to disk ───────────────────────────────────────────────
 
-fn write_idom(idom: &[u32], path: &Path) -> Result<()> {
-    let mut w =
-        BufWriter::with_capacity(IO_BUF_SIZE, File::create(path).context("create idom file")?);
-    let bytes =
-        unsafe { std::slice::from_raw_parts(idom.as_ptr().cast::<u8>(), idom.len() * 4) };
-    w.write_all(bytes)?;
-    w.flush()?;
-    Ok(())
-}
-
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Result<Pass3Output> {
@@ -664,7 +631,7 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
     let total = (n + 1) as usize;
     {
         // Read pre_to_node from disk, build node_to_pre in memory.
-        let pre_to_node = read_u32_vec(&dfs.pre_to_node_path)?;
+        let pre_to_node = crate::passes::read_u32s(&dfs.pre_to_node_path)?;
         let mut node_to_pre = vec![UNDEFINED; total];
         for (pre, &node) in pre_to_node.iter().enumerate() {
             node_to_pre[node as usize] = pre as u32;
@@ -673,7 +640,7 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         drop(pre_to_node);
 
         // Build rpo_to_node from post_order on disk.
-        let mut post_order = read_u32_vec(&dfs.post_order_path)?;
+        let mut post_order = crate::passes::read_u32s(&dfs.post_order_path)?;
         let _ = std::fs::remove_file(&dfs.post_order_path);
         post_order.reverse();
         let rpo_to_node = post_order;
@@ -694,7 +661,7 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         // ── Phase 1: compute semidominators ──────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("  computing dominators (Semi-NCA)...");
-        let parent_pre = read_u32_vec(&dfs.parent_pre_path)?;
+        let parent_pre = crate::passes::read_u32s(&dfs.parent_pre_path)?;
         let _ = std::fs::remove_file(&dfs.parent_pre_path);
 
         eprintln!("    phase 1: computing semidominators...");
@@ -711,9 +678,9 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         // ── Convert idom from preorder to RPO ────────────────────────────────
         let t = std::time::Instant::now();
         eprintln!("  converting idom to RPO...");
-        let pre_to_node = read_u32_vec(&dfs.pre_to_node_path)?;
+        let pre_to_node = crate::passes::read_u32s(&dfs.pre_to_node_path)?;
         let _ = std::fs::remove_file(&dfs.pre_to_node_path);
-        let rpo_to_node = read_u32_vec(&rpo_to_node_path)?;
+        let rpo_to_node = crate::passes::read_u32s(&rpo_to_node_path)?;
 
         let mut node_to_rpo = vec![UNDEFINED; total];
         for (rpo, &node) in rpo_to_node.iter().enumerate() {
@@ -738,7 +705,7 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
 
         // ── Write idom to disk ───────────────────────────────────────────────
         let idom_path = output_dir.join("idom.bin");
-        write_idom(&idom_rpo, &idom_path)?;
+        write_u32_vec(&idom_rpo, &idom_path).context("write idom.bin")?;
         let _ = std::fs::remove_file(&rpo_to_node_path);
 
         Ok(Pass3Output {

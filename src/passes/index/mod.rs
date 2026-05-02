@@ -16,8 +16,9 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use crate::parser::gc_record::{FieldInfo, FieldType};
+use crate::parser::primitive_parsers::read_id_be;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
-use crate::passes::IO_BUF_SIZE;
+use crate::passes::{IO_BUF_SIZE, MAX_MERGE_FAN_IN};
 
 // ── On-disk entry format ─────────────────────────────────────────────────────
 //
@@ -78,11 +79,11 @@ fn entry_id(buf: &RawEntry) -> u64 {
 
 // ── ClassDescriptor ──────────────────────────────────────────────────────────
 
-/// Everything retained about a class after pass 1.
-/// Lives in memory for the duration of the analysis — typically tens of MB.
 /// Type alias for the in-memory class map used throughout the analysis.
 pub type ClassDescriptorMap = std::collections::HashMap<u64, ClassDescriptor>;
 
+/// Everything retained about a class after pass 1.
+/// Lives in memory for the duration of the analysis — typically tens of MB.
 #[derive(Clone)]
 pub struct ClassDescriptor {
     /// Dot-separated class name, e.g. `java.lang.String`.
@@ -113,10 +114,6 @@ pub struct Pass1Output {
 }
 
 // ── External sorter ──────────────────────────────────────────────────────────
-
-/// Above this many chunks, do a two-level merge (merge groups → then merge groups).
-/// Keeps the final merge fan-in small regardless of dump size.
-const MAX_MERGE_FAN_IN: usize = 64;
 
 struct ExternalSorter {
     output_dir: PathBuf,
@@ -189,7 +186,6 @@ impl ExternalSorter {
             Vec::with_capacity(self.entries_per_chunk),
         );
 
-        let path_clone = out_path.clone();
         let handle = thread::Builder::new()
             .name(format!("sort-flush-{chunk_idx}"))
             .spawn(move || -> Result<PathBuf> {
@@ -198,9 +194,8 @@ impl ExternalSorter {
                 buf.par_sort_unstable_by_key(entry_id);
                 let mut w = BufWriter::with_capacity(
                     IO_BUF_SIZE,
-                    File::create(&path_clone).context("create sort chunk")?,
+                    File::create(&out_path).context("create sort chunk")?,
                 );
-                // Bulk write: one write_all for the whole buffer.
                 // Safety: RawEntry = [u8; ENTRY_SIZE] — plain bytes, alignment 1, no padding.
                 let bytes = unsafe {
                     std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * ENTRY_SIZE)
@@ -208,7 +203,7 @@ impl ExternalSorter {
                 w.write_all(bytes)?;
                 w.flush()?;
                 eprintln!("  chunk {} written", chunk_idx + 1);
-                Ok(path_clone)
+                Ok(out_path)
             })?;
 
         self.pending_flush = Some(handle);
@@ -256,10 +251,7 @@ impl ExternalSorter {
         let chunks = std::mem::take(&mut self.chunk_paths);
 
         match chunks.len() {
-            0 => {
-                File::create(output_path).context("create empty object index")?;
-                return Ok(0);
-            }
+            0 => unreachable!(),
             n if n <= MAX_MERGE_FAN_IN => {
                 eprintln!("  merging {} chunks…", n);
                 merge_chunks_with_fixup(&chunks, output_path, fixup)?;
@@ -587,16 +579,6 @@ impl IndexStreamExtractor {
     }
 }
 
-/// Read a big-endian object ID (4 or 8 bytes) from the start of `buf`.
-#[inline(always)]
-fn read_id_be(is: usize, buf: &[u8]) -> u64 {
-    if is == 8 {
-        u64::from_be_bytes(buf[..8].try_into().unwrap())
-    } else {
-        u32::from_be_bytes(buf[..4].try_into().unwrap()) as u64
-    }
-}
-
 /// Try to parse a CLASS_DUMP sub-record from `buf` (the bytes immediately after
 /// the 0x20 tag byte).  Returns `(bytes_consumed, IndexItem)` or `None` if there
 /// is not enough data in the buffer.
@@ -856,7 +838,7 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     for (class_id, desc) in &mut class_index {
         if let Some(&name_sid) = name_id_map.get(class_id) {
             if let Some(raw) = string_table.get(&name_sid) {
-                desc.name = raw.replace('/', ".");
+                desc.name = if raw.contains('/') { raw.replace('/', ".") } else { raw.clone() };
             }
         }
     }
