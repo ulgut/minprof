@@ -13,8 +13,11 @@
 //!
 //! # Fixture scale
 //!
-//! Controlled by BENCH_OBJECTS / BENCH_CLASSES / BENCH_ROOTS below.
-//! Adjust to trade off benchmark duration vs sensitivity.
+//! Defaults to 5,000,000 objects. Override per run via the BENCH_OBJECTS /
+//! BENCH_CLASSES / BENCH_ROOTS environment variables (the fixture regenerates
+//! automatically when any of them changes), e.g.
+//!
+//!   BENCH_OBJECTS=10000000 cargo bench --bench passes -- pass3
 
 use std::fs;
 use std::io::{Read, Write};
@@ -29,10 +32,26 @@ use minprof::passes::edges::Pass2Output;
 use minprof::passes::index::{Pass1Output, load_class_index, load_roots};
 
 // ── Fixture parameters ────────────────────────────────────────────────────────
+//
+// Override at run time without editing this file, e.g.
+//   BENCH_OBJECTS=10000000 cargo bench --bench passes
+// The fixture is regenerated automatically when any parameter changes.
 
-const BENCH_OBJECTS: &str = "1000000";
-const BENCH_CLASSES: &str = "1000";
-const BENCH_ROOTS: &str = "5000";
+fn bench_objects() -> String {
+    std::env::var("BENCH_OBJECTS").unwrap_or_else(|_| "5000000".to_string())
+}
+fn bench_classes() -> String {
+    std::env::var("BENCH_CLASSES").unwrap_or_else(|_| "1000".to_string())
+}
+fn bench_roots() -> String {
+    std::env::var("BENCH_ROOTS").unwrap_or_else(|_| "5000".to_string())
+}
+
+/// Criterion sample counts. Larger than criterion's small-run defaults so that
+/// pass-to-pass changes stand out above run-to-run variance. Pass 3 is the
+/// slowest pass, so it uses fewer samples to keep wall-clock reasonable.
+const SAMPLES_FAST: usize = 50;
+const SAMPLES_SLOW: usize = 30;
 
 const GEN_HPROF: &str = env!("CARGO_BIN_EXE_gen_hprof");
 
@@ -56,26 +75,32 @@ fn fixture() -> &'static Fixture {
         let hprof = dir.join("bench.hprof");
         // Sentinel: all pre-computed files are present.
         let sentinel = dir.join(".complete");
+        // Records the parameters the fixture was built with, so a parameter
+        // change forces regeneration instead of silently reusing stale data.
+        let params_path = dir.join(".params");
+        let (objects, classes, roots) = (bench_objects(), bench_classes(), bench_roots());
+        let params = format!("{objects} {classes} {roots}");
 
-        if !sentinel.exists() {
+        let stale = fs::read_to_string(&params_path).map(|p| p != params).unwrap_or(true);
+
+        if !sentinel.exists() || stale {
             // (Re-)generate from scratch.
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
 
             eprintln!(
-                "[bench] generating fixture: {} objects, {} classes, {} roots",
-                BENCH_OBJECTS, BENCH_CLASSES, BENCH_ROOTS,
+                "[bench] generating fixture: {objects} objects, {classes} classes, {roots} roots",
             );
             let status = std::process::Command::new(GEN_HPROF)
                 .args([
                     "--output",
                     hprof.to_str().unwrap(),
                     "--objects",
-                    BENCH_OBJECTS,
+                    &objects,
                     "--classes",
-                    BENCH_CLASSES,
+                    &classes,
                     "--roots",
-                    BENCH_ROOTS,
+                    &roots,
                 ])
                 .status()
                 .expect("gen_hprof binary not found — run `cargo build --release` first");
@@ -95,6 +120,7 @@ fn fixture() -> &'static Fixture {
 
             let counts = format!("{} {} {}", p1.object_count, p2.edge_count, p3.node_count);
             fs::write(&sentinel, counts).unwrap();
+            fs::write(&params_path, &params).unwrap();
 
             eprintln!("[bench] fixture ready.");
         }
@@ -196,7 +222,7 @@ impl Drop for TempOutDir {
 fn bench_pass1(c: &mut Criterion) {
     let f = fixture();
     let mut group = c.benchmark_group("pass1_index");
-    group.sample_size(10);
+    group.sample_size(SAMPLES_FAST);
 
     group.bench_function(format!("{}_objects", f.object_count), |b| {
         b.iter_batched(
@@ -214,7 +240,7 @@ fn bench_pass1(c: &mut Criterion) {
 fn bench_pass2(c: &mut Criterion) {
     let f = fixture();
     let mut group = c.benchmark_group("pass2_edges");
-    group.sample_size(10);
+    group.sample_size(SAMPLES_FAST);
 
     group.bench_function(format!("{}_objects", f.object_count), |b| {
         b.iter_batched(
@@ -232,7 +258,7 @@ fn bench_pass2(c: &mut Criterion) {
 fn bench_pass3(c: &mut Criterion) {
     let f = fixture();
     let mut group = c.benchmark_group("pass3_dominators");
-    group.sample_size(10);
+    group.sample_size(SAMPLES_SLOW);
 
     group.bench_function(format!("{}_objects", f.object_count), |b| {
         b.iter_batched(
@@ -250,7 +276,7 @@ fn bench_pass3(c: &mut Criterion) {
 fn bench_pass4(c: &mut Criterion) {
     let f = fixture();
     let mut group = c.benchmark_group("pass4_retained");
-    group.sample_size(10);
+    group.sample_size(SAMPLES_FAST);
 
     group.bench_function(format!("{}_objects", f.object_count), |b| {
         b.iter_batched(

@@ -6,19 +6,18 @@
 //! - Sorted object index on disk: `(object_id, class_id, shallow_size)` per object
 //! - GC root ID list on disk
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use anyhow::{Context, Result};
 
 use crate::parser::gc_record::{FieldInfo, FieldType};
 use crate::parser::primitive_parsers::read_id_be;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
-use crate::passes::{IO_BUF_SIZE, MAX_MERGE_FAN_IN};
+use crate::passes::IO_BUF_SIZE;
+use crate::passes::sort::RecordSorter;
 
 // ── On-disk entry format ─────────────────────────────────────────────────────
 //
@@ -113,264 +112,12 @@ pub struct Pass1Output {
     pub shallow_sizes_path: PathBuf,
 }
 
-// ── External sorter ──────────────────────────────────────────────────────────
+// ── Object-index sort key ────────────────────────────────────────────────────
 
-struct ExternalSorter {
-    output_dir: PathBuf,
-    chunk_paths: Vec<PathBuf>,
-    current: Vec<RawEntry>,
-    entries_per_chunk: usize,
-    /// Monotonically increasing chunk counter — used for filenames so that
-    /// background flushes that haven't been collected yet still get unique names.
-    chunk_count: usize,
-    /// In-flight background sort+write task. At most one pending at a time;
-    /// collected (joined) at the start of each subsequent `flush_chunk` call.
-    pending_flush: Option<thread::JoinHandle<Result<PathBuf>>>,
-}
-
-impl ExternalSorter {
-    fn new(output_dir: PathBuf) -> Self {
-        let chunk_bytes = crate::passes::sort_chunk_bytes();
-        let entries_per_chunk = chunk_bytes / ENTRY_SIZE;
-        eprintln!(
-            "  sort buffer: {:.1} GiB ({} entries/chunk)",
-            chunk_bytes as f64 / (1 << 30) as f64,
-            entries_per_chunk
-        );
-        Self {
-            output_dir,
-            chunk_paths: Vec::new(),
-            current: Vec::with_capacity(entries_per_chunk),
-            entries_per_chunk,
-            chunk_count: 0,
-            pending_flush: None,
-        }
-    }
-
-    fn push(&mut self, entry: RawEntry) -> Result<()> {
-        self.current.push(entry);
-        if self.current.len() >= self.entries_per_chunk {
-            self.flush_chunk()?;
-        }
-        Ok(())
-    }
-
-    /// Join the in-flight sort+write thread (if any) and record its output path.
-    fn collect_pending(&mut self) -> Result<()> {
-        if let Some(handle) = self.pending_flush.take() {
-            let path = handle.join().expect("sort-flush thread panicked")?;
-            self.chunk_paths.push(path);
-        }
-        Ok(())
-    }
-
-    /// Sort the current buffer and write it to disk on a background thread,
-    /// overlapping the write with continued parsing on the main thread.
-    fn flush_chunk(&mut self) -> Result<()> {
-        if self.current.is_empty() {
-            return Ok(());
-        }
-        // Join the previous background flush before starting a new one.
-        self.collect_pending()?;
-
-        let chunk_idx = self.chunk_count;
-        self.chunk_count += 1;
-        let out_path = self
-            .output_dir
-            .join(format!("object_index_chunk_{chunk_idx}.bin"));
-
-        // Swap out the full buffer for a fresh one so parsing can continue
-        // immediately while the old buffer is sorted and written in a thread.
-        let to_sort = std::mem::replace(
-            &mut self.current,
-            Vec::with_capacity(self.entries_per_chunk),
-        );
-
-        let handle = thread::Builder::new()
-            .name(format!("sort-flush-{chunk_idx}"))
-            .spawn(move || -> Result<PathBuf> {
-                use rayon::slice::ParallelSliceMut;
-                let mut buf = to_sort;
-                buf.par_sort_unstable_by_key(entry_id);
-                let mut w = BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    File::create(&out_path).context("create sort chunk")?,
-                );
-                // Safety: RawEntry = [u8; ENTRY_SIZE] — plain bytes, alignment 1, no padding.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * ENTRY_SIZE)
-                };
-                w.write_all(bytes)?;
-                w.flush()?;
-                eprintln!("  chunk {} written", chunk_idx + 1);
-                Ok(out_path)
-            })?;
-
-        self.pending_flush = Some(handle);
-        Ok(())
-    }
-
-    /// Merge all chunks into a single sorted file at `output_path`, applying
-    /// `fixup` to every entry as it is written.
-    ///
-    /// Returns the total number of entries written.
-    fn finish<F>(mut self, output_path: &Path, mut fixup: F) -> Result<u64>
-    where
-        F: FnMut(&mut RawEntry),
-    {
-        // Collect any in-flight background flush first.
-        self.collect_pending()?;
-
-        // Fast path: no chunks flushed — all data still lives in `current`.
-        if self.chunk_paths.is_empty() {
-            if self.current.is_empty() {
-                File::create(output_path).context("create empty object index")?;
-                return Ok(0);
-            }
-            use rayon::slice::ParallelSliceMut;
-            let count = self.current.len() as u64;
-            eprintln!("  sorting {count} entries in-memory (no chunk files needed)…");
-            self.current.par_sort_unstable_by_key(entry_id);
-            let mut w = BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                File::create(output_path).context("create object index")?,
-            );
-            for mut entry in self.current.drain(..) {
-                fixup(&mut entry);
-                w.write_all(&entry)?;
-            }
-            w.flush()?;
-            return Ok(count);
-        }
-
-        // Flush any remaining in-memory entries, then collect that flush.
-        self.flush_chunk()?;
-        self.collect_pending()?;
-
-        // Take ownership so Drop sees an empty list and won't double-delete.
-        let chunks = std::mem::take(&mut self.chunk_paths);
-
-        match chunks.len() {
-            0 => unreachable!(),
-            n if n <= MAX_MERGE_FAN_IN => {
-                eprintln!("  merging {} chunks…", n);
-                merge_chunks_with_fixup(&chunks, output_path, fixup)?;
-                for p in &chunks {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-            n => {
-                // Two-level merge: intermediate files written without fixup;
-                // fixup applied during the final merge pass.
-                let group_size = MAX_MERGE_FAN_IN;
-                let num_groups = (n + group_size - 1) / group_size;
-                eprintln!("  two-level merge: {} chunks → {} groups…", n, num_groups);
-
-                let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
-                for (g, group) in chunks.chunks(group_size).enumerate() {
-                    let inter = self.output_dir.join(format!("object_index_inter_{g}.bin"));
-                    eprintln!(
-                        "    merging group {}/{} ({} chunks)…",
-                        g + 1,
-                        num_groups,
-                        group.len()
-                    );
-                    merge_chunks_with_fixup(group, &inter, |_| {})?;
-                    for p in group {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    intermediates.push(inter);
-                }
-
-                eprintln!(
-                    "  final merge of {} intermediate files…",
-                    intermediates.len()
-                );
-                merge_chunks_with_fixup(&intermediates, output_path, fixup)?;
-                for p in &intermediates {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-
-        let count = std::fs::metadata(output_path)?.len() / ENTRY_SIZE as u64;
-        Ok(count)
-    }
-}
-
-/// Clean up any chunk files if the sorter is dropped before `finish()` (e.g. on panic).
-impl Drop for ExternalSorter {
-    fn drop(&mut self) {
-        // Join in-flight flush so we can retrieve its file path and delete it.
-        if let Some(handle) = self.pending_flush.take() {
-            if let Ok(Ok(path)) = handle.join() {
-                self.chunk_paths.push(path);
-            }
-        }
-        for p in &self.chunk_paths {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-/// K-way merge of sorted chunk files into a single sorted output file.
-/// `fixup` is called on each entry immediately before it is written.
-fn merge_chunks_with_fixup<F>(
-    chunk_paths: &[PathBuf],
-    output_path: &Path,
-    mut fixup: F,
-) -> Result<()>
-where
-    F: FnMut(&mut RawEntry),
-{
-    let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
-    let mut readers: Vec<BufReader<File>> = chunk_paths
-        .iter()
-        .map(|p| {
-            Ok(BufReader::with_capacity(
-                per_reader_buf,
-                File::open(p).context("open sort chunk")?,
-            ))
-        })
-        .collect::<Result<_>>()?;
-
-    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = BinaryHeap::new();
-    let mut peek: Vec<Option<RawEntry>> = vec![None; readers.len()];
-
-    for (i, reader) in readers.iter_mut().enumerate() {
-        if let Some(entry) = read_entry(reader)? {
-            heap.push(Reverse((entry_id(&entry), i)));
-            peek[i] = Some(entry);
-        }
-    }
-
-    let mut w = BufWriter::with_capacity(
-        IO_BUF_SIZE,
-        File::create(output_path).context("create merged object index")?,
-    );
-
-    while let Some(Reverse((_, idx))) = heap.pop() {
-        let mut entry = peek[idx].take().unwrap();
-        fixup(&mut entry);
-        w.write_all(&entry)?;
-
-        if let Some(next) = read_entry(&mut readers[idx])? {
-            heap.push(Reverse((entry_id(&next), idx)));
-            peek[idx] = Some(next);
-        }
-    }
-
-    w.flush()?;
-    Ok(())
-}
-
-fn read_entry(reader: &mut impl Read) -> Result<Option<RawEntry>> {
-    let mut buf = [0u8; ENTRY_SIZE];
-    match reader.read_exact(&mut buf) {
-        Ok(()) => Ok(Some(buf)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e).context("read sort chunk entry"),
-    }
+/// Sort key for object-index entries: by object_id. Object IDs are unique, so
+/// the second key component is unused.
+fn key_object_entry(e: &RawEntry) -> (u64, u64) {
+    (entry_id(e), 0)
 }
 
 // ── IndexItem ─────────────────────────────────────────────────────────────────
@@ -833,7 +580,8 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     let mut name_id_map: HashMap<u64, u64> = HashMap::new();
     let mut class_index: HashMap<u64, ClassDescriptor> = HashMap::new();
     let mut roots: Vec<u64> = Vec::new();
-    let mut sorter = ExternalSorter::new(output_dir.to_path_buf());
+    let mut sorter =
+        RecordSorter::<ENTRY_SIZE>::new(output_dir.to_path_buf(), "object_index", key_object_entry);
 
     let mut extractor = IndexStreamExtractor {
         id_size,
@@ -915,7 +663,7 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
         IO_BUF_SIZE,
         File::create(&shallow_sizes_path).context("create shallow_sizes.bin")?,
     );
-    let object_count = sorter.finish(&index_path, |entry| {
+    let object_count = sorter.finish_with_fixup(&index_path, |entry| {
         let (_, class_id, _) = decode_entry(entry);
         if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
             if let Some(desc) = class_index.get(&class_id) {

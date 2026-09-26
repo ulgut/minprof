@@ -121,20 +121,28 @@ fn prepare_indexed_files(
     }
     eprintln!("  [adj] partial resolve done (sort 1/2)");
 
-    // ── Sort 2/2: resolve to_id → to_idx, produce fwd + rev indexed ────
+    // ── Resolve 2/2: resolve to_id → to_idx, produce fwd + rev indexed ──
     //
     // Read partial_sorted (to_id, from_idx) sorted by to_id.  Co-scan IDs
     // to resolve to_id → to_idx.  Simultaneously:
-    //   • Push (from_idx, to_idx) into fwd_indexed RecordSorter
-    //   • Write (to_idx, from_idx) to rev_indexed.bin — already ordered by
-    //     to_idx since we scan sorted to_ids.
+    //   • Write (from_idx, to_idx) to fwd_indexed.bin
+    //   • Write (to_idx, from_idx) to rev_indexed.bin
+    //
+    // No sort is needed here. `build_csr_from_indexed` is a counting sort and
+    // only requires each node's neighbours to be contiguous, not the whole file
+    // sorted. Because this scan visits to_ids in ascending order, every node's
+    // forward neighbours are emitted in ascending to_idx order — exactly the
+    // order a full (from_idx, to_idx) sort would produce — so the resulting CSR
+    // (and the DFS / idom derived from it) is identical, byte for byte.
     //
     // Also inject vroot→root predecessor edges into rev_indexed.
-    let fwd_indexed_path = output_dir.join("fwd_indexed_sorted.bin");
+    let fwd_indexed_path = output_dir.join("fwd_indexed.bin");
     let rev_indexed_path = output_dir.join("rev_indexed.bin");
     {
-        let mut fwd_sorter =
-            RecordSorter::<INDEXED_SIZE>::new(output_dir.to_path_buf(), "fwd_indexed", key_indexed);
+        let mut fwd_w = BufWriter::with_capacity(
+            IO_BUF_SIZE,
+            File::create(&fwd_indexed_path).context("create fwd_indexed")?,
+        );
         let mut rev_w = BufWriter::with_capacity(
             IO_BUF_SIZE,
             File::create(&rev_indexed_path).context("create rev_indexed")?,
@@ -157,10 +165,8 @@ fn prepare_indexed_files(
             }
             let to_idx = scan as u32;
 
-            let mut fwd_rec = [0u8; INDEXED_SIZE];
-            fwd_rec[0..4].copy_from_slice(&from_idx.to_le_bytes());
-            fwd_rec[4..8].copy_from_slice(&to_idx.to_le_bytes());
-            fwd_sorter.push(fwd_rec)?;
+            fwd_w.write_all(&from_idx.to_le_bytes())?;
+            fwd_w.write_all(&to_idx.to_le_bytes())?;
 
             rev_w.write_all(&to_idx.to_le_bytes())?;
             rev_w.write_all(&from_idx.to_le_bytes())?;
@@ -172,14 +178,13 @@ fn prepare_indexed_files(
             rev_w.write_all(&vroot.to_le_bytes())?;
         }
 
+        fwd_w.flush()?;
         rev_w.flush()?;
         drop(reader);
         let _ = std::fs::remove_file(&partial_path);
-        drop(ids); // free 4 GB before forward merge
-
-        fwd_sorter.finish(&fwd_indexed_path)?;
+        drop(ids); // free the id table before building the CSR
     }
-    eprintln!("  [adj] indexed resolve done (sort 2/2)");
+    eprintln!("  [adj] indexed resolve done");
 
     Ok((fwd_indexed_path, rev_indexed_path))
 }
@@ -188,12 +193,6 @@ fn key_partial(rec: &[u8; PARTIAL_SIZE]) -> (u64, u64) {
     let key = u64::from_le_bytes(rec[0..8].try_into().unwrap());
     let idx = u32::from_le_bytes(rec[8..12].try_into().unwrap()) as u64;
     (key, idx)
-}
-
-fn key_indexed(rec: &[u8; INDEXED_SIZE]) -> (u64, u64) {
-    let a = u32::from_le_bytes(rec[0..4].try_into().unwrap()) as u64;
-    let b = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as u64;
-    (a, b)
 }
 
 fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr> {
@@ -222,18 +221,22 @@ fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr
     let mut neighbors = vec![0u32; edge_count];
 
     {
+        // Per-node write cursor (counting-sort fill). The input file need not be
+        // sorted by node_a: each record is placed at its node's running cursor,
+        // so neighbours land contiguously in the order they appear in the file.
+        let mut cursor = offsets.clone();
         let mut reader = BufReader::with_capacity(
             IO_BUF_SIZE,
             File::open(indexed_path).context("open indexed file (fill)")?,
         );
         let mut buf = [0u8; INDEXED_SIZE];
-        let mut write_pos = 0usize;
         while reader.read_exact(&mut buf).is_ok() {
             let node_a = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
             if node_a < total_nodes {
                 let node_b = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-                neighbors[write_pos] = node_b;
-                write_pos += 1;
+                let pos = cursor[node_a];
+                neighbors[pos as usize] = node_b;
+                cursor[node_a] = pos + 1;
             }
         }
     }

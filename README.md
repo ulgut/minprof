@@ -192,30 +192,67 @@ Once these files exist, `-i <dir>` can generate any report without touching the 
 |------|-------------|----------------|
 | Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | ~100 MB (class index) + sort buffer |
 | Pass 2 — edges | Extract object references, sort into `edges.bin` + `reverse_edges.bin` | sort buffer |
-| Pass 3 — dominator tree | CHK iterative algorithm on in-memory CSR graph | proportional to edge count |
+| Pass 3 — dominator tree | Semi-NCA algorithm on in-memory CSR graph | proportional to edge count |
 | Pass 4 — retained sizes | Bottom-up dominator tree walk | O(N) |
 
 The class index (kept in RAM across all passes) is typically under 100 MB for real-world JVM applications regardless of heap size.
 
-## Comparison
+## Comparison with standard tooling
 
-|                         | minprof       | Eclipse MAT       | VisualVM          |
-|-------------------------|---------------|-------------------|-------------------|
-| Peak RAM                | ~1 GB         | ≈ dump size       | ≈ dump size       |
-| 100 GB dump             | works         | needs ~100 GB RAM | needs ~100 GB RAM |
-| Retained heap           | ✅            | ✅                 | ✅                 |
-| Dominator tree          | ✅            | ✅                 | ❌                 |
-| Path to GC root         | ✅            | ✅                 | ❌                 |
-| Leak suspects           | ✅            | ✅                 | ❌                 |
-| GC pressure metrics     | ✅            | ✅                 | partial           |
-| Interactive treemap     | ✅ (HTML)     | ✅                 | ❌                 |
-| JSON / scriptable       | ✅            | ❌                 | ❌                 |
+The usual ways to open an `.hprof` file are **Eclipse MAT**, **VisualVM**, and the
+JDK's **`jhat`/`jmap`** (`jhat` is removed in modern JDKs). All three load the dump
+into a heap structure sized in proportion to the dump itself, so the machine doing
+the analysis needs roughly as much memory as the machine that produced the dump.
+minprof instead streams the dump and keeps the large structures on disk, so peak
+RAM is bounded by a configurable fraction of system memory regardless of dump size.
+
+### Capabilities
+
+|                         | minprof          | Eclipse MAT       | VisualVM          | jhat / jmap       |
+|-------------------------|------------------|-------------------|-------------------|-------------------|
+| Peak RAM                | bounded (~40% of system RAM, configurable) | ≈ dump size | ≈ dump size | ≈ dump size |
+| 100 GB dump             | works            | needs ~100 GB RAM | needs ~100 GB RAM | impractical       |
+| Retained heap           | ✅               | ✅                | ✅                | ❌                |
+| Dominator tree          | ✅               | ✅                | ❌                | ❌                |
+| Path to GC root         | ✅               | ✅                | ❌                | limited           |
+| Leak suspects           | ✅               | ✅                | ❌                | ❌                |
+| GC pressure metrics     | ✅               | ✅                | partial           | ❌                |
+| Interactive treemap     | ✅ (HTML)        | ✅                | ❌                | ❌                |
+| JSON / scriptable       | ✅               | ❌                | ❌                | ❌ (HTML/OQL UI)  |
+| Re-query without reload | ✅ (`-i` index)  | reopen the dump   | reopen the dump   | restart the server |
+| Interface              | CLI + static HTML | desktop GUI       | desktop GUI       | local web server  |
+
+### How the approach differs
+
+- **Memory model.** MAT and VisualVM build an in-memory object model; their working
+  set scales with the dump. minprof's scales with the number of distinct *classes*
+  (tens of MB) plus a sort buffer you control — a 100 GB dump is analysed without
+  100 GB of RAM.
+- **Index once, query many.** MAT/VisualVM re-parse (or re-open the index) per
+  session. minprof writes a compact on-disk index on the first run; every later
+  report (`-i <dir> --report …`, `--format html|json`, `--path …`) reads only that
+  index — no HPROF re-read. The index is also portable: build it on the big box,
+  copy the `<dump>.minprof/` directory, query it anywhere.
+- **Scriptable by default.** Newline-delimited JSON on stdout (progress on stderr)
+  drops straight into CI gates, dashboards, and diffs between two dumps. MAT is
+  GUI-first (batch mode exists but is awkward); VisualVM is GUI-only.
+- **No GUI, no JVM to launch.** A single static-linked binary; the HTML report is
+  self-contained (no server, no external assets).
+
+### Throughput
+
+On a synthetic fixture of **5,000,000 objects / ~10,000,000 edges** (~0.3 GiB dump,
+`gen_hprof`), the full index build — all four passes — completes in roughly
+**2.4 s** end to end on a developer laptop (parse+index ~0.18 s, edges ~0.08 s,
+dominator tree ~2.0 s, retained sizes ~0.08 s; `cargo bench --bench passes`). The
+dominator-tree pass dominates and is the focus of ongoing optimisation. Repeat
+reports off the existing index are effectively instant.
 
 ## Limitations
 
 - CLI only — no interactive query shell
 - Tested on 64-bit HotSpot HPROF format (`id_size = 8`); 32-bit dumps (`id_size = 4`) parse correctly but are less tested
-- Pass 3 (dominator tree) loads the full edge graph into RAM — on very large dumps (> a few hundred GB) this may require significant memory. See `PERFORMANCE_NOTES.md` for planned improvements.
+- Pass 3 (dominator tree) loads the full edge graph into RAM — on very large dumps (> a few hundred GB) this may require significant memory. See the "Future work" section of [architecture.md](architecture.md) for planned improvements.
 - Hobby project — use with caution
 
 ---
@@ -224,4 +261,5 @@ The class index (kept in RAM across all passes) is typically under 100 MB for re
 
 - [hprof-slurp](https://github.com/agourlay/hprof-slurp) — single-pass streaming HPROF parser in Rust by Arnaud Gourlay. minprof's parser layer is adapted from this project (Apache 2.0).
 - [HPROF format specification](https://docs.oracle.com/javase/8/docs/technotes/samples/hprof.html)
-- [Cooper, Harvey, Kennedy — "A Simple, Fast Dominance Algorithm"](https://www.cs.tufts.edu/~nr/cs257/archive/keith-cooper/dom14.pdf) — the CHK iterative dominator algorithm used in pass 3
+- [Georgiadis — "Linear-Time Algorithms for Dominators and Related Problems"](https://www.cs.princeton.edu/research/techreps/TR-737-05) — the Semi-NCA dominator algorithm used in pass 3
+- [architecture.md](architecture.md) — full pipeline, threading model, on-disk formats, and algorithm details

@@ -16,17 +16,16 @@
 //! for `sync_channel` × 1B edges = 200-500 s of pure overhead).
 
 use anyhow::{Context, Result};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::thread;
 
 use crate::parser::gc_record::FieldType;
 use crate::parser::primitive_parsers::read_id_be;
 use crate::parser::record_stream_parser::{process_with_extractor, read_header};
 use crate::passes::index::{ClassDescriptor, Pass1Output};
+use crate::passes::sort::RecordSorter;
 
 // ── On-disk edge format ──────────────────────────────────────────────────────
 //
@@ -36,7 +35,7 @@ use crate::passes::index::{ClassDescriptor, Pass1Output};
 pub const EDGE_SIZE: usize = 16;
 pub type RawEdge = [u8; EDGE_SIZE];
 
-use crate::passes::{IO_BUF_SIZE, MAX_MERGE_FAN_IN};
+use crate::passes::IO_BUF_SIZE;
 
 fn encode_edge(from: u64, to: u64) -> RawEdge {
     let mut buf = [0u8; EDGE_SIZE];
@@ -53,262 +52,10 @@ fn edge_to(e: &RawEdge) -> u64 {
     u64::from_le_bytes(e[8..16].try_into().unwrap())
 }
 
-// ── External sorter with async flush ────────────────────────────────────────
+// ── Edge sort key ────────────────────────────────────────────────────────────
 
-struct EdgeSorter {
-    output_dir: PathBuf,
-    prefix: String,
-    chunk_paths: Vec<PathBuf>,
-    current: Vec<RawEdge>,
-    edges_per_chunk: usize,
-    chunk_count: usize,
-    /// Background sort+write thread.  At most one in-flight; collected before
-    /// the next flush or in finish().  The old sort buffer lives in this thread
-    /// until the write completes — physical pages are freed on join.  A new
-    /// demand-paged buffer is allocated immediately so extraction can continue.
-    pending_flush: Option<thread::JoinHandle<Result<PathBuf>>>,
-}
-
-impl EdgeSorter {
-    fn new(output_dir: PathBuf, prefix: &str) -> Self {
-        let chunk_bytes = crate::passes::sort_chunk_bytes();
-        let edges_per_chunk = chunk_bytes / EDGE_SIZE;
-        eprintln!(
-            "  sort buffer [{prefix}]: {:.1} GiB ({} edges/chunk)",
-            chunk_bytes as f64 / (1 << 30) as f64,
-            edges_per_chunk
-        );
-        Self {
-            output_dir,
-            prefix: prefix.to_string(),
-            chunk_paths: Vec::new(),
-            current: Vec::with_capacity(edges_per_chunk),
-            edges_per_chunk,
-            chunk_count: 0,
-            pending_flush: None,
-        }
-    }
-
-    fn push(&mut self, edge: RawEdge) -> Result<()> {
-        self.current.push(edge);
-        if self.current.len() >= self.edges_per_chunk {
-            self.flush_chunk()?;
-        }
-        Ok(())
-    }
-
-    /// Join the in-flight sort+write thread (if any) and record its output path.
-    fn collect_pending(&mut self) -> Result<()> {
-        if let Some(handle) = self.pending_flush.take() {
-            let path = handle.join().expect("sort-flush thread panicked")?;
-            self.chunk_paths.push(path);
-        }
-        Ok(())
-    }
-
-    /// Sort the current buffer and write it to disk on a background thread.
-    ///
-    /// Memory: the old buffer is moved into the thread.  A fresh buffer is
-    /// allocated (demand-paged: virtual only until touched).  collect_pending()
-    /// is called first, guaranteeing at most one old buffer is live.  Peak
-    /// physical RSS = one full buffer + the fraction of the new buffer filled
-    /// so far.
-    fn flush_chunk(&mut self) -> Result<()> {
-        if self.current.is_empty() {
-            return Ok(());
-        }
-        self.collect_pending()?;
-
-        let chunk_idx = self.chunk_count;
-        self.chunk_count += 1;
-        let path = self
-            .output_dir
-            .join(format!("{}_chunk_{chunk_idx}.bin", self.prefix));
-        let prefix = self.prefix.clone();
-
-        let to_sort =
-            std::mem::replace(&mut self.current, Vec::with_capacity(self.edges_per_chunk));
-
-        let handle = thread::Builder::new()
-            .name(format!("{prefix}-flush-{chunk_idx}"))
-            .spawn(move || -> Result<PathBuf> {
-                use rayon::slice::ParallelSliceMut;
-                let mut buf = to_sort;
-                buf.par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
-                buf.dedup();
-                let mut w = BufWriter::with_capacity(
-                    IO_BUF_SIZE,
-                    File::create(&path).context("create edge chunk")?,
-                );
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * EDGE_SIZE)
-                };
-                w.write_all(bytes)?;
-                w.flush()?;
-                eprintln!("  [{prefix}] flushed chunk {}", chunk_idx + 1);
-                Ok(path)
-            })?;
-
-        self.pending_flush = Some(handle);
-        Ok(())
-    }
-
-    /// Finish sorting: flush remaining buffer, merge all chunks into `output_path`.
-    fn finish(mut self, output_path: &Path) -> Result<u64> {
-        // Fast path: no chunks on disk and none pending — sort in-memory.
-        if self.chunk_paths.is_empty() && self.pending_flush.is_none() {
-            if self.current.is_empty() {
-                File::create(output_path).context("create empty edge file")?;
-                return Ok(0);
-            }
-            use rayon::slice::ParallelSliceMut;
-            eprintln!(
-                "  [{}] sorting {} edges in-memory…",
-                self.prefix,
-                self.current.len()
-            );
-            self.current
-                .par_sort_unstable_by_key(|e| (edge_from(e), edge_to(e)));
-            self.current.dedup();
-            let count = self.current.len() as u64;
-            let mut w = BufWriter::with_capacity(
-                IO_BUF_SIZE,
-                File::create(output_path).context("create edge file")?,
-            );
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.current.as_ptr().cast::<u8>(),
-                    self.current.len() * EDGE_SIZE,
-                )
-            };
-            w.write_all(bytes)?;
-            w.flush()?;
-            return Ok(count);
-        }
-
-        self.flush_chunk()?;
-        self.collect_pending()?;
-        self.current = Vec::new(); // free sort buffer before merge
-
-        let chunks = std::mem::take(&mut self.chunk_paths);
-
-        match chunks.len() {
-            0 => unreachable!(),
-            n if n <= MAX_MERGE_FAN_IN => {
-                eprintln!("  [{}] merging {} edge chunks…", self.prefix, n);
-                merge_chunks(&chunks, output_path)?;
-                for p in &chunks {
-                    let _ = std::fs::remove_file(p);
-                }
-                let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
-                Ok(count)
-            }
-            n => {
-                let group_size = MAX_MERGE_FAN_IN;
-                let num_groups = (n + group_size - 1) / group_size;
-                eprintln!(
-                    "  [{}] two-level edge merge: {} chunks → {} groups…",
-                    self.prefix, n, num_groups
-                );
-
-                let mut intermediates: Vec<PathBuf> = Vec::with_capacity(num_groups);
-                for (g, group) in chunks.chunks(group_size).enumerate() {
-                    let inter = self
-                        .output_dir
-                        .join(format!("{}_inter_{g}.bin", self.prefix));
-                    eprintln!(
-                        "    merging group {}/{} ({} chunks)…",
-                        g + 1,
-                        num_groups,
-                        group.len()
-                    );
-                    merge_chunks(group, &inter)?;
-                    for p in group {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    intermediates.push(inter);
-                }
-
-                eprintln!(
-                    "  [{}] final merge of {} groups…",
-                    self.prefix,
-                    intermediates.len()
-                );
-                merge_chunks(&intermediates, output_path)?;
-                for p in &intermediates {
-                    let _ = std::fs::remove_file(p);
-                }
-
-                let count = std::fs::metadata(output_path)?.len() / EDGE_SIZE as u64;
-                Ok(count)
-            }
-        }
-    }
-}
-
-/// Clean up chunk files if the sorter is dropped before `finish()` (e.g. on panic).
-impl Drop for EdgeSorter {
-    fn drop(&mut self) {
-        if let Some(handle) = self.pending_flush.take() {
-            if let Ok(Ok(path)) = handle.join() {
-                self.chunk_paths.push(path);
-            }
-        }
-        for p in &self.chunk_paths {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-fn merge_chunks(chunk_paths: &[PathBuf], output_path: &Path) -> Result<()> {
-    let per_reader_buf = (IO_BUF_SIZE / chunk_paths.len().max(1)).max(256 * 1024);
-    let mut readers: Vec<BufReader<File>> = chunk_paths
-        .iter()
-        .map(|p| {
-            Ok(BufReader::with_capacity(
-                per_reader_buf,
-                File::open(p).context("open edge chunk")?,
-            ))
-        })
-        .collect::<Result<_>>()?;
-
-    let mut heap: BinaryHeap<Reverse<(u64, u64, usize)>> = BinaryHeap::new();
-    let mut peek: Vec<Option<RawEdge>> = vec![None; readers.len()];
-
-    for (i, r) in readers.iter_mut().enumerate() {
-        if let Some(e) = read_edge(r)? {
-            heap.push(Reverse((edge_from(&e), edge_to(&e), i)));
-            peek[i] = Some(e);
-        }
-    }
-
-    let mut w = BufWriter::with_capacity(
-        IO_BUF_SIZE,
-        File::create(output_path).context("create merged edge file")?,
-    );
-    let mut last_edge: Option<RawEdge> = None;
-    while let Some(Reverse((_, _, idx))) = heap.pop() {
-        let edge = peek[idx].take().unwrap();
-        if last_edge.as_ref() != Some(&edge) {
-            w.write_all(&edge)?;
-            last_edge = Some(edge);
-        }
-        if let Some(next) = read_edge(&mut readers[idx])? {
-            heap.push(Reverse((edge_from(&next), edge_to(&next), idx)));
-            peek[idx] = Some(next);
-        }
-    }
-    w.flush()?;
-    Ok(())
-}
-
-fn read_edge(r: &mut impl Read) -> Result<Option<RawEdge>> {
-    let mut buf = [0u8; EDGE_SIZE];
-    match r.read_exact(&mut buf) {
-        Ok(()) => Ok(Some(buf)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e).context("read edge chunk"),
-    }
+fn key_edge(e: &RawEdge) -> (u64, u64) {
+    (edge_from(e), edge_to(e))
 }
 
 // ── Pass 2 output ─────────────────────────────────────────────────────────────
@@ -636,7 +383,8 @@ pub fn build_reverse_edges(
     reverse_path: &Path,
     output_dir: &Path,
 ) -> Result<()> {
-    let mut rev_sorter = EdgeSorter::new(output_dir.to_path_buf(), "rev_edge");
+    let mut rev_sorter =
+        RecordSorter::<EDGE_SIZE>::new(output_dir.to_path_buf(), "rev_edge", key_edge).dedup();
 
     let mut reader = BufReader::with_capacity(
         IO_BUF_SIZE,
@@ -669,7 +417,8 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
     let (header, _) = read_header(path)?;
     let id_size = header.id_size;
 
-    let mut sorter = EdgeSorter::new(output_dir.to_path_buf(), "edge");
+    let mut sorter =
+        RecordSorter::<EDGE_SIZE>::new(output_dir.to_path_buf(), "edge", key_edge).dedup();
 
     {
         let mut extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
