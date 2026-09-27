@@ -3,6 +3,8 @@
 //! Re-exports the encoding constants defined in `passes::index` so callers
 //! only need to import from here.
 
+pub mod manifest;
+
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
@@ -200,5 +202,9 @@ impl RetainedIndex {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 }

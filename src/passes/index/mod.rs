@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 
 use crate::parser::gc_record::{FieldInfo, FieldType};
 use crate::parser::primitive_parsers::read_id_be;
-use crate::parser::record_stream_parser::{process_with_extractor, read_header};
+use crate::parser::record_stream_parser::{StreamExtractor, process_with_extractor, read_header};
 use crate::passes::IO_BUF_SIZE;
 use crate::passes::sort::RecordSorter;
 
@@ -147,12 +147,15 @@ enum IndexItem {
 // ── IndexStreamExtractor ──────────────────────────────────────────────────────
 
 /// Inline byte-scanner state.  Moved into the extractor closure and runs on the
-/// parser thread alongside the reader thread, avoiding all nom overhead.
+/// reader thread, avoiding all nom overhead.
 struct IndexStreamExtractor {
     id_size: usize,
     /// Bytes remaining in the current HEAP_DUMP / HEAP_DUMP_SEGMENT body.
     /// When zero we are between top-level records.
     heap_dump_remaining: usize,
+    /// Payload bytes of an instance or array record that need no pass-1 parsing.
+    skip_remaining: usize,
+    skip_is_primitive: bool,
 }
 
 impl IndexStreamExtractor {
@@ -161,6 +164,19 @@ impl IndexStreamExtractor {
     fn extract(&mut self, buf: &[u8], batch: &mut Vec<IndexItem>) -> usize {
         let mut pos = 0;
         loop {
+            if self.skip_remaining > 0 {
+                let n = self.skip_remaining.min(buf.len() - pos);
+                if n == 0 {
+                    break;
+                }
+                self.skip_remaining -= n;
+                self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(n);
+                if self.skip_remaining == 0 {
+                    self.skip_is_primitive = false;
+                }
+                pos += n;
+                continue;
+            }
             let advanced = if self.heap_dump_remaining == 0 {
                 self.try_outer(buf, &mut pos, batch)
             } else {
@@ -311,13 +327,11 @@ impl IndexStreamExtractor {
                 let class_id = read_id_be(is, &data[is + 4..]);
                 let data_size =
                     u32::from_be_bytes(data[2 * is + 4..2 * is + 8].try_into().unwrap());
-                let total = hdr + data_size as usize;
-                if data_avail < total {
-                    return false;
-                }
+                self.skip_remaining = data_size as usize;
+                self.skip_is_primitive = false;
                 // Use data_size as placeholder; fixup corrects to instance_size in finish().
                 batch.push(IndexItem::Entry(encode_entry(oid, class_id, data_size)));
-                1 + total
+                1 + hdr
             }
             0x22 => {
                 // OBJ_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + class_id(is) + elems[num*is]
@@ -328,10 +342,8 @@ impl IndexStreamExtractor {
                 let oid = read_id_be(is, data);
                 let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
                 let class_id = read_id_be(is, &data[is + 8..]);
-                let total = hdr + num as usize * is;
-                if data_avail < total {
-                    return false;
-                }
+                self.skip_remaining = num as usize * is;
+                self.skip_is_primitive = false;
                 // JVM header (16) + array length field (4) + element references.
                 let shallow = 16u32 + 4 + num.saturating_mul(is as u32);
                 batch.push(IndexItem::Entry(encode_entry(
@@ -339,7 +351,7 @@ impl IndexStreamExtractor {
                     class_id | OBJECT_ARRAY_FLAG,
                     shallow,
                 )));
-                1 + total
+                1 + hdr
             }
             0x23 => {
                 // PRIM_ARRAY_DUMP: object_id(is) + stack(4) + num(4) + elem_type(1) + data
@@ -351,17 +363,15 @@ impl IndexStreamExtractor {
                 let num = u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap());
                 let elem_type = FieldType::from_value(data[is + 8]);
                 let elem_size = elem_type.byte_size(is as u32); // u32
-                let total = hdr + num as usize * elem_size as usize;
-                if data_avail < total {
-                    return false;
-                }
+                self.skip_remaining = num as usize * elem_size as usize;
+                self.skip_is_primitive = true;
                 let shallow = 16u32 + 4 + num.saturating_mul(elem_size);
                 batch.push(IndexItem::Entry(encode_entry(
                     oid,
                     elem_type as u64,
                     shallow,
                 )));
-                1 + total
+                1 + hdr
             }
             x => panic!("unknown GC sub-record tag: 0x{x:02X}"),
         };
@@ -369,6 +379,42 @@ impl IndexStreamExtractor {
         self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(consumed);
         *pos += consumed;
         true
+    }
+}
+
+impl StreamExtractor<IndexItem> for IndexStreamExtractor {
+    fn extract(&mut self, buf: &[u8], batch: &mut Vec<IndexItem>) -> usize {
+        IndexStreamExtractor::extract(self, buf, batch)
+    }
+
+    fn finish(&self) -> Result<()> {
+        anyhow::ensure!(self.skip_remaining == 0, "truncated HPROF object payload");
+        anyhow::ensure!(
+            self.heap_dump_remaining == 0,
+            "truncated HPROF heap segment"
+        );
+        Ok(())
+    }
+
+    fn skippable_bytes(&self) -> usize {
+        if self.skip_is_primitive {
+            self.skip_remaining
+        } else {
+            0
+        }
+    }
+
+    fn skip_bytes(&mut self, bytes: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.skip_is_primitive
+                && bytes <= self.skip_remaining
+                && bytes <= self.heap_dump_remaining,
+            "primitive payload exceeds HPROF heap segment"
+        );
+        self.skip_remaining -= bytes;
+        self.heap_dump_remaining -= bytes;
+        self.skip_is_primitive = false;
+        Ok(())
     }
 }
 
@@ -583,70 +629,68 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     let mut sorter =
         RecordSorter::<ENTRY_SIZE>::new(output_dir.to_path_buf(), "object_index", key_object_entry);
 
-    let mut extractor = IndexStreamExtractor {
+    let extractor = IndexStreamExtractor {
         id_size,
         heap_dump_remaining: 0,
+        skip_remaining: 0,
+        skip_is_primitive: false,
     };
 
-    process_with_extractor(
-        path,
-        move |buf, batch| extractor.extract(buf, batch),
-        &mut |batch: &mut Vec<IndexItem>| {
-            for item in batch.drain(..) {
-                match item {
-                    IndexItem::Utf8String { id, value } => {
-                        string_table.insert(id, value);
-                    }
-                    IndexItem::LoadClass {
+    let mut on_batch = |batch: &mut Vec<IndexItem>| {
+        for item in batch.drain(..) {
+            match item {
+                IndexItem::Utf8String { id, value } => {
+                    string_table.insert(id, value);
+                }
+                IndexItem::LoadClass {
+                    class_object_id,
+                    class_name_id,
+                } => {
+                    name_id_map.insert(class_object_id, class_name_id);
+                }
+                IndexItem::Root(oid) => {
+                    roots.push(oid);
+                }
+                IndexItem::ClassDump {
+                    class_object_id,
+                    super_id,
+                    instance_size,
+                    static_shallow_size,
+                    instance_fields,
+                } => {
+                    // JVM object header (16) + static field data.
+                    let shallow = 16u32 + static_shallow_size;
+                    sorter
+                        .push(encode_entry(class_object_id, CLASS_ID_JAVA_CLASS, shallow))
+                        .expect("object index write failed");
+                    class_index.insert(
                         class_object_id,
-                        class_name_id,
-                    } => {
-                        name_id_map.insert(class_object_id, class_name_id);
-                    }
-                    IndexItem::Root(oid) => {
-                        roots.push(oid);
-                    }
-                    IndexItem::ClassDump {
-                        class_object_id,
-                        super_id,
-                        instance_size,
-                        static_shallow_size,
-                        instance_fields,
-                    } => {
-                        // JVM object header (16) + static field data.
-                        let shallow = 16u32 + static_shallow_size;
-                        sorter
-                            .push(encode_entry(class_object_id, CLASS_ID_JAVA_CLASS, shallow))
-                            .expect("object index write failed");
-                        class_index.insert(
-                            class_object_id,
-                            ClassDescriptor {
-                                name: String::new(), // resolved below
-                                super_id,
-                                instance_size,
-                                instance_fields,
-                            },
-                        );
-                    }
-                    IndexItem::Entry(entry) => {
-                        sorter.push(entry).expect("object index write failed");
-                    }
+                        ClassDescriptor {
+                            name: String::new(), // resolved below
+                            super_id,
+                            instance_size,
+                            instance_fields,
+                        },
+                    );
+                }
+                IndexItem::Entry(entry) => {
+                    sorter.push(entry).expect("object index write failed");
                 }
             }
-        },
-    )
-    .context("pass 1 streaming")?;
+        }
+    };
+    process_with_extractor(path, extractor, &mut on_batch).context("pass 1 streaming")?;
 
     // Resolve class names now that all Utf8String + LoadClass records have been seen.
     for (class_id, desc) in &mut class_index {
-        if let Some(&name_sid) = name_id_map.get(class_id) {
-            if let Some(raw) = string_table.get(&name_sid) {
-                desc.name = if raw.contains('/') {
-                    raw.replace('/', ".")
-                } else {
-                    raw.clone()
-                };
-            }
+        if let Some(&name_sid) = name_id_map.get(class_id)
+            && let Some(raw) = string_table.get(&name_sid)
+        {
+            desc.name = if raw.contains('/') {
+                raw.replace('/', ".")
+            } else {
+                raw.clone()
+            };
         }
     }
 
@@ -665,10 +709,11 @@ pub fn run(path: &Path, output_dir: &Path) -> Result<Pass1Output> {
     );
     let object_count = sorter.finish_with_fixup(&index_path, |entry| {
         let (_, class_id, _) = decode_entry(entry);
-        if class_id & OBJECT_ARRAY_FLAG == 0 && class_id > CLASS_ID_LONG_ARRAY {
-            if let Some(desc) = class_index.get(&class_id) {
-                entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
-            }
+        if class_id & OBJECT_ARRAY_FLAG == 0
+            && class_id > CLASS_ID_LONG_ARRAY
+            && let Some(desc) = class_index.get(&class_id)
+        {
+            entry[16..20].copy_from_slice(&desc.instance_size.to_le_bytes());
         }
         // Write the (possibly patched) shallow size to the sidecar file.
         shallow_w

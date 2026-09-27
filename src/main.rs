@@ -141,19 +141,20 @@ fn read_meta(path: &Path) -> Result<[u64; 7]> {
 // ── Index detection & loading ─────────────────────────────────────────────────
 
 fn index_is_complete(dir: &Path) -> bool {
-    [
-        "object_index.bin",
-        "class_names.bin",
-        "retained.bin",
-        "meta.bin",
-        "edges.bin",
-    ]
-    .iter()
-    .all(|f| dir.join(f).exists())
+    if dir.join("build_in_progress").exists() {
+        return false;
+    }
+    if dir.join("manifest.json").exists() {
+        return minprof::index::manifest::read(dir).is_ok();
+    }
+    minprof::index::manifest::REQUIRED_FILES
+        .iter()
+        .all(|f| dir.join(f).is_file())
 }
 
 fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
     let meta = read_meta(&dir.join("meta.bin"))?;
+    anyhow::ensure!(meta[0] == 1, "unsupported meta.bin version {}", meta[0]);
     // [version, object_count, root_count, edge_count,
     //  total_heap_bytes, unreachable_count, unreachable_shallow]
 
@@ -162,6 +163,30 @@ fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
         .context("stat object_index.bin")?
         .len()
         / ENTRY_SIZE as u64;
+    anyhow::ensure!(
+        std::fs::metadata(&object_index_path)?.len() == object_count * ENTRY_SIZE as u64,
+        "object_index.bin has a partial entry"
+    );
+    anyhow::ensure!(
+        object_count == meta[1],
+        "object count does not match meta.bin"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(dir.join("shallow_sizes.bin"))?.len() == object_count * 4,
+        "shallow_sizes.bin size does not match object count"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(dir.join("retained.bin"))?.len() == object_count * 8,
+        "retained.bin size does not match object count"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(dir.join("roots.bin"))?.len() == meta[2] * 8,
+        "roots.bin size does not match root count"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(dir.join("meta.bin"))?.len() == 56,
+        "meta.bin has invalid size"
+    );
 
     let pass1 = Pass1Output {
         class_index: load_class_index(&dir.join("class_names.bin"))?,
@@ -176,6 +201,19 @@ fn load_index(dir: &Path) -> Result<(Pass1Output, Pass2Output, Pass4Output)> {
         .context("stat edges.bin")?
         .len()
         / EDGE_SIZE as u64;
+    anyhow::ensure!(
+        std::fs::metadata(&edges_path)?.len() == edge_count * EDGE_SIZE as u64,
+        "edges.bin has a partial edge"
+    );
+    anyhow::ensure!(edge_count == meta[3], "edge count does not match meta.bin");
+    anyhow::ensure!(
+        std::fs::metadata(dir.join("idom.bin"))?.len() % 4 == 0,
+        "idom.bin has a partial entry"
+    );
+
+    if !dir.join("manifest.json").exists() {
+        minprof::index::manifest::publish(dir).context("upgrade legacy index manifest")?;
+    }
 
     let pass2 = Pass2Output {
         edges_path,
@@ -205,7 +243,7 @@ fn main() -> Result<()> {
     if let Some(ref index_dir) = cli.index_cache {
         if !index_is_complete(index_dir) {
             anyhow::bail!(
-                "index at '{}' is incomplete — missing one or more required .bin files",
+                "index at '{}' is incomplete or has an invalid manifest/build marker",
                 index_dir.display()
             );
         }
@@ -240,6 +278,19 @@ fn main() -> Result<()> {
     });
 
     eprintln!("output dir: {}", output_dir.display());
+
+    std::fs::create_dir_all(&output_dir).context("create output directory")?;
+    // A manifest is the completion marker. Remove it before replacing any index
+    // file so a failed rebuild cannot look like a valid old generation.
+    for name in ["manifest.json", "report_summary.json", "build_in_progress"] {
+        let marker = output_dir.join(name);
+        if marker.exists() {
+            std::fs::remove_file(marker)?;
+        }
+    }
+    std::fs::File::create(output_dir.join("build_in_progress"))?
+        .sync_all()
+        .context("write build-in-progress marker")?;
 
     let total_start = std::time::Instant::now();
 
@@ -288,6 +339,10 @@ fn main() -> Result<()> {
         pass4.unreachable_shallow,
     )
     .context("write meta.bin")?;
+
+    minprof::index::manifest::publish(&output_dir).context("publish index manifest")?;
+    std::fs::remove_file(output_dir.join("build_in_progress"))
+        .context("remove build-in-progress marker")?;
 
     eprintln!(
         "=== done in {:.1}s total ===",

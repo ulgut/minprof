@@ -2,5 +2,9 @@
 .idea/
 PLAN.md
 test/.test/
+tests/.test/**/manifest.json
+tests/.test/**/report_summary.json
+__pycache__/
 *.hprof
 *.minprof/
+design-sketch.md

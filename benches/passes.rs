@@ -81,7 +81,9 @@ fn fixture() -> &'static Fixture {
         let (objects, classes, roots) = (bench_objects(), bench_classes(), bench_roots());
         let params = format!("{objects} {classes} {roots}");
 
-        let stale = fs::read_to_string(&params_path).map(|p| p != params).unwrap_or(true);
+        let stale = fs::read_to_string(&params_path)
+            .map(|p| p != params)
+            .unwrap_or(true);
 
         if !sentinel.exists() || stale {
             // (Re-)generate from scratch.

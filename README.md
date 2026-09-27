@@ -1,6 +1,6 @@
 # minprof
 
-A streaming, multi-pass JVM heap dump analyser. Eclipse MAT and VisualVM load the entire heap into RAM — impractical for dumps larger than your available memory. `minprof` streams `.hprof` files in multiple passes, keeping intermediate data on disk, so it can handle files many times larger than available RAM without sacrificing insight.
+A streaming, multi-pass JVM heap dump analyser. `minprof` parses `.hprof` files twice, seeks past unused primitive-array payloads, keeps reusable index files on disk, computes dominators and retained sizes, then caches derived reports. A byte-heavy dump can be much larger than available RAM, while graph-heavy dumps still need memory proportional to their object and reference counts during indexing.
 
 ## Installation
 
@@ -19,7 +19,7 @@ Source (one required):
 
 Options:
   -o, --output <DIR>         Directory for index files and reports
-                             [default with -p: <hprof>.minprof/]
+                             [default with -p: replace .hprof with .minprof/]
       --format <FORMAT>      Output format [default: pretty]
       --report <REPORT>      Which analyses to run [default: all]
       --path <OBJECT_ID>     Print shortest reference path to this object
@@ -28,7 +28,7 @@ Options:
 
 ### First run
 
-Parse and index a heap dump. Index files are written to `heap.hprof.minprof/` by default.
+Parse and index a heap dump. Index files are written to `heap.minprof/` by default.
 
 ```sh
 minprof -p heap.hprof
@@ -40,9 +40,9 @@ minprof -p heap.hprof -o /fast-disk/heap-index/
 Skip all parse passes and generate reports from the existing index instantly.
 
 ```sh
-minprof -i heap.hprof.minprof/
-minprof -i heap.hprof.minprof/ --format html
-minprof -i heap.hprof.minprof/ --report leaks,packages
+minprof -i heap.minprof/
+minprof -i heap.minprof/ --format html
+minprof -i heap.minprof/ --report leaks,packages
 minprof -i /fast-disk/heap-index/ --format json
 ```
 
@@ -69,23 +69,23 @@ Selects which analyses to emit. Repeatable or comma-separated. Default: `all`.
 ### Examples
 
 ```sh
-# First run — parse the dump, write index to heap.hprof.minprof/
+# First run — parse the dump, write index to heap.minprof/
 minprof -p heap.hprof
 
 # First run with custom index location
 minprof -p heap.hprof -o /mnt/heap-index/
 
 # Re-run with HTML report (no re-parsing)
-minprof -i heap.hprof.minprof/ --format html
+minprof -i heap.minprof/ --format html
 
 # Re-run — JSON output, retained analysis only (no re-parsing)
-minprof -i heap.hprof.minprof/ --format json --report retained
+minprof -i heap.minprof/ --format json --report retained
 
 # Re-run — leak suspects + packages (no re-parsing)
-minprof -i heap.hprof.minprof/ --report leaks,packages
+minprof -i heap.minprof/ --report leaks,packages
 
 # Path to GC root for an object ID from the retained table
-minprof -i heap.hprof.minprof/ --path 0x00000000d6fc57f0
+minprof -i heap.minprof/ --path 0x00000000d6fc57f0
 ```
 
 ## Output
@@ -171,18 +171,24 @@ When the object is not found or is unreachable, `found` is `false` and an `error
 
 ## Index files
 
-The first run writes the following files to the index directory (`<hprof>.minprof/` by default):
+The first run writes the following files to the index directory (`heap.minprof/` for `heap.hprof`):
 
 | File | Description |
 |------|-------------|
 | `object_index.bin` | Sorted `(object_id, class_id, shallow_size)` for every object |
 | `class_names.bin` | Class name and super-class chain for every loaded class |
 | `edges.bin` | Sorted `(from_id, to_id)` reference pairs |
-| `reverse_edges.bin` | Sorted `(to_id, from_id)` pairs for path-to-root queries |
+| `shallow_sizes.bin` | Shallow bytes in object order, used by pass 4 |
 | `idom.bin` | Immediate dominator array (RPO-indexed) |
 | `retained.bin` | Retained size per object |
 | `meta.bin` | Scalar summary (object count, heap size, unreachable stats) |
 | `roots.bin` | GC root object IDs |
+| `manifest.json` | Completed index generation and required-file lengths |
+| `report_summary.json` | Derived report data for fast repeat queries |
+
+`reverse_edges.bin` is generated on the first `--path` query. A completed
+index is marked by `manifest.json`; `build_in_progress` rejects an interrupted
+rebuild. Existing indexes without a manifest are checked and upgraded on load.
 
 Once these files exist, `-i <dir>` can generate any report without touching the original `.hprof`.
 
@@ -190,12 +196,15 @@ Once these files exist, `-i <dir>` can generate any report without touching the 
 
 | Pass | What it does | Peak extra RAM |
 |------|-------------|----------------|
-| Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | ~100 MB (class index) + sort buffer |
-| Pass 2 — edges | Extract object references, sort into `edges.bin` + `reverse_edges.bin` | sort buffer |
-| Pass 3 — dominator tree | Semi-NCA algorithm on in-memory CSR graph | proportional to edge count |
+| Pass 1 — index | Parse HPROF, build class index, write `object_index.bin` | strings, classes, parser buffers, and sort buffer |
+| Pass 2 — edges | Extract object references and sort into `edges.bin` | parser and edge batches + sort buffer |
+| Pass 3 — dominator tree | Semi-NCA algorithm on in-memory CSR graph | proportional to objects, reachable nodes, and edges |
 | Pass 4 — retained sizes | Bottom-up dominator tree walk | O(N) |
 
-The class index (kept in RAM across all passes) is typically under 100 MB for real-world JVM applications regardless of heap size.
+Passes 3 and 4 allocate arrays proportional to object and edge counts. Array
+payloads are streamed, and adjacent repeated object-array references are
+elided, but unique references still increase sorter work independently of
+final index size.
 
 ## Comparison with standard tooling
 
@@ -203,15 +212,15 @@ The usual ways to open an `.hprof` file are **Eclipse MAT**, **VisualVM**, and t
 JDK's **`jhat`/`jmap`** (`jhat` is removed in modern JDKs). All three load the dump
 into a heap structure sized in proportion to the dump itself, so the machine doing
 the analysis needs roughly as much memory as the machine that produced the dump.
-minprof instead streams the dump and keeps the large structures on disk, so peak
-RAM is bounded by a configurable fraction of system memory regardless of dump size.
+minprof streams the dump and stores the reusable index on disk, but its graph
+and retained-size passes currently require memory proportional to the graph.
 
 ### Capabilities
 
 |                         | minprof          | Eclipse MAT       | VisualVM          | jhat / jmap       |
 |-------------------------|------------------|-------------------|-------------------|-------------------|
-| Peak RAM                | bounded (~40% of system RAM, configurable) | ≈ dump size | ≈ dump size | ≈ dump size |
-| 100 GB dump             | works            | needs ~100 GB RAM | needs ~100 GB RAM | impractical       |
+| Peak RAM                | varies with objects, references, array records, and sort buffers | ≈ dump size | ≈ dump size | ≈ dump size |
+| 100 GB dump             | depends on graph shape and host resources; not validated here | needs ~100 GB RAM | needs ~100 GB RAM | impractical       |
 | Retained heap           | ✅               | ✅                | ✅                | ❌                |
 | Dominator tree          | ✅               | ✅                | ❌                | ❌                |
 | Path to GC root         | ✅               | ✅                | ❌                | limited           |
@@ -225,14 +234,15 @@ RAM is bounded by a configurable fraction of system memory regardless of dump si
 ### How the approach differs
 
 - **Memory model.** MAT and VisualVM build an in-memory object model; their working
-  set scales with the dump. minprof's scales with the number of distinct *classes*
-  (tens of MB) plus a sort buffer you control — a 100 GB dump is analysed without
-  100 GB of RAM.
+  set scales with the dump. minprof's index lives on disk, while its temporary
+  graph arrays, parser buffers, class metadata, and sort buffers consume RAM.
+  A byte-heavy dump may need much less RAM than its file size; a dense graph
+  can need substantially more.
 - **Index once, query many.** MAT/VisualVM re-parse (or re-open the index) per
   session. minprof writes a compact on-disk index on the first run; every later
   report (`-i <dir> --report …`, `--format html|json`, `--path …`) reads only that
   index — no HPROF re-read. The index is also portable: build it on the big box,
-  copy the `<dump>.minprof/` directory, query it anywhere.
+  copy the index directory, query it without the HPROF file.
 - **Scriptable by default.** Newline-delimited JSON on stdout (progress on stderr)
   drops straight into CI gates, dashboards, and diffs between two dumps. MAT is
   GUI-first (batch mode exists but is awkward); VisualVM is GUI-only.
@@ -252,8 +262,20 @@ reports off the existing index are effectively instant.
 
 - CLI only — no interactive query shell
 - Tested on 64-bit HotSpot HPROF format (`id_size = 8`); 32-bit dumps (`id_size = 4`) parse correctly but are less tested
-- Pass 3 (dominator tree) loads the full edge graph into RAM — on very large dumps (> a few hundred GB) this may require significant memory. See the "Future work" section of [architecture.md](architecture.md) for planned improvements.
+- Pass 3 loads the forward graph into RAM and uses `u32` node/edge indices; large graphs can exceed memory or the index range. A 100 GiB live JVM dump has not been benchmarked on this host. See [architecture.md](architecture.md) for details.
 - Hobby project — use with caution
+
+## Design and benchmark notes
+
+- [Current design with Mermaid diagrams](design-sketch.md)
+- [Decision review, measured tradeoffs, and next experiments](design-review.md)
+- [Work, memory, and disk model](benchmark-model.md)
+- [Live JVM workloads and profiling](benches/README.md)
+- [1–300 GB byte-heavy size sweep and chart](benches/results/byte-heavy-size-sweep.md)
+- [Primitive-array seek optimization](benches/results/primitive-seek.md)
+- [Contiguous-ID graph optimization](benches/results/contiguous-ids.md)
+- [Semi-NCA predecessor input probe](benches/results/semi-nca-input.md)
+- [100 million-object graph benchmark](benches/results/object-heavy-100m.md)
 
 ---
 

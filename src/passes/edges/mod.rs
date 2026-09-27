@@ -2,18 +2,17 @@
 //!
 //! Streams the HPROF file a second time, extracting reference edges inline in
 //! the parser thread with zero per-object allocation. Each InstanceDump,
-//! ObjectArrayDump, and ClassDump is parsed directly from the 64 MiB work
-//! buffer; the only allocation is the pooled `Vec<RawEdge>` batch that is
-//! handed off to the main thread.
+//! ObjectArrayDump, and ClassDump is parsed from the work buffer. Large array
+//! payloads are consumed incrementally; output uses bounded, pooled
+//! `Vec<RawEdge>` batches handed to the main thread.
 //!
 //! Edges are accumulated in sorted chunks and merged into a single
 //! `edges.bin` file sorted by `from_id`, forming a disk-backed forward
 //! adjacency list for the dominator pass.
 //!
-//! Reverse edges (`reverse_edges.bin`) are built by reading the sorted forward
-//! file after the forward merge completes, swapping (from, to) → (to, from),
-//! and sorting again. This avoids per-edge channel overhead (~200-500 ns/edge
-//! for `sync_channel` × 1B edges = 200-500 s of pure overhead).
+//! Reverse edges (`reverse_edges.bin`) are built on demand for path queries by
+//! reading the sorted forward file, swapping (from, to) → (to, from), and
+//! sorting again. Ordinary builds avoid that extra sort and output file.
 
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -23,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::parser::gc_record::FieldType;
 use crate::parser::primitive_parsers::read_id_be;
-use crate::parser::record_stream_parser::{process_with_extractor, read_header};
+use crate::parser::record_stream_parser::{StreamExtractor, process_with_extractor, read_header};
 use crate::passes::index::{ClassDescriptor, Pass1Output};
 use crate::passes::sort::RecordSorter;
 
@@ -33,6 +32,7 @@ use crate::passes::sort::RecordSorter;
 //  [8..16] to_id:   u64  (little-endian)
 
 pub const EDGE_SIZE: usize = 16;
+const MAX_EDGE_BATCH: usize = 1_000_000;
 pub type RawEdge = [u8; EDGE_SIZE];
 
 use crate::passes::IO_BUF_SIZE;
@@ -76,6 +76,16 @@ struct EdgeStreamExtractor {
     /// raw-data block) at which an Object-typed field lives.
     field_offsets: HashMap<u64, Vec<u32>>,
     heap_dump_remaining: usize,
+    pending: Option<PendingArray>,
+}
+
+enum PendingArray {
+    SkipBytes(usize),
+    ObjectRefs {
+        from_id: u64,
+        remaining: usize,
+        last_to: Option<u64>,
+    },
 }
 
 impl EdgeStreamExtractor {
@@ -114,6 +124,7 @@ impl EdgeStreamExtractor {
             id_size: is,
             field_offsets,
             heap_dump_remaining: 0,
+            pending: None,
         }
     }
 
@@ -122,9 +133,63 @@ impl EdgeStreamExtractor {
         let mut pos = 0;
 
         loop {
+            if out.len() >= MAX_EDGE_BATCH {
+                break;
+            }
             let rem = &buf[pos..];
             if rem.is_empty() {
                 break;
+            }
+
+            if let Some(pending) = self.pending.take() {
+                match pending {
+                    PendingArray::SkipBytes(remaining) => {
+                        let n = remaining.min(rem.len());
+                        pos += n;
+                        self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(n);
+                        if remaining > n {
+                            self.pending = Some(PendingArray::SkipBytes(remaining - n));
+                        }
+                    }
+                    PendingArray::ObjectRefs {
+                        from_id,
+                        remaining,
+                        mut last_to,
+                    } => {
+                        let count = remaining
+                            .min(rem.len() / self.id_size)
+                            .min(MAX_EDGE_BATCH - out.len());
+                        if count == 0 {
+                            self.pending = Some(PendingArray::ObjectRefs {
+                                from_id,
+                                remaining,
+                                last_to,
+                            });
+                            break;
+                        }
+                        for chunk in rem[..count * self.id_size].chunks_exact(self.id_size) {
+                            let to = read_id_be(self.id_size, chunk);
+                            // The final edge sort deduplicates every pair. Elide
+                            // adjacent repeats here so a repetitive array does
+                            // not fill the batch and sorter first.
+                            if to != 0 && last_to != Some(to) {
+                                out.push(encode_edge(from_id, to));
+                                last_to = Some(to);
+                            }
+                        }
+                        let bytes = count * self.id_size;
+                        pos += bytes;
+                        self.heap_dump_remaining = self.heap_dump_remaining.saturating_sub(bytes);
+                        if remaining > count {
+                            self.pending = Some(PendingArray::ObjectRefs {
+                                from_id,
+                                remaining: remaining - count,
+                                last_to,
+                            });
+                        }
+                    }
+                }
+                continue;
             }
 
             if self.heap_dump_remaining == 0 {
@@ -162,7 +227,7 @@ impl EdgeStreamExtractor {
         pos
     }
 
-    fn extract_gc(&self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
+    fn extract_gc(&mut self, buf: &[u8], out: &mut Vec<RawEdge>) -> usize {
         if buf.is_empty() {
             return 0;
         }
@@ -198,19 +263,14 @@ impl EdgeStreamExtractor {
                 let object_id = read_id_be(is, data);
                 let num_elements =
                     u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap()) as usize;
-                let payload = num_elements * is;
-                let total = 1 + hdr + payload;
-                if buf.len() < total {
-                    return 0;
+                if num_elements > 0 {
+                    self.pending = Some(PendingArray::ObjectRefs {
+                        from_id: object_id,
+                        remaining: num_elements,
+                        last_to: None,
+                    });
                 }
-                let elem_data = &data[hdr..hdr + payload];
-                for chunk in elem_data.chunks_exact(is) {
-                    let to = read_id_be(is, chunk);
-                    if to != 0 {
-                        out.push(encode_edge(object_id, to));
-                    }
-                }
-                total
+                1 + hdr
             }
             0x23 => {
                 // TAG_GC_PRIM_ARRAY_DUMP
@@ -221,11 +281,10 @@ impl EdgeStreamExtractor {
                 let num_elements =
                     u32::from_be_bytes(data[is + 4..is + 8].try_into().unwrap()) as usize;
                 let elem_type = data[is + 8];
-                let total = 1 + hdr + num_elements * field_type_size(elem_type, is);
-                if buf.len() < total {
-                    return 0;
-                }
-                total
+                self.pending = Some(PendingArray::SkipBytes(
+                    num_elements * field_type_size(elem_type, is),
+                ));
+                1 + hdr
             }
             0x20 => {
                 // TAG_GC_CLASS_DUMP
@@ -289,6 +348,43 @@ impl EdgeStreamExtractor {
             if to != 0 {
                 out.push(encode_edge(from, to));
             }
+        }
+    }
+}
+
+impl StreamExtractor<RawEdge> for EdgeStreamExtractor {
+    fn extract(&mut self, buf: &[u8], batch: &mut Vec<RawEdge>) -> usize {
+        EdgeStreamExtractor::extract(self, buf, batch)
+    }
+
+    fn finish(&self) -> Result<()> {
+        anyhow::ensure!(self.pending.is_none(), "truncated HPROF array payload");
+        anyhow::ensure!(
+            self.heap_dump_remaining == 0,
+            "truncated HPROF heap segment"
+        );
+        Ok(())
+    }
+
+    fn skippable_bytes(&self) -> usize {
+        match self.pending {
+            Some(PendingArray::SkipBytes(bytes)) => bytes,
+            _ => 0,
+        }
+    }
+
+    fn skip_bytes(&mut self, bytes: usize) -> Result<()> {
+        match self.pending.take() {
+            Some(PendingArray::SkipBytes(remaining))
+                if bytes <= remaining && bytes <= self.heap_dump_remaining =>
+            {
+                self.heap_dump_remaining -= bytes;
+                if remaining > bytes {
+                    self.pending = Some(PendingArray::SkipBytes(remaining - bytes));
+                }
+                Ok(())
+            }
+            _ => anyhow::bail!("primitive payload exceeds HPROF heap segment"),
         }
     }
 }
@@ -421,17 +517,13 @@ pub fn run(path: &Path, pass1: &Pass1Output, output_dir: &Path) -> Result<Pass2O
         RecordSorter::<EDGE_SIZE>::new(output_dir.to_path_buf(), "edge", key_edge).dedup();
 
     {
-        let mut extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
-        process_with_extractor(
-            path,
-            move |buf: &[u8], edges: &mut Vec<RawEdge>| -> usize { extractor.extract(buf, edges) },
-            &mut |batch: &mut Vec<RawEdge>| {
-                for edge in batch.iter() {
-                    sorter.push(*edge).expect("edge sort write failed");
-                }
-            },
-        )
-        .context("pass 2 streaming")?;
+        let extractor = EdgeStreamExtractor::new(id_size, &pass1.class_index);
+        let mut on_batch = |batch: &mut Vec<RawEdge>| {
+            for edge in batch.iter() {
+                sorter.push(*edge).expect("edge sort write failed");
+            }
+        };
+        process_with_extractor(path, extractor, &mut on_batch).context("pass 2 streaming")?;
     }
 
     let edges_path = output_dir.join("edges.bin");

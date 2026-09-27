@@ -26,10 +26,10 @@ pub fn total_memory_bytes() -> u64 {
     // Linux
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         for line in s.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                if let Ok(kb) = rest.split_whitespace().next().unwrap_or("").parse::<u64>() {
-                    return kb * 1024;
-                }
+            if let Some(rest) = line.strip_prefix("MemTotal:")
+                && let Ok(kb) = rest.split_whitespace().next().unwrap_or("").parse::<u64>()
+            {
+                return kb * 1024;
             }
         }
     }
@@ -37,12 +37,10 @@ pub fn total_memory_bytes() -> u64 {
     if let Ok(out) = std::process::Command::new("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
+        && let Ok(s) = std::str::from_utf8(&out.stdout)
+        && let Ok(bytes) = s.trim().parse::<u64>()
     {
-        if let Ok(s) = std::str::from_utf8(&out.stdout) {
-            if let Ok(bytes) = s.trim().parse::<u64>() {
-                return bytes;
-            }
-        }
+        return bytes;
     }
     FALLBACK_MEM_BYTES
 }
@@ -52,6 +50,16 @@ pub fn total_memory_bytes() -> u64 {
 /// Both pass 1 and pass 2 run their external sort exclusively (no overlap),
 /// so 40% is safe alongside the class-index and I/O-buffer overhead.
 pub fn sort_chunk_bytes() -> usize {
+    if let Some(raw) = std::env::var_os("MINPROF_BENCH_SORT_MIB") {
+        let mib: usize = raw
+            .to_string_lossy()
+            .parse()
+            .expect("MINPROF_BENCH_SORT_MIB must be a positive integer");
+        assert!(mib > 0, "MINPROF_BENCH_SORT_MIB must be positive");
+        return mib
+            .checked_mul(1024 * 1024)
+            .expect("MINPROF_BENCH_SORT_MIB is too large");
+    }
     let mem = total_memory_bytes();
     let target = (mem as f64 * 0.40) as u64;
     target.clamp(256 * 1024 * 1024, 128 * 1024 * 1024 * 1024) as usize

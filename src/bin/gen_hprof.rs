@@ -7,15 +7,20 @@
 //! # ID layout
 //!   [1, C]          class object IDs
 //!   [C+1, C+N]      instance object IDs
-//!   [C+N+1, ...]    string IDs (field names, class names)
+//!   [C+N+1, ...]    optional primitive byte-array IDs
+//!   [after arrays, ...] string IDs (field names, class names)
 //!
 //! # Typical usage
 //!
-//!   # ~32 GiB local file (500 M objects, ~2 B edges after 50% null)
+//!   # ~32 GiB local file (500 M objects, ~1 B edges after 50% null)
 //!   cargo run --release --bin gen_hprof -- --output test.hprof
 //!
-//!   # Production scale (~445 GiB, 7.76 B objects)
+//!   # HPROF format scale (~445 GiB; graph exceeds minprof's current u32 limit)
 //!   cargo run --release --bin gen_hprof -- --output large.hprof --objects 7760000000
+//!
+//!   # 100 GiB of array payload with a small graph (file-scale parser test)
+//!   cargo run --release --bin gen_hprof -- --output byte-heavy.hprof \
+//!     --objects 1000 --classes 1 --roots 1 --byte-array-mib 102400
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -53,12 +58,33 @@ struct Args {
     /// Number of GC roots (ROOT_JNI_GLOBAL records)
     #[arg(long, default_value_t = 18_253)]
     roots: u32,
+
+    /// Total MiB of zero-filled primitive byte-array payload to append
+    #[arg(long, default_value_t = 0)]
+    byte_array_mib: u64,
+
+    /// Size of each synthetic byte array, in MiB (1–1024)
+    #[arg(long, default_value_t = 256)]
+    byte_array_block_mib: u32,
 }
 
 const WRITE_BUF: usize = 64 * 1024 * 1024;
+const MIB: u64 = 1024 * 1024;
 
 fn main() {
     let args = Args::parse();
+    assert!(args.classes > 0, "--classes must be positive");
+    assert!(
+        (1..=1024).contains(&args.byte_array_block_mib),
+        "--byte-array-block-mib must be between 1 and 1024"
+    );
+    let byte_array_bytes = args
+        .byte_array_mib
+        .checked_mul(MIB)
+        .expect("--byte-array-mib is too large");
+    let array_block_bytes = u64::from(args.byte_array_block_mib) * MIB;
+    let array_count = byte_array_bytes.div_ceil(array_block_bytes);
+    assert!(array_count <= u32::MAX as u64, "too many byte arrays");
 
     let per_obj = instance_sub_record_size(args.obj_fields, args.prim_fields) as u64;
     let avg_edges = args.obj_fields as f64 * (100 - args.null_pct) as f64 / 100.0;
@@ -77,8 +103,12 @@ fn main() {
     eprintln!("  prim fields:  {}", args.prim_fields);
     eprintln!("  roots:        {}", args.roots);
     eprintln!(
+        "  byte arrays:  {} MiB across {} arrays ({} MiB each)",
+        args.byte_array_mib, array_count, args.byte_array_block_mib
+    );
+    eprintln!(
         "  est. size:    {:.1} GiB",
-        args.objects as f64 * per_obj as f64 / (1u64 << 30) as f64
+        (args.objects as f64 * per_obj as f64 + byte_array_bytes as f64) / (1u64 << 30) as f64
     );
 
     let t0 = std::time::Instant::now();
@@ -107,7 +137,11 @@ fn generate(w: &mut impl Write, a: &Args) -> std::io::Result<()> {
     let n = a.objects;
     let class_base: u64 = 1;
     let inst_base: u64 = c + 1;
-    let str_base: u64 = c + n + 1;
+    let byte_array_bytes = a.byte_array_mib * MIB;
+    let array_block_bytes = u64::from(a.byte_array_block_mib) * MIB;
+    let array_count = byte_array_bytes.div_ceil(array_block_bytes);
+    let array_base = c + n + 1;
+    let str_base: u64 = array_base + array_count;
     let total_fields = a.obj_fields + a.prim_fields;
 
     // ── HPROF file header ─────────────────────────────────────────────────────
@@ -164,16 +198,20 @@ fn generate(w: &mut impl Write, a: &Args) -> std::io::Result<()> {
     }
 
     // ── GC roots segment ──────────────────────────────────────────────────────
+    // Root the byte arrays as well: a live-heap dump would retain them.
     // ROOT_JNI_GLOBAL: tag(1) + oid(8) + jni_ref(8) = 17 bytes each.
-    let root_seg_body = a.roots as u64 * 17;
+    let root_seg_body = (a.roots as u64 + array_count) * 17;
     assert!(root_seg_body <= u32::MAX as u64);
     write_seg_hdr(w, root_seg_body as u32)?;
     let mut rng = Rng::new(0xdeadbeef_cafebabe);
     // JNI ref IDs live just above the object ID space.
-    let jni_base = c + n + total_fields as u64 + c + 1;
+    let jni_base = str_base + total_fields as u64 + c;
     for ri in 0..a.roots as u64 {
         let oid = inst_base + rng.range(n);
         write_gc_root_jni_global(w, oid, jni_base + ri)?;
+    }
+    for ai in 0..array_count {
+        write_gc_root_jni_global(w, array_base + ai, jni_base + a.roots as u64 + ai)?;
     }
 
     // ── InstanceDump segments ─────────────────────────────────────────────────
@@ -211,6 +249,36 @@ fn generate(w: &mut impl Write, a: &Args) -> std::io::Result<()> {
             written,
             n,
         );
+    }
+
+    // Each array lives in its own segment so both the HPROF record length and
+    // the element count stay within their 32-bit format fields. Write payload
+    // in 1 MiB pieces; generating a 100 GiB file does not allocate 100 GiB.
+    let zero = vec![0u8; MIB as usize];
+    let mut payload_written = 0u64;
+    for i in 0..array_count {
+        let payload_len = (byte_array_bytes - payload_written).min(array_block_bytes);
+        let segment_len = payload_len + 18; // tag + ID + stack + count + type
+        write_seg_hdr(w, segment_len as u32)?;
+        w.write_all(&[0x23])?; // TAG_GC_PRIM_ARRAY_DUMP
+        w.write_all(&(array_base + i).to_be_bytes())?;
+        w.write_all(&0u32.to_be_bytes())?; // stack serial
+        w.write_all(&(payload_len as u32).to_be_bytes())?;
+        w.write_all(&[8])?; // byte element type
+        let mut left = payload_len;
+        while left > 0 {
+            let count = left.min(MIB) as usize;
+            w.write_all(&zero[..count])?;
+            left -= count as u64;
+        }
+        payload_written += payload_len;
+        if (i + 1) % 64 == 0 || i + 1 == array_count {
+            eprintln!(
+                "  byte arrays: {} / {} MiB",
+                payload_written / MIB,
+                a.byte_array_mib
+            );
+        }
     }
 
     // ── HEAP_DUMP_END ─────────────────────────────────────────────────────────
@@ -292,17 +360,23 @@ fn write_class_dump(
     w.write_all(&0u16.to_be_bytes())?; // constant pool count = 0
     w.write_all(&0u16.to_be_bytes())?; // static fields count = 0
     w.write_all(&((obj_fields + prim_fields) as u16).to_be_bytes())?;
-    for fi in 0..obj_fields as usize {
-        w.write_all(&field_name_ids[fi].to_be_bytes())?;
+    for &name_id in field_name_ids.iter().take(obj_fields as usize) {
+        w.write_all(&name_id.to_be_bytes())?;
         w.write_all(&[2u8])?; // Object
     }
-    for fi in 0..prim_fields as usize {
-        w.write_all(&field_name_ids[obj_fields as usize + fi].to_be_bytes())?;
+    for &name_id in field_name_ids
+        .iter()
+        .skip(obj_fields as usize)
+        .take(prim_fields as usize)
+    {
+        w.write_all(&name_id.to_be_bytes())?;
         w.write_all(&[10u8])?; // int
     }
     Ok(())
 }
 
+// Each argument maps to an independent HPROF field or generator parameter.
+#[allow(clippy::too_many_arguments)]
 fn write_instance_dump(
     w: &mut impl Write,
     oid: u64,

@@ -205,3 +205,94 @@ fn hprof_32_index_cache_matches() {
         );
     }
 }
+
+#[test]
+fn truncated_heap_record_is_rejected() {
+    let root = workspace_root();
+    let input = std::fs::read(root.join("tests/hprof-32.bin")).expect("read 32-bit fixture");
+    let test_dir = root.join("target/truncated-heap-integration");
+    std::fs::create_dir_all(&test_dir).expect("create test dir");
+    let hprof = test_dir.join("truncated.hprof");
+    // This offset is inside a heap-dump segment and leaves a partial subrecord.
+    std::fs::write(&hprof, &input[..270_000]).expect("write truncated fixture");
+
+    let output = Command::new(BINARY)
+        .args([
+            "-p",
+            hprof.to_str().unwrap(),
+            "-o",
+            test_dir.join("index").to_str().unwrap(),
+        ])
+        .output()
+        .expect("run minprof on truncated fixture");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("truncated HPROF record at EOF"));
+}
+
+#[test]
+fn seek_reader_indexes_and_rejects_truncated_array() {
+    let root = workspace_root();
+    let test_dir = root.join("target/seek-reader-integration");
+    std::fs::create_dir_all(&test_dir).expect("create test dir");
+    let hprof = test_dir.join("array.hprof");
+    let generated = Command::new(env!("CARGO_BIN_EXE_gen_hprof"))
+        .args([
+            "--output",
+            hprof.to_str().unwrap(),
+            "--objects",
+            "10",
+            "--classes",
+            "1",
+            "--roots",
+            "1",
+            "--byte-array-mib",
+            "8",
+            "--byte-array-block-mib",
+            "8",
+        ])
+        .output()
+        .expect("generate HPROF with primitive array");
+    assert!(generated.status.success());
+
+    let run = |name: &str, path: &Path| {
+        let index = test_dir.join(name);
+        if index.exists() {
+            std::fs::remove_dir_all(&index).expect("clean index");
+        }
+        let mut command = Command::new(BINARY);
+        command.args([
+            "-p",
+            path.to_str().unwrap(),
+            "-o",
+            index.to_str().unwrap(),
+            "--format",
+            "json",
+        ]);
+        (index, command.output().expect("run minprof"))
+    };
+
+    let (seek_index, seeking) = run("seeking", &hprof);
+    assert!(seeking.status.success());
+    let stderr = String::from_utf8_lossy(&seeking.stderr);
+    assert!(stderr.contains("seek reader skipped"));
+    assert!(stderr.contains("contiguous object IDs: direct range lookup"));
+    assert_eq!(
+        std::fs::metadata(seek_index.join("object_index.bin"))
+            .unwrap()
+            .len(),
+        12 * 20
+    );
+
+    let truncated = test_dir.join("truncated-array.hprof");
+    std::fs::copy(&hprof, &truncated).expect("copy HPROF");
+    let half = std::fs::metadata(&truncated).unwrap().len() / 2;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&truncated)
+        .unwrap()
+        .set_len(half)
+        .expect("truncate primitive payload");
+    let (_, rejected) = run("truncated", &truncated);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("truncated HPROF array payload"));
+}

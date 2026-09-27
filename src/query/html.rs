@@ -497,7 +497,7 @@ fn section_leak_suspects(out: &AnalysisOutput) -> String {
                 he(&fmt_bytes(sus.total_retained_bytes)),
                 sus.instance_count,
                 he(&fmt_bytes(sus.avg_retained_bytes)),
-                he(sus.pattern),
+                he(&sus.pattern),
             ));
         }
         s.push_str("</div>\n");
@@ -606,15 +606,15 @@ pub fn render(out: &AnalysisOutput) -> String {
     html.push_str("</nav>\n<main>\n");
 
     html.push_str(&section_overview(out));
-    html.push_str("\n");
+    html.push('\n');
     html.push_str(&section_gc_pressure(out));
-    html.push_str("\n");
+    html.push('\n');
     html.push_str(&section_leak_suspects(out));
-    html.push_str("\n");
+    html.push('\n');
     html.push_str(&section_treemap());
-    html.push_str("\n");
+    html.push('\n');
     html.push_str(&section_histogram(out));
-    html.push_str("\n");
+    html.push('\n');
     html.push_str(&section_packages(out));
 
     html.push_str("\n</main>\n<script>\n");

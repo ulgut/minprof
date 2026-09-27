@@ -1,19 +1,19 @@
 # minprof — Architecture
 
-`minprof` analyses JVM `.hprof` heap dumps that are **larger than available RAM**.
-It does this by never holding the whole heap in memory: the dump is streamed in
-several passes, and everything that scales with the object/edge count (the object
-table, the reference graph, the dominator tree, retained sizes) lives in
-**sorted flat files on disk**. Only data that scales with the number of distinct
-*classes* (tens of MB in practice) is kept resident.
+`minprof` analyses JVM `.hprof` heap dumps with a reusable on-disk index. It
+streams the input in two scans and stores sorted object and edge files on disk.
+Passes 3 and 4 still allocate arrays proportional to object and reference
+counts, so a dump larger than available RAM is feasible when its graph fits
+the host's memory; file size alone does not establish feasibility.
 
 ## Design goals
 
 In priority order:
 
-1. **Minimise peak RSS.** Resident memory is bounded by a configurable fraction
-   of system RAM (the external-sort buffer) plus the class index — independent
-   of object count `N` or edge count `E`.
+1. **Minimise peak RSS.** Keep the fastest correct computation where it fits,
+   and develop a host-aware lower-memory path when graph or parser allocations
+   exceed available memory. The current implementation does not enforce a
+   whole-process memory budget.
 2. **Minimise on-disk footprint.** Intermediate and index files use compact
    fixed-width binary records.
 3. **Be faster than the alternatives** (Eclipse MAT, VisualVM) — memory savings
@@ -48,30 +48,32 @@ In priority order:
                         → pretty text / NDJSON / self-contained HTML
 ```
 
-Only passes 1 and 2 read the HPROF file. Passes 3–4 and every query read only
-the `.bin` index files, so reports for an already-indexed dump are effectively
-free (goal 4).
+Only passes 1 and 2 read the HPROF file. Passes 3–4 work from the index.
+The first report scans object and retained files and persists a derived summary;
+later standard reports load that summary when its index generation matches.
 
 ## Streaming parser (`parser/record_stream_parser.rs`)
 
-Passes 1 and 2 share a three-stage thread pipeline connected by bounded
-`crossbeam` channels, with buffers and batches recycled through pools so steady
-state allocates nothing:
+Passes 1 and 2 use a seek-aware reader. It reads 1 MiB at a time and parses
+records in the same thread, so a primitive-array seek cannot race with read
+ahead.
 
-```
- reader thread          extractor thread             main thread
- ────────────           ────────────────             ───────────
- read 64 MiB    ──buf──▶ inline byte scanner ──batch─▶ consume batch
- chunks from            (no nom; advances over        (build maps /
- the file               record/sub-record bytes)       push to sorter)
-        ◀───pooled buf───────────┘     └────pooled batch───◀
+```mermaid
+flowchart LR
+    F[HPROF file] --> R[Read 1 MiB]
+    R --> X[Inline record scanner]
+    X -->|Parsed object and edge batches| S[Index sorter]
+    X -->|Primitive array header| V[Check payload extent]
+    V --> K[Seek past unused bytes]
+    K --> R
 ```
 
 The extractor is an **inline byte scanner**, not a combinator parser: it walks
-HPROF top-level records and `HEAP_DUMP` sub-records directly over the 64 MiB work
-buffer and emits only the few fields each pass needs. The work buffer is compacted
-(tail shifted to front) once it is at least half-consumed, so a partially-read
-record at a chunk boundary is simply completed on the next chunk. The original
+HPROF top-level records and `HEAP_DUMP` sub-records directly over the input
+buffer and emits only the few fields each pass needs. A partially read record
+is completed on the next chunk. Primitive payloads already in the buffer are
+consumed; the remaining payload is checked against file and segment bounds
+before a seek. The original
 nom-based record parser from `hprof-slurp` is not used on the hot path.
 
 ## Pass 1 — index (`passes/index`)
@@ -111,7 +113,7 @@ scanning, `EdgeStreamExtractor` precomputes, for every class, the flat list of
 byte offsets within an instance's field block at which an `Object`-typed field
 lives — walking the superclass chain once so inherited fields are included. For
 each `INSTANCE_DUMP` it then reads object references straight from those offsets;
-for object arrays it emits one edge per non-null element; for class dumps it emits
+for object arrays it emits one edge per non-null element except adjacent repeats; for class dumps it emits
 edges from static `Object` fields.
 
 Edges are 16-byte records `(from_id, to_id)` pushed into the external sorter with
@@ -130,7 +132,8 @@ parameterised by record width and a `fn(&[u8; N]) -> (u64, u64)` key:
 - When the buffer fills it is sorted (`rayon` parallel unstable sort) and written
   to a chunk file **on a background thread**, so the sort+write overlaps with
   continued production on the caller thread. At most one flush is in flight, so
-  peak RSS is ~one full buffer.
+  an old full buffer can coexist with a refilling new buffer. The sort target
+  is an allocation target, not a whole-process RSS limit.
 - `finish` does a k-way merge of the chunk files via a binary heap. Above
   `MAX_MERGE_FAN_IN` (64) chunks it uses a **two-level merge** to cap the open
   file-descriptor count.
@@ -151,13 +154,13 @@ edges to every GC root and dominates the whole graph. Steps:
 1. **Load + resolve.** Read `object_index.bin` into a sorted `Vec<u64>` of object
    IDs (node index = array position); resolve GC-root IDs to node indices by
    binary search.
-2. **Index the edges.** Two co-scans turn `(from_id, to_id)` into integer node
-   pairs: the first resolves `from_id → from_idx` and sorts by `to_id`; the
-   second resolves `to_id → to_idx`, writing the forward pairs `(from_idx,
-   to_idx)` and reverse pairs `(to_idx, from_idx)` to disk. Because the second
-   scan visits `to_id`s in ascending order, each node's forward neighbours are
-   already emitted contiguously, so the forward CSR is built by a **counting
-   sort** — no separate sort of the forward edges is required.
+2. **Index the edges.** When every sorted object ID differs from the previous
+   by one, compute each node index as `object_id - first_id`. Build forward CSR
+   and reverse indexed edges directly from `edges.bin`; the ID vector is then
+   released before CSR construction. Otherwise, two co-scans resolve
+   `(from_id, to_id)` through an intermediate sort by target ID. The forward
+   CSR is built by counting sort. Both paths preserve each source's ascending
+   target order, so DFS and dominator outputs are identical.
 3. **DFS** the forward CSR from the virtual root, streaming preorder, postorder,
    and parent-preorder arrays to disk. A packed-bit visited set keeps this small.
 4. **Semi-NCA.** Phase 1 computes semidominators by processing predecessor edges
@@ -168,10 +171,9 @@ edges to every GC root and dominates the whole graph. Steps:
 5. **Emit** `idom.bin`: the immediate dominator of each node, indexed and stored
    in reverse-postorder (RPO) so pass 4 is a sequential sweep.
 
-This is the runtime hotspot — roughly two-thirds of total pipeline time on
-representative inputs. Intermediate files (`partial_sorted`, `fwd_indexed`,
-`rev_indexed`, `pred_sorted`, the DFS arrays) are deleted as soon as they are
-consumed.
+This is the runtime hotspot on graph-heavy inputs. The dense-ID path avoids
+`partial_sorted` and `fwd_indexed`; other intermediate files are deleted as
+soon as they are consumed.
 
 ## Pass 4 — retained sizes (`passes/retained`)
 
@@ -192,10 +194,10 @@ full shallow sum) without a second bitmap.
 
 ## Query layer (`query/`)
 
-Every report is produced from the index files. `collect_output` makes a **single
-streaming pass** over `object_index.bin` joined with `retained.bin` (read in
-lockstep, since both are in node order) and computes simultaneously, with memory
-proportional to the number of *classes*, not objects:
+Every report is produced from the index files. On a summary-cache miss,
+`collect_output` makes a **single streaming pass** over `object_index.bin`
+joined with `retained.bin` (both are in node order) and computes simultaneously,
+with memory proportional to the number of *classes*, not objects:
 
 - class histogram (by total shallow allocation and by largest single instance),
 - retained heap aggregated by class,
@@ -203,6 +205,11 @@ proportional to the number of *classes*, not objects:
 - package rollups and the HTML treemap hierarchy,
 - leak suspects (classes retaining ≥ 1% of the heap, with a pattern label),
 - GC-pressure counts (finalizer queue, soft/weak/phantom references).
+
+The result is stored in `report_summary.json`. Later reports load it when the
+generation matches `manifest.json`; missing, stale, or unreadable summaries
+are recomputed. The manifest lists required index files and byte lengths and
+is published after the four passes complete. It does not checksum contents.
 
 `--path <id>` runs a BFS from the target over `reverse_edges.bin`, binary-
 searching the sorted file for each node's referrers, until it reaches a GC root.
@@ -222,17 +229,22 @@ progress on stderr), or a single dependency-free HTML file.
 | `idom.bin` | `idom_rpo` | 4 | RPO order | dominator tree |
 | `retained.bin` | `retained_bytes` | 8 | node order | retained size per object |
 | `meta.bin` | 7 × `u64` | 56 | — | scalar summary (counts, totals, unreachable stats) |
+| `manifest.json` | generation and file lengths | variable | — | index completion and summary invalidation |
+| `report_summary.json` | derived report model | variable | — | repeat reports |
 
-The index directory defaults to `<hprof>.minprof/`. `index_is_complete` checks
-for the core files before a `-i` run.
+For `heap.hprof`, the index directory defaults to `heap.minprof/`.
+`index_is_complete` validates the manifest and rejects a build-in-progress
+marker; legacy indexes are structurally checked and receive a manifest.
 
 ## Memory & disk characteristics
 
-- **Resident memory** during passes 1–2 is the sort buffer (≈40% of RAM by
-  default) plus the class index. Passes 3–4 currently load the working graph
-  (object-ID table, CSR, dominator/retained arrays) into RAM, so pass 3 is the
-  memory high-water mark; this is the main lever for very large dumps and is
-  tracked in *Future work*.
+- **Resident memory** during passes 1–2 includes recycled read buffers,
+  an expandable work buffer, bounded edge batches, class metadata, and a sort
+  buffer whose default target is 40% of physical RAM. Array payloads are
+  consumed incrementally; other whole-record paths can still enlarge the work
+  buffer. Passes 3–4 load object-ID,
+  CSR, dominator, and retained arrays into RAM. The measured peak can occur in
+  any of these stages, depending on input shape.
 - **On-disk footprint** is the sum of the table above: roughly `20·N` (objects)
   `+ 16·E` (edges) `+ 12·N` (idom + retained + sidecar) bytes, plus transient
   pass-3 intermediates that are deleted as they are consumed.

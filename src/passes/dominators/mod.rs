@@ -195,6 +195,71 @@ fn key_partial(rec: &[u8; PARTIAL_SIZE]) -> (u64, u64) {
     (key, idx)
 }
 
+/// Return the first ID only when every sorted object ID occupies the next
+/// integer. Checking all IDs avoids treating a malformed index with gaps or
+/// duplicates as a dense range.
+fn contiguous_id_base(ids: &[u64]) -> Option<u64> {
+    ids.first().copied().filter(|_| {
+        ids.windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+    })
+}
+
+/// Build CSR directly when object IDs form a dense range. `edges.bin` is
+/// sorted by (from_id, to_id), so appending each target preserves the neighbor
+/// order of the sort-and-join path without either intermediate sort.
+fn build_csr_dense(
+    edges_path: &Path,
+    base_id: u64,
+    n: u32,
+    root_nodes: &[u32],
+    output_dir: &Path,
+) -> Result<(Csr, PathBuf)> {
+    let edge_count = std::fs::metadata(edges_path)?.len() / EDGE_SIZE as u64;
+    anyhow::ensure!(
+        edge_count <= u32::MAX as u64,
+        "too many edges for u32 CSR offsets"
+    );
+    let mut offsets = vec![0u32; n as usize + 1];
+    let mut neighbors = Vec::<u32>::with_capacity(edge_count as usize);
+    let rev_indexed_path = output_dir.join("rev_indexed.bin");
+    let mut reader = BufReader::with_capacity(IO_BUF_SIZE, File::open(edges_path)?);
+    let mut rev_writer = BufWriter::with_capacity(
+        IO_BUF_SIZE,
+        File::create(&rev_indexed_path).context("create direct reverse indexed edges")?,
+    );
+    let mut record = [0u8; EDGE_SIZE];
+    while reader.read_exact(&mut record).is_ok() {
+        let from_id = u64::from_le_bytes(record[0..8].try_into().unwrap());
+        let to_id = u64::from_le_bytes(record[8..16].try_into().unwrap());
+        let Some(from_idx) = from_id.checked_sub(base_id).filter(|&i| i < n as u64) else {
+            continue;
+        };
+        let Some(to_idx) = to_id.checked_sub(base_id).filter(|&i| i < n as u64) else {
+            continue;
+        };
+        let from_idx = from_idx as u32;
+        let to_idx = to_idx as u32;
+        offsets[from_idx as usize + 1] += 1;
+        neighbors.push(to_idx);
+        rev_writer.write_all(&to_idx.to_le_bytes())?;
+        rev_writer.write_all(&from_idx.to_le_bytes())?;
+    }
+    for &root in root_nodes {
+        rev_writer.write_all(&root.to_le_bytes())?;
+        rev_writer.write_all(&n.to_le_bytes())?;
+    }
+    rev_writer.flush()?;
+    for i in 1..=n as usize {
+        offsets[i] += offsets[i - 1];
+    }
+    anyhow::ensure!(
+        offsets[n as usize] as usize == neighbors.len(),
+        "direct CSR edge count mismatch"
+    );
+    Ok((Csr { offsets, neighbors }, rev_indexed_path))
+}
+
 fn build_csr_from_indexed(indexed_path: &Path, total_nodes: usize) -> Result<Csr> {
     let mut offsets = vec![0u32; total_nodes + 1];
 
@@ -282,7 +347,7 @@ fn compute_dfs_to_disk(
     );
 
     // Packed-bit visited set: 62 MB for 500M nodes — fits in L3 cache.
-    let mut visited: Vec<u64> = vec![0u64; (total + 63) / 64];
+    let mut visited: Vec<u64> = vec![0u64; total.div_ceil(64)];
 
     // Stack frame: (node, edge_pos, edge_end, preorder_number).
     // 16 bytes per frame.  Max depth ≈ graph diameter.
@@ -334,7 +399,7 @@ fn compute_dfs_to_disk(
                 stack.push((child, child_start, child_end, child_pre));
 
                 nodes_visited += 1;
-                if nodes_visited % 10_000_000 == 0 {
+                if nodes_visited.is_multiple_of(10_000_000) {
                     eprint!("\r    {nodes_visited} nodes visited...");
                 }
             }
@@ -463,6 +528,55 @@ fn snca_eval(nodes: &mut [EvalNode], stack: &mut Vec<u32>, v: u32) -> u32 {
     }
 }
 
+/// Fixed-size, record-aligned predecessor input. This avoids one
+/// `BufReader::read_exact` call for each 8-byte edge while keeping the input
+/// memory bounded to 1 MiB.
+struct PredecessorReader {
+    file: File,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+    remaining: u64,
+}
+
+impl PredecessorReader {
+    fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path).context("open pred sorted")?;
+        let remaining = file.metadata()?.len();
+        anyhow::ensure!(
+            remaining.is_multiple_of(PRED_EDGE_SIZE as u64),
+            "partial predecessor edge record"
+        );
+        Ok(Self {
+            file,
+            buf: vec![0; 1024 * 1024],
+            pos: 0,
+            len: 0,
+            remaining,
+        })
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> Result<Option<(u32, u32)>> {
+        if self.pos == self.len {
+            if self.remaining == 0 {
+                return Ok(None);
+            }
+            self.len = self.buf.len().min(self.remaining as usize);
+            self.file
+                .read_exact(&mut self.buf[..self.len])
+                .context("read predecessor block")?;
+            self.remaining -= self.len as u64;
+            self.pos = 0;
+        }
+        let record = &self.buf[self.pos..self.pos + PRED_EDGE_SIZE];
+        let to = u32::from_le_bytes(record[0..4].try_into().unwrap());
+        let from = u32::from_le_bytes(record[4..8].try_into().unwrap());
+        self.pos += PRED_EDGE_SIZE;
+        Ok(Some((to, from)))
+    }
+}
+
 fn compute_semidominators(
     pred_sorted_path: &Path,
     parent_pre: &[u32],
@@ -477,47 +591,35 @@ fn compute_semidominators(
         .collect();
     let mut compress_stack: Vec<u32> = Vec::new();
 
-    let mut reader = BufReader::with_capacity(
-        IO_BUF_SIZE,
-        File::open(pred_sorted_path).context("open pred sorted")?,
-    );
-    let mut buf = [0u8; PRED_EDGE_SIZE];
-    let mut have_edge = reader.read_exact(&mut buf).is_ok();
-    let mut edge_to_pre = if have_edge {
-        u32::from_le_bytes(buf[0..4].try_into().unwrap())
-    } else {
-        0
-    };
-    let mut edge_from_pre = if have_edge {
-        u32::from_le_bytes(buf[4..8].try_into().unwrap())
-    } else {
-        0
-    };
-
-    for w_pre in (1..reachable as u32).rev() {
-        while have_edge && edge_to_pre == w_pre {
-            let v_pre = edge_from_pre;
-            let u_pre = snca_eval(&mut nodes, &mut compress_stack, v_pre);
-            if nodes[u_pre as usize].semi < nodes[w_pre as usize].semi {
-                nodes[w_pre as usize].semi = nodes[u_pre as usize].semi;
-            }
-
-            have_edge = reader.read_exact(&mut buf).is_ok();
-            if have_edge {
-                edge_to_pre = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-                edge_from_pre = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    let mut reader = PredecessorReader::open(pred_sorted_path)?;
+    let mut w_pre = reachable as u32 - 1;
+    while let Some((to_pre, from_pre)) = reader.next()? {
+        if to_pre == 0 {
+            break;
+        }
+        anyhow::ensure!(
+            to_pre <= w_pre && (from_pre as usize) < reachable,
+            "invalid predecessor preorder"
+        );
+        while w_pre > to_pre {
+            nodes[w_pre as usize].ancestor = parent_pre[w_pre as usize];
+            w_pre -= 1;
+            if w_pre.is_multiple_of(10_000_000) {
+                eprint!(
+                    "\r    phase 1: {} / {} nodes...",
+                    reachable as u32 - w_pre,
+                    reachable
+                );
             }
         }
-
+        let u_pre = snca_eval(&mut nodes, &mut compress_stack, from_pre);
+        if nodes[u_pre as usize].semi < nodes[w_pre as usize].semi {
+            nodes[w_pre as usize].semi = nodes[u_pre as usize].semi;
+        }
+    }
+    while w_pre > 0 {
         nodes[w_pre as usize].ancestor = parent_pre[w_pre as usize];
-
-        if w_pre % 10_000_000 == 0 {
-            eprint!(
-                "\r    phase 1: {} / {} nodes...",
-                reachable as u32 - w_pre,
-                reachable
-            );
-        }
+        w_pre -= 1;
     }
     if reachable > 10_000_000 {
         eprint!("\r                                              \r");
@@ -555,10 +657,24 @@ fn compute_idom_nca(nodes: &[EvalNode], parent_pre: &[u32], reachable: usize) ->
 // ── Public entry point ────────────────────────────────────────────────────────
 
 pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Result<Pass3Output> {
+    anyhow::ensure!(
+        pass1.object_count < u32::MAX as u64,
+        "{} objects exceed the u32 graph index limit",
+        pass1.object_count
+    );
+    anyhow::ensure!(
+        pass2.edge_count <= u32::MAX as u64,
+        "{} edges exceed the u32 CSR offset limit",
+        pass2.edge_count
+    );
     // ── Load IDs and roots ───────────────────────────────────────────────────
     let t = std::time::Instant::now();
     eprintln!("  loading object index...");
     let ids = load_object_ids(&pass1.object_index_path)?;
+    anyhow::ensure!(
+        ids.len() as u64 == pass1.object_count,
+        "object index count changed before dominator computation"
+    );
     let n = ids.len() as u32;
     let vroot = n;
     eprintln!("    {} nodes  [{:.1}s]", n, t.elapsed().as_secs_f64());
@@ -572,15 +688,20 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         t.elapsed().as_secs_f64()
     );
 
-    // ── Produce indexed files while ids is in memory ─────────────────────────
+    // ── Choose the fastest exact ID resolution available ────────────────────
     let t = std::time::Instant::now();
     eprintln!("  building adjacency lists...");
-    let (fwd_indexed, rev_indexed) =
-        prepare_indexed_files(&pass2.edges_path, ids, &root_nodes, output_dir)?;
-
-    // ── Build forward CSR for DFS ────────────────────────────────────────────
-    let forward = build_csr_from_indexed(&fwd_indexed, n as usize)?;
-    let _ = std::fs::remove_file(&fwd_indexed);
+    let (forward, rev_indexed) = if let Some(base_id) = contiguous_id_base(&ids) {
+        eprintln!("  [adj] contiguous object IDs: direct range lookup");
+        drop(ids);
+        build_csr_dense(&pass2.edges_path, base_id, n, &root_nodes, output_dir)?
+    } else {
+        let (fwd_indexed, rev_indexed) =
+            prepare_indexed_files(&pass2.edges_path, ids, &root_nodes, output_dir)?;
+        let forward = build_csr_from_indexed(&fwd_indexed, n as usize)?;
+        let _ = std::fs::remove_file(&fwd_indexed);
+        (forward, rev_indexed)
+    };
     let fwd_edge_count = forward.neighbors.len();
     eprintln!(
         "    {} forward edges  [{:.1}s]",
@@ -641,12 +762,22 @@ pub fn run(pass1: &Pass1Output, pass2: &Pass2Output, output_dir: &Path) -> Resul
         let _ = std::fs::remove_file(&dfs.parent_pre_path);
 
         eprintln!("    phase 1: computing semidominators...");
+        let phase1_start = std::time::Instant::now();
         let eval_nodes = compute_semidominators(&pred_sorted_path, &parent_pre, reachable)?;
+        eprintln!(
+            "    phase 1 done [{:.3}s]",
+            phase1_start.elapsed().as_secs_f64()
+        );
         let _ = std::fs::remove_file(&pred_sorted_path);
 
         // ── Phase 2: compute idom via NCA walk ───────────────────────────────
         eprintln!("    phase 2: computing immediate dominators...");
+        let phase2_start = std::time::Instant::now();
         let idom_pre = compute_idom_nca(&eval_nodes, &parent_pre, reachable);
+        eprintln!(
+            "    phase 2 done [{:.3}s]",
+            phase2_start.elapsed().as_secs_f64()
+        );
         drop(eval_nodes);
         drop(parent_pre);
         eprintln!("    [{:.1}s]", t.elapsed().as_secs_f64());

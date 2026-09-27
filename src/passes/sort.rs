@@ -109,14 +109,16 @@ impl<const N: usize> RecordSorter<N> {
         let key_fn = self.key_fn;
         let dedup = self.dedup;
 
-        let to_sort =
-            std::mem::replace(&mut self.current, Vec::with_capacity(self.records_per_chunk));
+        let to_sort = std::mem::replace(
+            &mut self.current,
+            Vec::with_capacity(self.records_per_chunk),
+        );
 
         let handle = thread::Builder::new()
             .name(format!("{prefix}-flush-{chunk_idx}"))
             .spawn(move || -> Result<PathBuf> {
                 let mut buf = to_sort;
-                buf.par_sort_unstable_by_key(|e| key_fn(e));
+                buf.par_sort_unstable_by_key(key_fn);
                 if dedup {
                     buf.dedup();
                 }
@@ -126,9 +128,8 @@ impl<const N: usize> RecordSorter<N> {
                 );
                 // Safety: [u8; N] is a plain byte array (alignment 1, no
                 // padding); Vec<[u8; N]> stores records back-to-back.
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * N)
-                };
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * N) };
                 w.write_all(bytes)?;
                 w.flush()?;
                 eprintln!("  [{prefix}] flushed chunk {}", chunk_idx + 1);
@@ -160,7 +161,7 @@ impl<const N: usize> RecordSorter<N> {
                 return Ok(0);
             }
             let key_fn = self.key_fn;
-            self.current.par_sort_unstable_by_key(|e| key_fn(e));
+            self.current.par_sort_unstable_by_key(key_fn);
             if self.dedup {
                 self.current.dedup();
             }
@@ -246,10 +247,10 @@ impl<const N: usize> RecordSorter<N> {
 /// Clean up chunk files if the sorter is dropped before `finish` (e.g. on panic).
 impl<const N: usize> Drop for RecordSorter<N> {
     fn drop(&mut self) {
-        if let Some(handle) = self.pending_flush.take() {
-            if let Ok(Ok(path)) = handle.join() {
-                self.chunk_paths.push(path);
-            }
+        if let Some(handle) = self.pending_flush.take()
+            && let Ok(Ok(path)) = handle.join()
+        {
+            self.chunk_paths.push(path);
         }
         for p in &self.chunk_paths {
             let _ = std::fs::remove_file(p);

@@ -14,10 +14,11 @@ mod html;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::index::{ObjectIndex, class_name};
 use crate::passes::edges::EDGE_SIZE;
@@ -53,6 +54,7 @@ impl ReportConfig {
 
 // ── Output types ──────────────────────────────────────────────────────────────
 
+#[derive(Serialize, Deserialize)]
 pub struct AnalysisOutput {
     pub total_objects: usize,
     pub total_classes: usize,
@@ -82,6 +84,7 @@ pub struct AnalysisOutput {
     pub phantom_ref_count: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ClassHistEntry {
     pub class_name: String,
     pub instances: u64,
@@ -89,6 +92,7 @@ pub struct ClassHistEntry {
     pub max_shallow_bytes: u32,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct RetainedObjectEntry {
     pub object_id: u64,
     pub class_name: String,
@@ -96,6 +100,7 @@ pub struct RetainedObjectEntry {
     pub retained_bytes: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct RetainedByClassEntry {
     pub class_name: String,
     pub instance_count: u64,
@@ -103,6 +108,7 @@ pub struct RetainedByClassEntry {
     pub total_shallow_bytes: u64,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct PackageSummaryEntry {
     pub package: String,
     pub class_count: u64,
@@ -113,6 +119,7 @@ pub struct PackageSummaryEntry {
 
 /// A classified leak suspect — class retaining ≥ 1% of heap.
 #[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
 pub struct LeakSuspectEntry {
     pub class_name: String,
     pub instance_count: u64,
@@ -120,16 +127,18 @@ pub struct LeakSuspectEntry {
     pub total_shallow_bytes: u64,
     pub avg_retained_bytes: u64,
     pub pct_of_heap: f64,
-    pub pattern: &'static str,
+    pub pattern: String,
 }
 
 /// Package node in the treemap hierarchy.
+#[derive(Serialize, Deserialize)]
 pub struct TreemapPackage {
     pub name: String,
     pub retained_bytes: u64,
     pub classes: Vec<TreemapClass>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct TreemapClass {
     pub name: String,
     pub retained_bytes: u64,
@@ -214,7 +223,7 @@ fn package_of(class_name: &str) -> String {
         return "<unknown>".to_string();
     }
     // Strip trailing array dimensions (e.g. "Foo[][]" → "Foo")
-    let base = class_name.trim_end_matches(|c: char| c == '[' || c == ']');
+    let base = class_name.trim_end_matches(['[', ']']);
     if !base.contains('.') {
         return "<primitive arrays>".to_string();
     }
@@ -256,12 +265,13 @@ fn collect_output(
     );
     let mut ret_buf = [0u8; 8];
 
+    let mut rows_read = 0usize;
     for (oid, cid, shallow) in obj_idx.iter()? {
-        let retained = if ret_reader.read_exact(&mut ret_buf).is_ok() {
-            u64::from_le_bytes(ret_buf)
-        } else {
-            shallow as u64
-        };
+        ret_reader
+            .read_exact(&mut ret_buf)
+            .with_context(|| format!("read retained value for object row {rows_read}"))?;
+        let retained = u64::from_le_bytes(ret_buf);
+        rows_read += 1;
 
         // Histogram
         let stats = histogram.entry(cid).or_default();
@@ -279,15 +289,25 @@ fn collect_output(
         if top_heap.len() < TOP_N {
             top_heap.push(Reverse((retained, oid)));
             top_rows.insert(oid, (cid, retained, shallow));
-        } else if let Some(&Reverse((min_ret, _))) = top_heap.peek() {
-            if retained > min_ret {
-                let Reverse((_, evicted_oid)) = top_heap.pop().unwrap();
-                top_rows.remove(&evicted_oid);
-                top_heap.push(Reverse((retained, oid)));
-                top_rows.insert(oid, (cid, retained, shallow));
-            }
+        } else if let Some(&Reverse((min_ret, _))) = top_heap.peek()
+            && retained > min_ret
+        {
+            let Reverse((_, evicted_oid)) = top_heap.pop().unwrap();
+            top_rows.remove(&evicted_oid);
+            top_heap.push(Reverse((retained, oid)));
+            top_rows.insert(oid, (cid, retained, shallow));
         }
     }
+    anyhow::ensure!(
+        rows_read == obj_idx.entry_count,
+        "object index ended after {rows_read} of {} entries",
+        obj_idx.entry_count
+    );
+    let mut extra = [0u8; 1];
+    anyhow::ensure!(
+        ret_reader.read(&mut extra)? == 0,
+        "retained.bin has more values than object_index.bin"
+    );
 
     let total_shallow_bytes: u64 = histogram.values().map(|s| s.total_shallow).sum();
 
@@ -386,7 +406,7 @@ fn collect_output(
                 total_shallow_bytes: e.total_shallow_bytes,
                 avg_retained_bytes: avg,
                 pct_of_heap: pct,
-                pattern: classify_suspect(e.instance_count, avg, e.total_retained_bytes),
+                pattern: classify_suspect(e.instance_count, avg, e.total_retained_bytes).to_owned(),
             }
         })
         .collect();
@@ -921,7 +941,7 @@ fn emit_json(out: &AnalysisOutput, config: &ReportConfig) {
                 "    {{\"class_name\":{},\"instance_count\":{},\"total_retained_bytes\":{},\"avg_retained_bytes\":{},\"pct_of_heap\":{:.2},\"pattern\":{}}}",
                 json_str(&e.class_name), e.instance_count, e.total_retained_bytes,
                 e.avg_retained_bytes, e.pct_of_heap,
-                json_str(e.pattern),
+                json_str(&e.pattern),
             )
         }).collect();
         sections.push(format!(
@@ -1137,6 +1157,100 @@ pub fn path_to_root(
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
+#[derive(Serialize, Deserialize)]
+struct SummaryCache {
+    version: u32,
+    generation: String,
+    object_index_bytes: u64,
+    retained_bytes: u64,
+    output: AnalysisOutput,
+}
+
+fn collect_or_load_output(pass1: &Pass1Output, pass4: &Pass4Output) -> Result<AnalysisOutput> {
+    let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
+    let cache_path = pass1
+        .object_index_path
+        .with_file_name("report_summary.json");
+    let object_index_bytes = std::fs::metadata(&pass1.object_index_path)?.len();
+    let retained_bytes = std::fs::metadata(&pass4.retained_path)?.len();
+    let generation = crate::index::manifest::generation(
+        pass1
+            .object_index_path
+            .parent()
+            .context("index path has no parent")?,
+    )
+    .ok();
+
+    if let Some(generation) = generation.as_deref()
+        && cache_path.exists()
+    {
+        let load_start = std::time::Instant::now();
+        let loaded = (|| -> Result<SummaryCache> {
+            let reader = BufReader::new(File::open(&cache_path)?);
+            Ok(serde_json::from_reader(reader)?)
+        })();
+        match loaded {
+            Ok(cache)
+                if cache.version == 1
+                    && cache.generation == generation
+                    && cache.object_index_bytes == object_index_bytes
+                    && cache.retained_bytes == retained_bytes =>
+            {
+                eprintln!(
+                    "  [summary-cache] loaded {}  [{:.3}s]",
+                    cache_path.display(),
+                    load_start.elapsed().as_secs_f64()
+                );
+                return Ok(cache.output);
+            }
+            Ok(_) => eprintln!("  [summary-cache] stale or unsupported; recomputing"),
+            Err(err) => eprintln!("  [summary-cache] unreadable ({}); recomputing", err),
+        }
+    }
+
+    let output = collect_output(
+        &obj_idx,
+        &pass4.retained_path,
+        &pass1.class_index,
+        pass1,
+        pass4,
+    )?;
+    if let Some(generation) = generation {
+        let write_start = std::time::Instant::now();
+        let cache = SummaryCache {
+            version: 1,
+            generation,
+            object_index_bytes,
+            retained_bytes,
+            output,
+        };
+        let tmp_path =
+            cache_path.with_file_name(format!("report_summary.json.{}.tmp", std::process::id()));
+        let write_result = (|| -> Result<()> {
+            let mut writer = BufWriter::new(File::create(&tmp_path)?);
+            serde_json::to_writer(&mut writer, &cache)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            drop(writer);
+            std::fs::rename(&tmp_path, &cache_path)?;
+            Ok(())
+        })();
+        match write_result {
+            Ok(()) => eprintln!(
+                "  [summary-cache] wrote {}  [{:.3}s]",
+                cache_path.display(),
+                write_start.elapsed().as_secs_f64()
+            ),
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!("  [summary-cache] could not write cache: {err}");
+            }
+        }
+        return Ok(cache.output);
+    }
+    Ok(output)
+}
+
 /// Run the selected analyses and emit results to stdout.
 /// Progress messages go to stderr regardless of mode.
 pub fn run(
@@ -1146,14 +1260,7 @@ pub fn run(
     json: bool,
     config: &ReportConfig,
 ) -> Result<()> {
-    let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let out = collect_output(
-        &obj_idx,
-        &pass4.retained_path,
-        &pass1.class_index,
-        pass1,
-        pass4,
-    )?;
+    let out = collect_or_load_output(pass1, pass4)?;
     if json {
         emit_json(&out, config);
     } else {
@@ -1164,14 +1271,7 @@ pub fn run(
 
 /// Generate a self-contained HTML report and write it to `html_path`.
 pub fn run_html(pass1: &Pass1Output, pass4: &Pass4Output, html_path: &Path) -> Result<()> {
-    let obj_idx = ObjectIndex::open(&pass1.object_index_path)?;
-    let out = collect_output(
-        &obj_idx,
-        &pass4.retained_path,
-        &pass1.class_index,
-        pass1,
-        pass4,
-    )?;
+    let out = collect_or_load_output(pass1, pass4)?;
     let html_str = html::render(&out);
     std::fs::write(html_path, html_str.as_bytes())
         .with_context(|| format!("write HTML report to {}", html_path.display()))?;
